@@ -13,11 +13,14 @@ class DSL(StrEnum):
     GLUON = "gluon"
     SYCL = "sycl"
     CUDA = "cuda"
+    MLIR = "mlir"
 
     @property
     def code_language(self) -> str:
         if self in (DSL.SYCL, DSL.CUDA):
             return "cpp"
+        if self == DSL.MLIR:
+            return "mlir"
         return "python"
 
 

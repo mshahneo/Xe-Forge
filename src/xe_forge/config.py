@@ -21,6 +21,9 @@ class LLMConfig:
     max_tokens: int = 8192
     api_base: str | None = None
     api_key: str | None = None
+    # dspy.LM model_type: "responses" (OpenAI Responses API) or "chat"
+    # (Chat Completions). Some OpenAI-compatible proxies only support "chat".
+    model_type: str = "responses"
 
 
 @dataclass
@@ -207,8 +210,11 @@ class ConfigManager:
             model=self._get_env("LLM_MODEL", "openai/gpt-4o"),
             temperature=self._get_env("LLM_TEMPERATURE", 0.1, float),  # GPT need 1.0
             max_tokens=self._get_env("LLM_MAX_TOKENS", 8192, int),  # 16k for gpt
-            api_base=self._get_env("OPENAI_API_BASE"),
+            # Accept either OPENAI_API_BASE (what we read) or the OpenAI SDK's
+            # OPENAI_BASE_URL, so proxy endpoints set via the latter still work.
+            api_base=self._get_env("OPENAI_API_BASE") or self._get_env("OPENAI_BASE_URL"),
             api_key=self._get_env("OPENAI_API_KEY"),
+            model_type=self._get_env("LLM_MODEL_TYPE", "responses"),
         )
 
         # Agent Configuration

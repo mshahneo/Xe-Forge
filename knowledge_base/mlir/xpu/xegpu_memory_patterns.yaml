@@ -1,0 +1,88 @@
+# XeGPU Workgroup-Level Memory-Access Patterns
+# Prefetching, cache hints, and coalesced 2D block loads for WG-level XeGPU.
+
+constraints:
+  - id: xegpu_contiguous_2d_block_load
+    name: load_nd tiles should map to contiguous 2D block loads
+    severity: high
+    description: |
+      xegpu.load_nd reads a 2D tile described by create_nd_tdesc. For the load
+      to coalesce, the tile's inner (fastest) dimension must be contiguous in
+      memory and sized to the hardware block-load width. Mismatched sg_data /
+      order forces gathered or strided loads that waste bandwidth.
+
+patterns:
+  - id: xegpu_add_prefetch_nd
+    name: Prefetch operand tiles ahead of the K-loop with cache hints
+    stage: memory_access
+    description: |
+      Insert xegpu.prefetch_nd for the next K-iteration's A/B tiles before the
+      load_nd that consumes the current tiles, with
+      l1_hint/l2_hint/l3_hint = #xegpu.cache_hint<cached>. This overlaps global
+      memory latency with DPAS compute. Use a dedicated prefetch layout
+      (#k_prefetch) whose sg_layout spreads the prefetch across subgroups.
+    rationale: |
+      The DPAS array stalls waiting on global loads; software prefetch into the
+      cache hierarchy hides that latency behind compute.
+    pattern_before: |
+      scf.for %k = %c0 to %K step %BLOCK_K iter_args(%acc = %zero) -> (vector<128x16xf32>) {
+        %a = xegpu.load_nd %a_tile[%row, %k] : !xegpu.tensor_desc<128x64xf16, #a> -> vector<128x64xf16>
+        %b = xegpu.load_nd %b_tile[%k, %col] : !xegpu.tensor_desc<64x16xf16, #b>  -> vector<64x16xf16>
+        %acc2 = xegpu.dpas %a, %b, %acc : vector<128x64xf16>, vector<64x16xf16>, vector<128x16xf32> -> vector<128x16xf32>
+        scf.yield %acc2 : vector<128x16xf32>
+      }
+    pattern_after: |
+      %k_pf = xegpu.create_nd_tdesc %K_ptr, ... -> !xegpu.tensor_desc<64x64xf16, #k_prefetch>
+      xegpu.prefetch_nd %k_pf[%row, %c0] {l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>, layout = #k_prefetch} : !xegpu.tensor_desc<64x64xf16, #k_prefetch>
+      scf.for %k = %c0 to %K step %BLOCK_K iter_args(%acc = %zero) -> (vector<128x16xf32>) {
+        %knext = arith.addi %k, %BLOCK_K : index
+        xegpu.prefetch_nd %k_pf[%row, %knext] {l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>, layout = #k_prefetch} : !xegpu.tensor_desc<64x64xf16, #k_prefetch>
+        %a = xegpu.load_nd %a_tile[%row, %k] {l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>} : !xegpu.tensor_desc<128x64xf16, #a> -> vector<128x64xf16>
+        %b = xegpu.load_nd %b_tile[%k, %col] {l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>} : !xegpu.tensor_desc<64x16xf16, #b> -> vector<64x16xf16>
+        %acc2 = xegpu.dpas %a, %b, %acc : vector<128x64xf16>, vector<64x16xf16>, vector<128x16xf32> -> vector<128x16xf32>
+        scf.yield %acc2 : vector<128x16xf32>
+      }
+    expected_speedup: "1.3-2x on memory-bound GEMM / attention"
+    applies_to: ["gemm", "matmul", "flash_attention"]
+
+  - id: xegpu_cache_hint_on_load
+    name: Add cached l1/l2/l3 hints to load_nd of reused operands
+    stage: memory_access
+    description: |
+      Operands reused across the workgroup (e.g. a shared B panel) should be
+      loaded with #xegpu.cache_hint<cached> so they stay resident in L1/L2
+      rather than streaming through.
+    rationale: |
+      Cache hints keep hot operands in the cache hierarchy, cutting redundant
+      global traffic when many subgroups read overlapping data.
+    pattern_before: |
+      %b = xegpu.load_nd %b_tile[%k, %col] : !xegpu.tensor_desc<64x16xf16, #b> -> vector<64x16xf16>
+    pattern_after: |
+      %b = xegpu.load_nd %b_tile[%k, %col] {l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>} : !xegpu.tensor_desc<64x16xf16, #b> -> vector<64x16xf16>
+    expected_speedup: "1.1-1.4x on bandwidth-bound kernels"
+    applies_to: ["gemm", "matmul", "flash_attention"]
+
+  - id: xegpu_hoist_invariant_loads
+    name: Hoist K-loop-invariant loads and address math out of the loop
+    stage: memory_access
+    description: |
+      Tile descriptors and offsets that do not depend on the K induction
+      variable should be created once before the scf.for, not rebuilt each
+      iteration.
+    rationale: |
+      Recomputing create_nd_tdesc / offsets every iteration wastes issue slots
+      and can block prefetch overlap.
+    pattern_before: |
+      scf.for %k = %c0 to %K step %BLOCK_K {
+        %a_tile = xegpu.create_nd_tdesc %A_ptr, shape: [%M, %K], strides: [%K, %c1] : i64 -> !xegpu.tensor_desc<128x64xf16, #a>
+        %a = xegpu.load_nd %a_tile[%row, %k] : !xegpu.tensor_desc<128x64xf16, #a> -> vector<128x64xf16>
+        ...
+      }
+    pattern_after: |
+      %a_tile = xegpu.create_nd_tdesc %A_ptr, shape: [%M, %K], strides: [%K, %c1] : i64 -> !xegpu.tensor_desc<128x64xf16, #a>
+      scf.for %k = %c0 to %K step %BLOCK_K {
+        %a = xegpu.load_nd %a_tile[%row, %k] : !xegpu.tensor_desc<128x64xf16, #a> -> vector<128x64xf16>
+        ...
+      }
+    expected_speedup: "1.05-1.2x"
+    applies_to: ["gemm", "matmul", "flash_attention"]

@@ -67,6 +67,66 @@ _SYCL_SKIP_ISSUES: set[IssueType] = {
 }
 
 
+# XeGPU WG-level MLIR: issue descriptions phrased in MLIR/XeGPU terms.
+_MLIR_DESCRIPTIONS: dict[IssueType, str] = {
+    IssueType.SUBOPTIMAL_TILE_SIZE: (
+        "sg_data / inst_data in #xegpu.layout suboptimal for the Xe-core — match "
+        "inst_data to the DPAS shape ([8,16]/[16,16]) and size sg_data so each "
+        "subgroup tile feeds the systolic array efficiently"
+    ),
+    IssueType.SUBOPTIMAL_WARPS: (
+        "sg_layout (subgroup grid) mismatched with gpu.launch_func threads — the "
+        "sg_layout product must equal subgroups-per-workgroup"
+    ),
+    IssueType.UNCOALESCED_ACCESS: (
+        "load_nd tile shape does not map to a contiguous 2D block load — pick "
+        "sg_data/order that yields coalesced access"
+    ),
+    IssueType.MISSING_TMA: (
+        "no xegpu.prefetch_nd ahead of load_nd — add prefetch with cached "
+        "l1/l2/l3 cache_hints to hide memory latency"
+    ),
+    IssueType.HIGH_REGISTER_PRESSURE: (
+        "accumulator / K-loop tile too large, risking GRF spill — reduce sg_data "
+        "or tile the scf.for K-loop"
+    ),
+    IssueType.DTYPE_FLOAT64: "f64 anywhere — use f16/bf16 inputs with f32 DPAS accumulators",
+    IssueType.DTYPE_PRECISION: "f32 inputs where f16/bf16 suffice for the dpas operands",
+    IssueType.UNFUSED_ELEMENTWISE: "elementwise epilogue not fused after the dpas loop in the kernel",
+    IssueType.SUBOPTIMAL_ALGORITHM: "naive K-loop when a structure-exploiting form exists",
+    IssueType.REDUNDANT_COMPUTATION: "loads/recomputation inside scf.for that can be hoisted",
+    IssueType.OPEN_ENDED: (
+        "A novel XeGPU optimization not covered by any existing issue_type. Use "
+        "ONLY for a concrete, implementable optimization; populate "
+        "open_ended_proposal with (a) what changes, (b) why valid, (c) a "
+        "before/after MLIR sketch, (d) estimated speedup reasoning."
+    ),
+}
+
+# Skip Triton/Python-host-only issue types that have no XeGPU WG-level meaning.
+_MLIR_SKIP_ISSUES: set[IssueType] = {
+    IssueType.MANUAL_POINTER_ARITHMETIC,
+    IssueType.BLOCK_PTR_BOUNDARY_WRONG,
+    IssueType.BLOCK_PTR_MULTIPLE_OF_MISUSE,
+    IssueType.MISSING_BLOCK_POINTERS,
+    IssueType.MISSING_AUTOTUNE,
+    IssueType.SUBOPTIMAL_AUTOTUNE_CONFIGS,
+    IssueType.AUTOTUNE_KEY_MISSING,
+    IssueType.AUTOTUNE_DUPLICATE_PARAMS,
+    IssueType.MISSING_GRF_MODE,
+    IssueType.NO_SWIZZLING,
+    IssueType.SIGMOID_SLOW_EXP,
+    IssueType.REPACK_IN_FORWARD,
+    IssueType.MISSING_PACKED_TRANSPOSE,
+    IssueType.MISSING_PERSISTENT,
+    IssueType.PERSISTENT_NUM_PROGS_HARDCODED,
+    IssueType.SERIALIZED_N_TILES,
+    IssueType.DEVICE_HOST_SYNC,
+    IssueType.NON_CONTIGUOUS_INPUT,
+    IssueType.DTYPE_INPUT_CONVERSION,
+}
+
+
 def _build_issue_categories(dsl: DSL = DSL.TRITON) -> str:
     """
     Generate the === ISSUE CATEGORIES === block from the IssueType enum + stage mapping.
@@ -171,10 +231,13 @@ def _build_issue_categories(dsl: DSL = DSL.TRITON) -> str:
         ),
     }
 
-    # When building for SYCL, apply overrides and skip Triton-only issues
+    # When building for SYCL or MLIR, apply overrides and skip Triton-only issues
     if dsl == DSL.SYCL:
         skip = _SYCL_SKIP_ISSUES
         desc_overrides = _SYCL_DESCRIPTIONS
+    elif dsl == DSL.MLIR:
+        skip = _MLIR_SKIP_ISSUES
+        desc_overrides = _MLIR_DESCRIPTIONS
     else:
         skip = set()
         desc_overrides = {}
@@ -208,6 +271,7 @@ def _build_issue_categories(dsl: DSL = DSL.TRITON) -> str:
 # Build once at import time — cheap, just string formatting
 _ISSUE_CATEGORIES_BLOCK = _build_issue_categories(DSL.TRITON)
 _SYCL_ISSUE_CATEGORIES_BLOCK = _build_issue_categories(DSL.SYCL)
+_MLIR_ISSUE_CATEGORIES_BLOCK = _build_issue_categories(DSL.MLIR)
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +385,51 @@ IMPORTANT:
     )
 
 
+class MlirAnalysisSignature(dspy.Signature):
+    __doc__ = f"""Analyze an XeGPU workgroup-level MLIR kernel for optimization opportunities on Intel XPU.
+
+You are a world-class expert in MLIR, the XeGPU dialect, and Intel Xe GPU kernel optimization.
+
+The input is a self-contained MLIR module: a host `func.func @main` that launches a
+`gpu.module` kernel via `gpu.launch_func` and checks the result against an embedded CPU
+reference. Analyze ONLY the kernel (the `gpu.module` body, its `#xegpu.layout` attributes,
+and the launch geometry) — the `@main` harness and reference are fixed and must not change.
+
+=== XeGPU WG-LEVEL OPTIMIZATION KNOBS ===
+- #xegpu.layout<sg_layout=[..], sg_data=[..], inst_data=[..]>: subgroup distribution of
+  the workgroup tile. inst_data should match the DPAS shape ([8,16]/[16,16]); sg_data sizes
+  the per-subgroup tile; the sg_layout product = subgroups-per-workgroup.
+- xegpu.prefetch_nd with l1/l2/l3 cache_hints to hide memory latency ahead of load_nd.
+- scf.for K-loop tiling / accumulator tile: trade register pressure vs reuse.
+- gpu.launch_func grid (output tiles) and block (subgroups * 16) geometry.
+
+{_MLIR_ISSUE_CATEGORIES_BLOCK}
+IMPORTANT:
+- Return issues as a JSON array of DetectedIssue objects.
+- Each issue MUST have: issue_type (exact string from the list above),
+  severity (1-5), description, suggested_fix, estimated_speedup.
+- issue_type MUST be one of the exact strings listed above.
+- Return empty array [] ONLY if the kernel is already optimal.
+"""
+
+    kernel_code: dspy.Code["mlir"] = dspy.InputField(
+        desc="XeGPU workgroup-level MLIR module to analyze."
+    )
+    reference_code: str = dspy.InputField(
+        desc="Reference implementation or description. May be empty."
+    )
+    problem_context: str = dspy.InputField(
+        desc="Problem size, FLOP count, target device, and other context."
+    )
+    knowledge_base_context: str = dspy.InputField(
+        desc="Constraints from the knowledge base for XeGPU/MLIR kernels. "
+        "Empty string if KB is disabled."
+    )
+    issues_found: list[DetectedIssue] = dspy.OutputField(
+        desc="List of detected issues. Return empty array [] only if kernel is already optimal."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Analyzer Agent
 # ---------------------------------------------------------------------------
@@ -332,7 +441,12 @@ class AnalyzerAgent:
     def __init__(self, knowledge_base=None, dsl: DSL | str = DSL.TRITON):
         self.knowledge_base = knowledge_base
         self.dsl = DSL(dsl) if isinstance(dsl, str) else dsl
-        sig = SyclAnalysisSignature if self.dsl == DSL.SYCL else AnalysisSignature
+        if self.dsl == DSL.SYCL:
+            sig = SyclAnalysisSignature
+        elif self.dsl == DSL.MLIR:
+            sig = MlirAnalysisSignature
+        else:
+            sig = AnalysisSignature
         self.predictor = dspy.Predict(sig)
 
     def analyze(

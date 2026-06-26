@@ -48,6 +48,21 @@ DSL_SUPPORTED_STAGES: dict[DSL, set[OptimizationStage]] = {
         OptimizationStage.AUTOTUNING,
         OptimizationStage.DISCOVERY,
     },
+    # XeGPU workgroup-level MLIR. The kernel is already hardware-shaped
+    # (sg_layout / sg_data / inst_data / dpas / prefetch), so the actionable
+    # knobs are layout/tile tuning, memory access (prefetch, cache hints),
+    # dtype, and fusion — folded under DEVICE_SPECIFIC + MEMORY_ACCESS.
+    # Triton-only concepts (block pointers, persistent kernels, autotune
+    # configs) do not apply at this level and are omitted.
+    DSL.MLIR: {
+        OptimizationStage.ANALYSIS,
+        OptimizationStage.ALGORITHMIC,
+        OptimizationStage.DTYPE_FIX,
+        OptimizationStage.FUSION,
+        OptimizationStage.MEMORY_ACCESS,
+        OptimizationStage.DEVICE_SPECIFIC,
+        OptimizationStage.DISCOVERY,
+    },
 }
 
 

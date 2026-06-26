@@ -69,6 +69,12 @@ class XeForgePipeline:
                 executor = SyclExecutor(
                     verify=self.config.optimization.require_correctness,
                 )
+            elif self.config.device_config.dsl == DSL.MLIR:
+                from xe_forge.core.mlir_executor import MlirExecutor
+
+                executor = MlirExecutor(
+                    require_correctness=self.config.optimization.require_correctness,
+                )
             else:
                 from xe_forge.core import KernelBenchExecutor
 
@@ -138,7 +144,7 @@ class XeForgePipeline:
             lm = dspy.LM(
                 model=self.config.llm.model,
                 api_base=self.config.llm.api_base,
-                model_type="responses",
+                model_type=self.config.llm.model_type,
                 api_key=self.config.llm.api_key or "",
                 temperature=self.config.llm.temperature,
                 max_tokens=self.config.llm.max_tokens,
@@ -185,7 +191,13 @@ class XeForgePipeline:
             kernel_code = triton_code
         if reference_code is None:
             reference_code = pytorch_code or ""
-        import torch
+        # torch is only needed for dtype mapping / tensor-based executors. The
+        # MLIR (XeGPU) path uses self-contained kernels and never touches it, so
+        # tolerate its absence there.
+        try:
+            import torch
+        except ImportError:
+            torch = None
 
         spec, flop, dtype, init_args, spec_dims, input_dtypes = None, None, None, None, None, None
         if spec_path:
@@ -212,7 +224,7 @@ class XeForgePipeline:
         if hasattr(self.executor, "atol"):
             self.executor.atol = eatol
 
-        if target_dtype:
+        if target_dtype and torch is not None:
             dm = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
             dtype = dm.get(target_dtype, dtype)
 
@@ -220,16 +232,24 @@ class XeForgePipeline:
         logger.info(f"Starting optimization for kernel: {display_name}")
 
         val_orig_tflops, val_orig_ms = None, None
-        from xe_forge.core.executor import KernelBenchExecutor
-        from xe_forge.core.sycl_executor import SyclExecutor
+        _is_mlir = self.config.device_config.dsl == DSL.MLIR
 
-        _is_sycl = isinstance(self.executor, SyclExecutor)
-        _bench_ex = (
-            self.executor
-            if isinstance(self.executor, (KernelBenchExecutor, SyclExecutor))
-            else KernelBenchExecutor(device=self.config.device_config.device)
-        )
-        if self.executor and (_is_sycl or input_shapes):
+        # The MLIR path uses a self-contained executor and a different baseline
+        # path (below); avoid importing the torch-backed executors entirely.
+        if _is_mlir:
+            _is_sycl = False
+            _bench_ex = self.executor
+        else:
+            from xe_forge.core.executor import KernelBenchExecutor
+            from xe_forge.core.sycl_executor import SyclExecutor
+
+            _is_sycl = isinstance(self.executor, SyclExecutor)
+            _bench_ex = (
+                self.executor
+                if isinstance(self.executor, (KernelBenchExecutor, SyclExecutor))
+                else KernelBenchExecutor(device=self.config.device_config.device)
+            )
+        if self.executor and not _is_mlir and (_is_sycl or input_shapes):
             try:
                 if _is_sycl:
                     _sycl_dims = spec_dims or dict(
@@ -258,6 +278,26 @@ class XeForgePipeline:
                         logger.debug(orig_r.error_traceback)
             except Exception as e:
                 logger.warning(f"Failed to measure original: {e}")
+
+        # MLIR baseline: the kernel is self-contained, so just run it once and
+        # read its embedded timing/correctness.
+        if self.executor and _is_mlir:
+            try:
+                orig_r = self.executor.execute(kernel_code=kernel_code, flop=flop)
+                if orig_r.success:
+                    val_orig_tflops, val_orig_ms = orig_r.tflops, orig_r.execution_time_ms
+                    if val_orig_ms is not None:
+                        logger.info(
+                            "Original: %s, %.4f ms",
+                            f"{val_orig_tflops:.2f} TFLOPS" if val_orig_tflops else "n/a TFLOPS",
+                            val_orig_ms,
+                        )
+                    if orig_r.output_correct is False:
+                        logger.warning("Baseline kernel does not pass its own correctness check.")
+                else:
+                    logger.error("Baseline FAILED: %s", orig_r.error_message)
+            except Exception as e:
+                logger.warning(f"Failed to measure original MLIR kernel: {e}")
 
         if self.trial_manager and kernel_name:
             try:

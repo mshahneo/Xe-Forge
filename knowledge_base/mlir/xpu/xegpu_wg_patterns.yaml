@@ -1,0 +1,109 @@
+# XeGPU Workgroup-Level MLIR Optimization Patterns
+# Targets self-contained WG-level XeGPU kernels (the form in
+# mlir-extensions/test/Integration/Dialect/XeGPU/WG): a host @main launches a
+# gpu.module kernel via gpu.launch_func and checks the result against an
+# embedded CPU reference ([ALLCLOSE: TRUE]).
+#
+# The optimizer edits ONLY the gpu.module kernel body, the #xegpu.layout
+# attributes, and the gpu.launch_func grid/block geometry. The @main harness
+# and reference are the fixed correctness oracle and must not change.
+#
+# Hardware focus: Intel Xe2 (Battlemage: B580/B570/Pro B) and Xe-HPC (PVC).
+# Subgroup (SIMD) width is 16; the DPAS/XMX systolic array consumes 2D tiles.
+
+constraints:
+  - id: xegpu_sg_layout_matches_launch_threads
+    name: sg_layout product must match subgroups-per-workgroup in gpu.launch_func
+    severity: critical
+    description: |
+      In #xegpu.layout<sg_layout=[a, b], ...>, the product a*b is the number of
+      subgroups per workgroup. It MUST equal (threads-per-workgroup / 16),
+      because each subgroup is one SIMD16 hardware thread.
+
+      If gpu.launch_func declares `threads in (%c128, %c1, %c1)` that is
+      128 / 16 = 8 subgroups, so sg_layout must satisfy a*b == 8
+      (e.g. [8, 1], [4, 2], [2, 4], [1, 8]). A mismatch causes a lowering
+      failure or wrong results.
+
+  - id: xegpu_dpas_requires_simd16
+    name: DPAS operations require SIMD16 subgroups on Arc / Xe2
+    severity: critical
+    description: |
+      The XMX (DPAS) hardware on Intel Arc (Xe-HPG) and Xe2 expects a SIMD16
+      subgroup width. inst_data should match a supported DPAS tile shape
+      (e.g. [8, 16] for the A/C operand, [16, 16] for B). Picking inst_data
+      that does not map to a DPAS shape forces a fall back to slower code or
+      fails to lower.
+
+  - id: xegpu_fp32_accumulator_required
+    name: Use f32 accumulator for f16/bf16 DPAS
+    severity: critical
+    description: |
+      xegpu.dpas with f16/bf16 operands must accumulate into an f32 vector
+      (vector<MxNxf32>). Accumulating in f16 loses precision across the K-loop
+      and typically breaks the [ALLCLOSE] check. Only down-cast to f16/bf16 in
+      the epilogue store if the reference allows it.
+
+  - id: xegpu_dtype_no_f64
+    name: Avoid f64 anywhere in the kernel
+    severity: critical
+    description: |
+      f64 is dramatically slower on Intel XPU and is not a DPAS input type.
+      Use f16/bf16 inputs with f32 accumulation.
+
+patterns:
+  - id: xegpu_tune_sg_data_for_dpas
+    name: Size sg_data / inst_data to feed the DPAS systolic array
+    stage: device_specific
+    description: |
+      The per-subgroup tile (sg_data) and the per-instruction tile (inst_data)
+      control how the workgroup tile is distributed and fed to DPAS. inst_data
+      should match a DPAS shape; sg_data should be an integer multiple of
+      inst_data so each subgroup issues several back-to-back DPAS ops, keeping
+      the systolic array busy and amortizing load latency.
+    rationale: |
+      Tiles that match the DPAS shape avoid partial/under-utilized MMA issues;
+      larger sg_data increases arithmetic intensity per load but costs GRF.
+    pattern_before: |
+      // Tiny per-subgroup tile — under-feeds DPAS, high relative load overhead
+      #a = #xegpu.layout<sg_layout = [8, 1], sg_data = [8, 16],  inst_data = [8, 16]>
+    pattern_after: |
+      // Larger sg_data (multiple of inst_data) — more DPAS issues per load
+      #a = #xegpu.layout<sg_layout = [8, 1], sg_data = [32, 16], inst_data = [8, 16]>
+    expected_speedup: "1.2-2x on compute-bound GEMM"
+    applies_to: ["gemm", "matmul", "flash_attention"]
+
+  - id: xegpu_balance_sg_layout
+    name: Balance sg_layout across M and N to improve data reuse
+    stage: device_specific
+    description: |
+      A 1D sg_layout like [8, 1] tiles only along one axis; a 2D layout such as
+      [4, 2] or [2, 4] gives each subgroup a squarer tile, improving reuse of
+      both A and B operands and reducing redundant global loads. Keep the
+      product equal to subgroups-per-workgroup (see constraint).
+    rationale: |
+      Square-ish subgroup tiles maximize the ratio of DPAS work to bytes loaded.
+    pattern_before: |
+      #c = #xegpu.layout<sg_layout = [8, 1], sg_data = [32, 64], inst_data = [8, 16]>
+    pattern_after: |
+      #c = #xegpu.layout<sg_layout = [4, 2], sg_data = [32, 32], inst_data = [8, 16]>
+    expected_speedup: "1.1-1.5x when memory-bound on operand reuse"
+    applies_to: ["gemm", "matmul"]
+
+  - id: xegpu_cast_inputs_to_bf16
+    name: Use bf16/f16 DPAS inputs with f32 accumulation
+    stage: dtype_fix
+    description: |
+      Ensure the load_nd tiles feeding xegpu.dpas are f16/bf16 and the
+      accumulator vector is f32. Never compute in f64.
+    rationale: |
+      bf16/f16 are the native DPAS input types; f32 accumulation preserves
+      correctness while keeping the matmul on the XMX path.
+    pattern_before: |
+      %acc = arith.constant dense<0.0> : vector<128x16xf64>
+      %c = xegpu.dpas %a, %b, %acc : vector<128x64xf64>, vector<64x16xf64>, vector<128x16xf64> -> vector<128x16xf64>
+    pattern_after: |
+      %acc = arith.constant dense<0.0> : vector<128x16xf32>
+      %c = xegpu.dpas %a, %b, %acc : vector<128x64xf16>, vector<64x16xf16>, vector<128x16xf32> -> vector<128x16xf32>
+    expected_speedup: "many-x vs f64; correctness-critical"
+    applies_to: ["gemm", "matmul", "flash_attention"]
