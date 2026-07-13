@@ -16,6 +16,7 @@ from xe_forge.models import (
     IssueType,
     OptimizationResult,
     OptimizationStage,
+    StageResult,
 )
 from xe_forge.planner import DEFAULT_STAGE_ORDER as PLANNER_DEFAULT_STAGE_ORDER
 from xe_forge.planner import PlannerAgent
@@ -32,6 +33,64 @@ def _extract_gemm_dims(
         if len(a) >= 2 and len(b) >= 2:
             return a[-2], b[-1], a[-1]
     return 1024, 1024, 1024
+
+
+def _split_linalg_harness(code: str) -> tuple[str, str | None]:
+    """Split a self-contained Linalg file into (bare compute kernel, harness).
+
+    Expects a module containing the compute ``func.func`` (with ``linalg.matmul``)
+    plus a ``@main`` harness and helper decls. Returns:
+      - bare: just the compute func (for the lowering pipeline), and
+      - harness: the enclosing module with the compute func replaced by a
+        ``// KERNEL`` marker and an ``// ALIASES`` slot before the module, so the
+        lowered WG kernel can be spliced back in (see MlirExecutor._splice_kernel).
+    Returns (code, None) if the expected structure is not found.
+    """
+    import re
+
+    # Find the compute func (the one containing linalg.matmul).
+    funcs = list(re.finditer(r"\n?\s*func\.func\s+@(\w+)\s*\(", code))
+    compute_span = None
+    compute_name = None
+    for mt in funcs:
+        # brace-match this func's body
+        start = mt.start()
+        b = code.find("{", mt.end() - 1)
+        depth = 0
+        j = b
+        while j < len(code):
+            if code[j] == "{":
+                depth += 1
+            elif code[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        segment = code[start : j + 1]
+        if "linalg.matmul" in segment:
+            compute_span = (start, j + 1)
+            compute_name = mt.group(1)
+            bare = segment.strip()
+            break
+    if compute_span is None or compute_name is None:
+        return code, None
+
+    # Build the harness: same file, compute func -> "// KERNEL".
+    body = code[: compute_span[0]] + "\n  // KERNEL\n" + code[compute_span[1] :]
+    # The spliced gpu.launch_func requires the enclosing module to carry the
+    # gpu.container_module attribute. If the input has no explicit attributed
+    # module wrapper, wrap the body in one; otherwise ensure the attribute is set.
+    if "gpu.container_module" not in body:
+        if body.lstrip().startswith("module"):
+            # Has a module but lacks the attribute — add it.
+            body = body.replace("module {", "module attributes {gpu.container_module} {", 1)
+        else:
+            # Bare top-level funcs — wrap them in a container module.
+            body = "module attributes {gpu.container_module} {\n" + body + "\n}\n"
+    # "// ALIASES" slot at the very top so hoisted affine-map aliases land at
+    # module-attribute scope (before the module keyword).
+    harness = "// ALIASES\n" + body
+    return bare, harness
 
 
 DEFAULT_STAGE_ORDER: list[OptimizationStage] = [
@@ -168,6 +227,80 @@ class XeForgePipeline:
         if atol is not None:
             eatol = atol
         return ertol, eatol
+
+    def _lowering_kb(self):
+        """Load (and cache) the mlir/linalg-scoped KB for lowering-config proposals.
+
+        The pipeline's shared self.knowledge_base is mlir/xpu-scoped (WG patterns);
+        the lowering configs live in mlir/linalg/, so the lowering agent needs its
+        own KB view. Returns None if the KB is disabled.
+        """
+        if not self.config.knowledge.enabled:
+            return None
+        if getattr(self, "_cached_lowering_kb", None) is None:
+            from xe_forge.knowledge.loader import load_knowledge_base
+
+            self._cached_lowering_kb = load_knowledge_base(
+                self.config.knowledge.knowledge_dir, dsl="mlir", device_type="linalg"
+            )
+        return self._cached_lowering_kb
+
+    def _maybe_lower_linalg(self, kernel_code: str, flop: float | None) -> str | None:
+        """If *kernel_code* is Linalg-level, tile-search + lower it to WG-level.
+
+        Runs the hybrid search: LLM proposes lowering configs (grounded by the
+        mlir/linalg KB), then each is lowered + timed on the GPU (kernel-only
+        rtclock) and the fastest correct one wins. Returns a runnable, self-contained
+        WG-level kernel (best config spliced into a timing harness), or None if the
+        kernel is already WG-level / cannot be lowered.
+        """
+        from xe_forge.core.linalg_lowering import (
+            detect_mlir_level,
+            extract_matmul_dims,
+            render_timing_harness,
+        )
+
+        if detect_mlir_level(kernel_code) != "linalg":
+            return None
+        executor = self.executor
+        if not hasattr(executor, "sweep_configs"):
+            logger.warning("Executor has no sweep_configs; skipping Linalg lowering.")
+            return None
+
+        dims = extract_matmul_dims(kernel_code)
+        if dims is None:
+            logger.warning("Could not extract matmul dims; skipping Linalg lowering.")
+            return None
+        m, n, k = dims
+
+        # Bare compute kernel for the lowering pipeline (strip any harness the input
+        # brought; the timing harness is generated per config).
+        bare, _ = _split_linalg_harness(kernel_code)
+
+        # LLM shortlist (KB-grounded) -> timed sweep (hybrid search).
+        from xe_forge.agents.linalg_lowering_agent import LinalgLoweringAgent
+
+        agent = LinalgLoweringAgent(knowledge_base=self._lowering_kb())
+        configs = agent.propose(bare, m, n, k)
+        logger.info(
+            "STAGE: LINALG_LOWERING — sweeping %d configs for %dx%dx%d", len(configs), m, n, k
+        )
+        best_cfg, best_wg, best_r, _ = executor.sweep_configs(
+            bare, None, configs, flop=flop, dims=(m, n, k)
+        )
+        if best_cfg is None:
+            logger.warning("No lowering config produced a correct kernel; keeping input.")
+            return None
+        logger.info(
+            "LINALG_LOWERING best config: %s (%s)",
+            best_cfg,
+            f"{best_r.execution_time_ms:.4f}ms" if best_r and best_r.execution_time_ms else "correct",
+        )
+        # Return a runnable, self-contained WG kernel (best config's timing harness).
+        from xe_forge.core.mlir_executor import _kernel_name
+
+        harness = render_timing_harness(best_cfg, m, n, k, kernel_name=_kernel_name(best_wg))
+        return executor._splice_kernel(harness, best_wg, kernel_only=True)
 
     def optimize(
         self,
@@ -338,6 +471,22 @@ class XeForgePipeline:
                 dtype=etd or "float16",
             )
 
+            # --- MLIR two-level flow: lower Linalg -> XeGPU WG *before* analysis,
+            # so the WG-level analyzer/stages operate on the lowered kernel.
+            lowering_stage_result = None
+            if self.config.device_config.dsl == DSL.MLIR:
+                logger.info("=" * 60 + "\nSTAGE: LINALG_LOWERING\n" + "=" * 60)
+                lowered = self._maybe_lower_linalg(kernel_code, flop)
+                if lowered is not None:
+                    lowering_stage_result = StageResult(
+                        stage=OptimizationStage.LINALG_LOWERING,
+                        success=True,
+                        input_code=kernel_code,
+                        output_code=lowered,
+                        changes_made=["lowered Linalg to XeGPU WG-level (best config)"],
+                    )
+                    kernel_code = lowered  # WG stages now operate on the lowered kernel
+
             logger.info("=" * 60 + "\nSTAGE: ANALYSIS\n" + "=" * 60)
             analysis = self.analyzer.analyze(
                 kernel_code,
@@ -348,6 +497,8 @@ class XeForgePipeline:
                 target_dtype=etd,
             )
             result.analysis = analysis
+            if lowering_stage_result is not None:
+                result.stages_applied.append(lowering_stage_result)
 
             logger.info(f"Detected {len(analysis.detected_issues)} issues:")
             for iss in analysis.detected_issues:

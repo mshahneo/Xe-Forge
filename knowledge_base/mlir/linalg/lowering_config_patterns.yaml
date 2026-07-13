@@ -1,0 +1,80 @@
+# Linalg -> XeGPU WG lowering config: tunable tile / subgroup parameters.
+#
+# These are the knobs of the Linalg->WG lowering itself (pipelines/linalg_to_wg).
+# A config is the 5-tuple (wg_m, wg_n, sg_m, sg_n, k_tile); every #xegpu.layout is
+# derived from it (see xe_forge.core.linalg_lowering.LoweringConfig). The optimizer
+# proposes configs; the CoVeR gate verifies each by lowering + running on the GPU.
+#
+# Target: Intel Xe2 (Battlemage) — SIMD16 subgroups, XMX/DPAS tiles A=[8,16]
+# B=[16,16] C=[8,16]. Max 1024 work-items per workgroup.
+
+constraints:
+  - id: lowering_wg_divisible_by_sg
+    name: Workgroup tile must be divisible by subgroup tile
+    severity: critical
+    description: |
+      wg_m % sg_m == 0 and wg_n % sg_n == 0. The subgroup grid is
+      [wg_m/sg_m, wg_n/sg_n]; non-divisible tiles fail to lower.
+
+  - id: lowering_sg_dpas_aligned
+    name: Subgroup + k tiles must be multiples of the DPAS shape
+    severity: critical
+    description: |
+      sg_m % 8 == 0, sg_n % 16 == 0, k_tile % 16 == 0 (DPAS A=[8,16], B=[16,16]).
+      Misaligned tiles either fail to lower or fall off the XMX path.
+
+  - id: lowering_threads_le_1024
+    name: Threads per workgroup must not exceed 1024
+    severity: critical
+    description: |
+      nb_threads = (wg_m/sg_m) * (wg_n/sg_n) * 16 must be <= 1024. Equivalently,
+      the number of subgroups per workgroup must be <= 64. Larger tiles need
+      larger sg tiles to stay within budget.
+
+  - id: lowering_shape_divisible
+    name: Problem dims should be divisible by the tile sizes
+    severity: high
+    description: |
+      For a GEMM MxNxK: M % wg_m == 0, N % wg_n == 0, K % k_tile == 0. If not,
+      choose smaller tiles (boundary handling is not yet generated).
+
+patterns:
+  - id: lowering_config_balanced_256
+    name: Balanced 256x256 WG tile (default, compute-bound GEMM)
+    stage: device_specific
+    description: |
+      wg=[256,256] sg=[32,32] k_tile=32 -> subgroup grid [8,8], 1024 threads.
+      Large square tile maximizes DPAS reuse; the proven Phase-0 default. Best
+      when M,N are large multiples of 256 and the kernel is compute-bound.
+    expected_speedup: "baseline for large GEMM"
+    applies_to: ["gemm", "matmul"]
+
+  - id: lowering_config_skinny_m
+    name: 128x256 WG tile for skinny-M or register-pressure cases
+    stage: device_specific
+    description: |
+      wg=[128,256] sg=[32,32] k_tile=32 -> subgroup grid [4,8], 512 threads.
+      Fewer threads / smaller M tile: use when M is small, when the 256x256 tile
+      spills GRF, or to raise occupancy on memory-bound shapes.
+    expected_speedup: "wins on skinny-M / high-register-pressure kernels"
+    applies_to: ["gemm", "matmul"]
+
+  - id: lowering_config_large_ktile
+    name: Larger k_tile to amortize load latency
+    stage: device_specific
+    description: |
+      wg=[256,256] sg=[32,32] k_tile=64 -> more DPAS issues per K iteration,
+      fewer loop iterations. Trades register pressure for reduced load overhead;
+      try when the K dimension is large and the kernel is memory-latency bound.
+    expected_speedup: "1.05-1.3x on large-K, latency-bound GEMM"
+    applies_to: ["gemm", "matmul"]
+
+  - id: lowering_config_small_tile_odd_shapes
+    name: 128x128 WG tile for smaller / less-divisible shapes
+    stage: device_specific
+    description: |
+      wg=[128,128] sg=[32,32] k_tile=32 -> subgroup grid [4,4], 256 threads.
+      Use when M or N is not divisible by 256; smaller tiles fit more shapes and
+      raise occupancy at the cost of per-tile arithmetic intensity.
+    expected_speedup: "enables shapes not divisible by 256; may be slower per tile"
+    applies_to: ["gemm", "matmul"]

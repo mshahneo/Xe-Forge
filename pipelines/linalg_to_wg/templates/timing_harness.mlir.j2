@@ -1,0 +1,104 @@
+// Kernel-only timing harness (rendered per lowering config).
+// Wraps a spliced XeGPU gpu.module (KERNEL marker below) in an @main that allocates
+// device buffers ONCE, then brackets only the repeated gpu.launch_func with
+// rtclock — so the reported "Average time (ms)" reflects kernel time, not the
+// per-call host alloc/copy overhead. Grid/threads are derived from the config.
+//
+// Kernel ABI (from the Linalg->WG lowering): @{{ kernel_name }}(C: memref<MxNxf32>,
+// A: memref<MxKxf16>, B: memref<KxNxf16>), grid [M/wg_m, N/wg_n], threads nb_threads.
+// ALIASES
+module attributes {gpu.container_module} {
+  // KERNEL
+  func.func @main() attributes {llvm.emit_c_interface} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %cM = arith.constant {{ m }} : index
+    %cN = arith.constant {{ n }} : index
+    %grid_m = arith.constant {{ grid_m }} : index
+    %grid_n = arith.constant {{ grid_n }} : index
+    %threads = arith.constant {{ nb_threads }} : index
+    %nwarmup = arith.constant 20 : index
+    %nruns = arith.constant 100 : index
+    %c1000_f64 = arith.constant 1000.0 : f64
+    %c0_f32 = arith.constant 0.0 : f32
+    %c2_f32 = arith.constant 2.0 : f32
+    %c3_f32 = arith.constant 3.0 : f32
+
+    // Host allocations + fills.
+    %A = memref.alloc() : memref<{{ m }}x{{ k }}xf16>
+    %B = memref.alloc() : memref<{{ k }}x{{ n }}xf16>
+    %C = memref.alloc() : memref<{{ m }}x{{ n }}xf32>
+    %C_ref = memref.alloc() : memref<{{ m }}x{{ n }}xf32>
+    %C_zero = memref.alloc() : memref<{{ m }}x{{ n }}xf32>  // stays zero: re-zero source
+    %A_cast = memref.cast %A : memref<{{ m }}x{{ k }}xf16> to memref<*xf16>
+    call @fillResource1DF16(%A_cast, %c2_f32) : (memref<*xf16>, f32) -> ()
+    %B_cast = memref.cast %B : memref<{{ k }}x{{ n }}xf16> to memref<*xf16>
+    call @fillResource1DF16(%B_cast, %c3_f32) : (memref<*xf16>, f32) -> ()
+    scf.for %i = %c0 to %cM step %c1 {
+      scf.for %j = %c0 to %cN step %c1 {
+        memref.store %c0_f32, %C[%i, %j] : memref<{{ m }}x{{ n }}xf32>
+        memref.store %c0_f32, %C_ref[%i, %j] : memref<{{ m }}x{{ n }}xf32>
+        memref.store %c0_f32, %C_zero[%i, %j] : memref<{{ m }}x{{ n }}xf32>
+      }
+    }
+
+    // Device buffers, copied in once.
+    %A_gpu = gpu.alloc () : memref<{{ m }}x{{ k }}xf16>
+    gpu.memcpy %A_gpu, %A : memref<{{ m }}x{{ k }}xf16>, memref<{{ m }}x{{ k }}xf16>
+    %B_gpu = gpu.alloc () : memref<{{ k }}x{{ n }}xf16>
+    gpu.memcpy %B_gpu, %B : memref<{{ k }}x{{ n }}xf16>, memref<{{ k }}x{{ n }}xf16>
+    %C_gpu = gpu.alloc () : memref<{{ m }}x{{ n }}xf32>
+    gpu.memcpy %C_gpu, %C : memref<{{ m }}x{{ n }}xf32>, memref<{{ m }}x{{ n }}xf32>
+
+    // --- Correctness launch: fresh zeroed C, one launch, copy back + check.
+    // NOTE: the kernel reads C as the DPAS accumulator init (folded linalg.fill 0),
+    // so C_gpu MUST be re-zeroed before every launch — otherwise successive launches
+    // accumulate. C_gpu was just memcpy'd from the zeroed host C above.
+    gpu.launch_func @{{ kernel_name }}::@{{ kernel_name }} blocks in (%grid_m, %grid_n, %c1) threads in (%threads, %c1, %c1) args(%C_gpu : memref<{{ m }}x{{ n }}xf32>, %A_gpu : memref<{{ m }}x{{ k }}xf16>, %B_gpu : memref<{{ k }}x{{ n }}xf16>)
+    gpu.wait
+    gpu.memcpy %C, %C_gpu : memref<{{ m }}x{{ n }}xf32>, memref<{{ m }}x{{ n }}xf32>
+    %C_ref_cast = memref.cast %C_ref : memref<{{ m }}x{{ n }}xf32> to memref<*xf32>
+    call @gemmF16F16F32(%A_cast, %B_cast, %C_ref_cast) : (memref<*xf16>, memref<*xf16>, memref<*xf32>) -> ()
+    // CHECK: [ALLCLOSE: TRUE]
+    %C_cast = memref.cast %C : memref<{{ m }}x{{ n }}xf32> to memref<*xf32>
+    %eq = arith.constant false
+    call @printAllcloseF32(%C_cast, %C_ref_cast, %eq) : (memref<*xf32>, memref<*xf32>, i1) -> ()
+
+    // --- Timing: re-zero C_gpu before each launch so the accumulator init is 0.
+    // The re-zero (gpu.memcpy of a zeroed buffer) is constant overhead across configs.
+    // Warmup.
+    scf.for %arg = %c0 to %nwarmup step %c1 {
+      gpu.memcpy %C_gpu, %C_zero : memref<{{ m }}x{{ n }}xf32>, memref<{{ m }}x{{ n }}xf32>
+      gpu.launch_func @{{ kernel_name }}::@{{ kernel_name }} blocks in (%grid_m, %grid_n, %c1) threads in (%threads, %c1, %c1) args(%C_gpu : memref<{{ m }}x{{ n }}xf32>, %A_gpu : memref<{{ m }}x{{ k }}xf16>, %B_gpu : memref<{{ k }}x{{ n }}xf16>)
+      gpu.wait
+    }
+    // Timed loop.
+    %t0 = func.call @rtclock() : () -> f64
+    scf.for %arg = %c0 to %nruns step %c1 {
+      gpu.memcpy %C_gpu, %C_zero : memref<{{ m }}x{{ n }}xf32>, memref<{{ m }}x{{ n }}xf32>
+      gpu.launch_func @{{ kernel_name }}::@{{ kernel_name }} blocks in (%grid_m, %grid_n, %c1) threads in (%threads, %c1, %c1) args(%C_gpu : memref<{{ m }}x{{ n }}xf32>, %A_gpu : memref<{{ m }}x{{ k }}xf16>, %B_gpu : memref<{{ k }}x{{ n }}xf16>)
+      gpu.wait
+    }
+    %t1 = func.call @rtclock() : () -> f64
+    %dt = arith.subf %t1, %t0 : f64
+    %nruns_i64 = arith.index_cast %nruns : index to i64
+    %nruns_f64 = arith.sitofp %nruns_i64 : i64 to f64
+    %avg = arith.divf %dt, %nruns_f64 : f64
+    %avg_ms = arith.mulf %avg, %c1000_f64 : f64
+    vector.print str "Average time (ms): "
+    vector.print %avg_ms : f64
+
+    gpu.dealloc %A_gpu : memref<{{ m }}x{{ k }}xf16>
+    gpu.dealloc %B_gpu : memref<{{ k }}x{{ n }}xf16>
+    gpu.dealloc %C_gpu : memref<{{ m }}x{{ n }}xf32>
+    memref.dealloc %A : memref<{{ m }}x{{ k }}xf16>
+    memref.dealloc %B : memref<{{ k }}x{{ n }}xf16>
+    memref.dealloc %C : memref<{{ m }}x{{ n }}xf32>
+    memref.dealloc %C_ref : memref<{{ m }}x{{ n }}xf32>
+    return
+  }
+  func.func private @rtclock() -> f64
+  func.func private @fillResource1DF16(memref<*xf16>, f32) attributes {llvm.emit_c_interface}
+  func.func private @gemmF16F16F32(memref<*xf16>, memref<*xf16>, memref<*xf32>) attributes {llvm.emit_c_interface}
+  func.func private @printAllcloseF32(memref<*xf32>, memref<*xf32>, i1) attributes {llvm.emit_c_interface}
+}

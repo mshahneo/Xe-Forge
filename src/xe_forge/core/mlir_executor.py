@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -125,6 +126,7 @@ class MlirExecutor:
         self._build_dir: str | None = None
 
         self.imex_opt = str(Path(bin_dir) / "imex-opt")
+        self.mlir_opt = str(Path(bin_dir) / "mlir-opt")
         self.mlir_runner = str(Path(bin_dir) / "mlir-runner")
         self._shared_libs = [str(Path(lib_dir) / name) for name in _RUNTIME_LIBS]
 
@@ -340,6 +342,219 @@ class MlirExecutor:
             feedback_message=msg,
         )
 
+    # ------------------------------------------------------------------
+    # Two-level flow: lower a bare Linalg kernel to XeGPU WG-level
+    # ------------------------------------------------------------------
+    def lower_linalg_to_wg(self, linalg_code: str, config) -> tuple[bool, str, str]:
+        """Lower a bare Linalg matmul kernel to XeGPU WG-level IR under *config*.
+
+        *config* is a LoweringConfig (xe_forge.core.linalg_lowering). Renders the
+        two transform libraries for the config, then runs the 3-stage recipe:
+          1. transform-interpreter with the tile/vectorize library
+          2. gpu-kernel-outlining + xevm-attach-target + gpu.module(vector->xegpu)
+          3. transform-interpreter with the WG layout-annotation library
+
+        Returns (success, wg_code, error_message).
+        """
+        errs = config.validate()
+        if errs:
+            return False, "", f"invalid lowering config: {'; '.join(errs)}"
+
+        work = tempfile.mkdtemp(prefix="mlir_lower_")
+        try:
+            tile_lib, anno_lib = config.render(work)
+            src = Path(work) / "input.mlir"
+            src.write_text(linalg_code)
+
+            # Stage 1
+            s1 = self._run_opt(
+                [str(src),
+                 f"--transform-preload-library=transform-library-paths={tile_lib}",
+                 "--transform-interpreter"],
+                use_imex=False,
+            )
+            if not s1.ok:
+                return False, "", f"LOWERING stage1 (tile/vectorize) failed:\n{_tail(s1.err)}"
+
+            # Stage 2 (normal pass pipeline; dlti-safe)
+            s2 = self._run_opt(
+                ["-",
+                 "--pass-pipeline=builtin.module(gpu-kernel-outlining, "
+                 "xevm-attach-target{chip=bmg O=3}, "
+                 "gpu.module(convert-vector-to-xegpu))"],
+                use_imex=False,
+                stdin=s1.out,
+            )
+            if not s2.ok:
+                return False, "", f"LOWERING stage2 (outline/xegpu) failed:\n{_tail(s2.err)}"
+
+            # Stage 3
+            s3 = self._run_opt(
+                ["-",
+                 f"--transform-preload-library=transform-library-paths={anno_lib}",
+                 "--transform-interpreter"],
+                use_imex=False,
+                stdin=s2.out,
+            )
+            if not s3.ok:
+                return False, "", f"LOWERING stage3 (wg-annotate) failed:\n{_tail(s3.err)}"
+
+            return True, s3.out.decode(errors="replace"), ""
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def sweep_configs(
+        self,
+        linalg_code: str,
+        harness: str | None,
+        configs,
+        flop=None,
+        dims: tuple[int, int, int] | None = None,
+    ):
+        """Lower *linalg_code* under each config, run on GPU, rank by kernel time.
+
+        Two modes:
+          - Timed (preferred): pass ``dims=(M, N, K)`` and ``harness=None``. For each
+            config a kernel-only rtclock timing harness is rendered
+            (render_timing_harness) and only the lowered ``gpu.module`` is spliced in,
+            so ``Average time (ms)`` reflects kernel time. Configs are ranked by that.
+          - Legacy (correctness-only): pass a full ``harness`` with a ``// KERNEL``
+            marker and no dims; the whole lowered body is spliced (no timing signal).
+
+        Each candidate must pass ``[ALLCLOSE: TRUE]``. Returns
+        (best_config, best_wg_code, best_result, all_results). Invalid/failing configs
+        are skipped.
+        """
+        from xe_forge.core.linalg_lowering import render_timing_harness
+
+        results = []
+        best = None
+        for cfg in configs:
+            ok, wg, err = self.lower_linalg_to_wg(linalg_code, cfg)
+            if not ok:
+                logger.info("config %s: lowering failed (%s)", cfg, _tail(err, 2))
+                results.append((cfg, None, err))
+                continue
+            if dims is not None:
+                m, n, k = dims
+                kname = _kernel_name(wg)
+                timing_harness = render_timing_harness(cfg, m, n, k, kernel_name=kname)
+                runnable = self._splice_kernel(timing_harness, wg, kernel_only=True)
+            else:
+                runnable = self._splice_kernel(harness, wg)
+            r = self.execute(kernel_code=runnable, output_name="sweep", flop=flop)
+            ok_run = r.success and (r.output_correct is not False)
+            ms = r.execution_time_ms if ok_run else None
+            logger.info(
+                "config %s: %s%s",
+                cfg,
+                "OK" if ok_run else f"FAIL ({_tail(r.error_message or '', 2)})",
+                f" {ms:.4f}ms" if ms else "",
+            )
+            results.append((cfg, r, None))
+            if ok_run:
+                score = ms if ms is not None else float("inf")
+                if best is None or score < best[0]:
+                    best = (score, cfg, wg, r)
+        if best is None:
+            return None, None, None, results
+        return best[1], best[2], best[3], results
+
+    @staticmethod
+    def _splice_kernel(harness: str, wg_code: str, kernel_only: bool = False) -> str:
+        """Splice the lowered WG kernel into *harness*.
+
+        The lowered module is:  <alias defs> module {...host @test... gpu.module...}
+        The harness is:         <// ALIASES> module { // KERNEL  ...@main... }
+        Alias defs (``#map = ...``) are hoisted to the ``// ALIASES`` slot.
+
+        If *kernel_only*, only the ``gpu.module`` (the device kernel) is spliced —
+        used with the timing harness, which supplies its own host launch/@main.
+        Otherwise the whole module body (host @test + gpu.module) is spliced.
+        """
+        text = wg_code.strip()
+        mod_at = text.find("module")
+        aliases = text[:mod_at].strip()
+        body = text[mod_at:]
+
+        if kernel_only:
+            inner = _extract_gpu_module(body)
+        else:
+            # Find the module's *body* opening brace, skipping the optional
+            # "attributes {...}" dict.
+            i = body.find("{")
+            prefix = body[:i]
+            if prefix.rstrip().endswith("attributes"):
+                depth = 0
+                j = i
+                while j < len(body):
+                    if body[j] == "{":
+                        depth += 1
+                    elif body[j] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                i = body.find("{", j + 1)
+            inner = body[i + 1 : body.rfind("}")].strip()
+
+        out = harness.replace("// KERNEL", inner)
+        if "// ALIASES" in out:
+            out = out.replace("// ALIASES", aliases)
+        elif aliases:
+            out = aliases + "\n" + out
+        return out
+
+    def _run_opt(self, args, use_imex=False, stdin: bytes | None = None):
+        """Run mlir-opt (or imex-opt) with *args*; return a small result holder."""
+        tool = self.imex_opt if use_imex else self.mlir_opt
+        try:
+            p = subprocess.run(
+                [tool, *args],
+                input=stdin,
+                capture_output=True,
+                timeout=self.compile_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return _OptResult(False, b"", b"mlir-opt timed out")
+        return _OptResult(p.returncode == 0, p.stdout, p.stderr)
+
+
+@dataclass
+class _OptResult:
+    ok: bool
+    out: bytes
+    err: bytes
+
+    @property
+    def error(self) -> str:
+        return self.err.decode(errors="replace")
+
+
+def _kernel_name(wg_code: str) -> str:
+    """Return the outlined gpu.func kernel name (defaults to 'test_kernel')."""
+    m = re.search(r"gpu\.func @(\w+)", wg_code)
+    return m.group(1) if m else "test_kernel"
+
+
+def _extract_gpu_module(text: str) -> str:
+    """Return the full ``gpu.module {...}`` op (brace-matched) from *text*."""
+    start = text.find("gpu.module")
+    if start == -1:
+        return ""
+    brace = text.find("{", start)
+    depth = 0
+    j = brace
+    while j < len(text):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : j + 1]
+        j += 1
+    return text[start:]
+
 
 def _interleave(flag: str, values: list[str]) -> list[str]:
     out: list[str] = []
@@ -348,6 +563,8 @@ def _interleave(flag: str, values: list[str]) -> list[str]:
     return out
 
 
-def _tail(text: str, n: int = 40) -> str:
+def _tail(text, n: int = 40) -> str:
+    if isinstance(text, (bytes, bytearray)):
+        text = text.decode(errors="replace")
     lines = text.strip().splitlines()
     return "\n".join(lines[-n:])

@@ -1,0 +1,26 @@
+// Stage-3 transform library (rendered from a lowering config).
+// Seeds WG #xegpu.layout on the A/B loads, the dpas operands (a/b/cd), and the
+// store. All layouts are derived from the config:
+//   sg_layout  = [wg_m/sg_m, wg_n/sg_n]   (subgroup grid over the WG tile)
+//   A: sg_data=[sg_m, k_tile]  sg_layout=[wg_m/sg_m, 1]   inst_data=DPAS.A_TILE [8,16]
+//   B: sg_data=[k_tile, sg_n]  sg_layout=[1, wg_n/sg_n]   inst_data=DPAS.B_TILE [16,16]
+//   C: sg_data=[sg_m, sg_n]    sg_layout=[wg_m/sg_m, wg_n/sg_n]  inst_data=DPAS.C_TILE [8,16]
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.any_op {transform.readonly}) {
+    %dpas = transform.structured.match ops{["xegpu.dpas"]} in %root : (!transform.any_op) -> !transform.any_op
+    %aval = transform.get_operand %dpas[0] : (!transform.any_op) -> !transform.any_value
+    %aload = transform.xegpu.get_load_op %aval : (!transform.any_value) -> !transform.any_op
+    %bval = transform.get_operand %dpas[1] : (!transform.any_op) -> !transform.any_value
+    %bload = transform.xegpu.get_load_op %bval : (!transform.any_value) -> !transform.any_op
+    // A operand: M tiled across subgroups, K whole per subgroup
+    transform.xegpu.set_anchor_layout %aload sg_layout = [{{ sg_grid_m }}, 1] sg_data = [{{ sg_m }}, {{ k_tile }}] inst_data = [8, 16] : !transform.any_op
+    // B operand: K whole, N tiled across subgroups
+    transform.xegpu.set_anchor_layout %bload sg_layout = [1, {{ sg_grid_n }}] sg_data = [{{ k_tile }}, {{ sg_n }}] inst_data = [16, 16] : !transform.any_op
+    transform.xegpu.set_anchor_layout %dpas index = 0 sg_layout = [{{ sg_grid_m }}, 1] sg_data = [{{ sg_m }}, {{ k_tile }}] inst_data = [8, 16] : !transform.any_op
+    transform.xegpu.set_anchor_layout %dpas index = 1 sg_layout = [1, {{ sg_grid_n }}] sg_data = [{{ k_tile }}, {{ sg_n }}] inst_data = [16, 16] : !transform.any_op
+    transform.xegpu.set_anchor_layout %dpas index = 2 sg_layout = [{{ sg_grid_m }}, {{ sg_grid_n }}] sg_data = [{{ sg_m }}, {{ sg_n }}] inst_data = [8, 16] : !transform.any_op
+    %store = transform.structured.match ops{["xegpu.store_nd"]} in %root : (!transform.any_op) -> !transform.any_op
+    transform.xegpu.set_anchor_layout %store sg_layout = [{{ sg_grid_m }}, {{ sg_grid_n }}] sg_data = [{{ sg_m }}, {{ sg_n }}] inst_data = [8, 16] : !transform.any_op
+    transform.yield
+  }
+}

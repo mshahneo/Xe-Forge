@@ -43,6 +43,8 @@ class OptimizationStage(StrEnum):
     AUTOTUNING = "autotuning"
     DISCOVERY = "discovery"  # handles open_ended issues — novel optimizations
     # not covered by any existing stage
+    LINALG_LOWERING = "linalg_lowering"  # MLIR two-level: tune the Linalg->XeGPU-WG
+    # lowering config (tile/subgroup sizes), then continue at WG level
 
 
 class IssueType(StrEnum):
