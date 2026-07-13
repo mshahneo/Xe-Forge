@@ -29,6 +29,12 @@ class ConfigProposal(BaseModel):
     sg_m: int = Field(description="Subgroup tile M, multiple of 8 (e.g. 32)")
     sg_n: int = Field(description="Subgroup tile N, multiple of 16 (e.g. 32)")
     k_tile: int = Field(description="K-loop tile, multiple of 16 (e.g. 32, 64)")
+    large_grf: bool = Field(
+        default=False,
+        description="Enable Intel Xe (BMG) large register file. Requires <=32 "
+        "subgroups per workgroup, i.e. (wg_m/sg_m)*(wg_n/sg_n) <= 32. Helps "
+        "register-pressure-bound tiles (large sg tiles) at the cost of occupancy.",
+    )
     rationale: str = Field(default="", description="Why this config suits the shape")
 
 
@@ -43,10 +49,13 @@ class LoweringConfigSignature(dspy.Signature):
       - sg_m/sg_n: the per-subgroup tile; subgroup grid = [wg_m/sg_m, wg_n/sg_n].
       - k_tile: the k-loop step.
 
+    Each config may also set large_grf (Intel Xe / BMG large register file).
+
     HARD CONSTRAINTS (configs violating these are discarded):
       - wg_m % sg_m == 0 and wg_n % sg_n == 0
       - sg_m % 8 == 0, sg_n % 16 == 0, k_tile % 16 == 0   (DPAS alignment)
-      - (wg_m/sg_m) * (wg_n/sg_n) * 16 <= 1024            (thread budget)
+      - subgroups = (wg_m/sg_m) * (wg_n/sg_n); subgroups <= 64
+      - if large_grf: subgroups <= 32                     (large-GRF halves budget)
       - M % wg_m == 0, N % wg_n == 0, K % k_tile == 0     (fits the shape)
 
     GUIDANCE:
@@ -55,6 +64,10 @@ class LoweringConfigSignature(dspy.Signature):
       - Smaller / skinny tiles (128x256, 128x128) raise occupancy and fit
         shapes not divisible by 256, or relieve register pressure.
       - Larger k_tile (64) amortizes load latency on large-K, memory-bound cases.
+      - large_grf helps when each subgroup does a lot of work (large sg tile, e.g.
+        sg 64x32 or 64x64) and is register-pressure-bound. It forces <=32
+        subgroups, so pair it with larger sg tiles; try a large-GRF variant of a
+        promising large-sg-tile config alongside its small-GRF version.
     Propose a spread that brackets the likely optimum, not near-duplicates.
     """
 
@@ -103,7 +116,10 @@ class LinalgLoweringAgent:
                 knowledge_base_context=self._kb_context(),
             )
             for p in pred.configs or []:
-                cfg = LoweringConfig(p.wg_m, p.wg_n, p.sg_m, p.sg_n, p.k_tile)
+                cfg = LoweringConfig(
+                    p.wg_m, p.wg_n, p.sg_m, p.sg_n, p.k_tile,
+                    large_grf=bool(getattr(p, "large_grf", False)),
+                )
                 if cfg.validate():
                     logger.info("discarding invalid proposed config %s", cfg)
                     continue

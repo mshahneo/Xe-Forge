@@ -25,6 +25,13 @@ DPAS_A_TILE = (8, 16)
 DPAS_B_TILE = (16, 16)
 DPAS_C_TILE = (8, 16)
 NB_WORKITEMS = 16  # subgroup (SIMD) width
+MAX_SUBGROUPS = 64  # default (small-GRF) ceiling: 1024 work-items / workgroup
+# Intel Xe (BMG) large-register-file mode: doubles per-thread GRF but halves the
+# subgroup budget to 32/workgroup. Enabled at lowering time via the igc option
+# below; helps register-pressure-bound kernels (large tiles) at the cost of
+# occupancy. See LoweringConfig.large_grf.
+MAX_SUBGROUPS_LARGE_GRF = 32
+LARGE_GRF_IGC_OPTION = "igc-cmd-options=-ze-opt-large-register-file"
 
 _TEMPLATE_DIR = (
     Path(__file__).resolve().parents[3]
@@ -43,6 +50,7 @@ class LoweringConfig:
     sg_m: int  # subgroup tile M
     sg_n: int  # subgroup tile N
     k_tile: int  # k-loop tile
+    large_grf: bool = False  # BMG large register file (<=32 subgroups; igc option)
 
     # ---- derived quantities -------------------------------------------------
     @property
@@ -54,9 +62,19 @@ class LoweringConfig:
         return self.wg_n // self.sg_n
 
     @property
+    def num_subgroups(self) -> int:
+        """Subgroups per workgroup = sg_grid_m * sg_grid_n."""
+        return self.sg_grid_m * self.sg_grid_n
+
+    @property
     def nb_threads(self) -> int:
         """Threads per workgroup = number of subgroups * SIMD width."""
-        return self.sg_grid_m * self.sg_grid_n * NB_WORKITEMS
+        return self.num_subgroups * NB_WORKITEMS
+
+    @property
+    def max_subgroups(self) -> int:
+        """Subgroup ceiling: 32 in large-GRF mode, else 64."""
+        return MAX_SUBGROUPS_LARGE_GRF if self.large_grf else MAX_SUBGROUPS
 
     # ---- validity -----------------------------------------------------------
     def validate(self) -> list[str]:
@@ -73,11 +91,15 @@ class LoweringConfig:
             errs.append(f"sg_n {self.sg_n} not a multiple of DPAS N {DPAS_B_TILE[1]}")
         if self.k_tile % DPAS_A_TILE[1]:
             errs.append(f"k_tile {self.k_tile} not a multiple of DPAS K {DPAS_A_TILE[1]}")
-        # Hardware ceiling: 1024 work-items per workgroup on Xe.
-        if self.nb_threads > 1024:
-            errs.append(f"nb_threads {self.nb_threads} exceeds 1024 (too many subgroups)")
-        if self.nb_threads == 0:
-            errs.append("nb_threads is 0 (sg tile larger than wg tile)")
+        # Subgroup ceiling depends on GRF mode: 32 (large GRF) or 64 (default).
+        if self.num_subgroups > self.max_subgroups:
+            mode = "large-GRF" if self.large_grf else "default"
+            errs.append(
+                f"{self.num_subgroups} subgroups exceeds {self.max_subgroups} "
+                f"({mode} mode); reduce tile or enlarge sg tile"
+            )
+        if self.num_subgroups == 0:
+            errs.append("0 subgroups (sg tile larger than wg tile)")
         return errs
 
     @property
@@ -94,6 +116,20 @@ class LoweringConfig:
         if k % self.k_tile:
             errs.append(f"K {k} not divisible by k_tile {self.k_tile}")
         return errs
+
+    # ---- run-time lowering options -----------------------------------------
+    def run_pipeline_options(self) -> str:
+        """Options string for --gpu-lower-to-xevm-pipeline used to RUN this config.
+
+        Large-GRF mode is a compile-time (igc) flag applied when the final kernel
+        is lowered+run, not a change to the tiling/layout transforms. Returns e.g.
+        ``xegpu-op-level=workgroup`` or, with large_grf,
+        ``xegpu-op-level=workgroup igc-cmd-options=-ze-opt-large-register-file``.
+        """
+        opts = "xegpu-op-level=workgroup"
+        if self.large_grf:
+            opts += " " + LARGE_GRF_IGC_OPTION
+        return opts
 
     # ---- rendering ----------------------------------------------------------
     def _ctx(self) -> dict:

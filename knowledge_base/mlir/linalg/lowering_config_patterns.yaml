@@ -38,6 +38,17 @@ constraints:
       For a GEMM MxNxK: M % wg_m == 0, N % wg_n == 0, K % k_tile == 0. If not,
       choose smaller tiles (boundary handling is not yet generated).
 
+  - id: lowering_large_grf_max_32_subgroups
+    name: Large register file requires <=32 subgroups per workgroup
+    severity: critical
+    description: |
+      Intel Xe (BMG) large-GRF mode doubles per-thread registers but halves the
+      subgroup budget: with large_grf=true, (wg_m/sg_m)*(wg_n/sg_n) must be <= 32
+      (vs 64 default). It is applied at lowering time via the igc option
+      igc-cmd-options=-ze-opt-large-register-file. Pair it with larger subgroup
+      tiles (fewer, heavier subgroups) — that is exactly the register-pressure
+      regime where the extra GRF pays off.
+
 patterns:
   - id: lowering_config_balanced_256
     name: Balanced 256x256 WG tile (default, compute-bound GEMM)
@@ -77,4 +88,17 @@ patterns:
       Use when M or N is not divisible by 256; smaller tiles fit more shapes and
       raise occupancy at the cost of per-tile arithmetic intensity.
     expected_speedup: "enables shapes not divisible by 256; may be slower per tile"
+    applies_to: ["gemm", "matmul"]
+
+  - id: lowering_config_large_grf_heavy_subgroup
+    name: Large register file with heavy subgroup tiles (<=32 subgroups)
+    stage: device_specific
+    description: |
+      wg=[256,256] sg=[64,32] k_tile=32 large_grf=true -> subgroup grid [4,8],
+      32 subgroups. Each subgroup does 2x the M-work of a 32x32 tile, raising
+      register pressure — exactly where BMG large-GRF (2x GRF per thread) helps.
+      Always try this as a large-GRF variant of a heavy-sg-tile config next to
+      its small-GRF version; the sweep picks the faster. large_grf caps subgroups
+      at 32, so it MUST be paired with larger sg tiles.
+    expected_speedup: "up to ~1.4x vs the same 32-subgroup tile without large GRF"
     applies_to: ["gemm", "matmul"]

@@ -153,11 +153,16 @@ class MlirExecutor:
         kernel_path: str | None = None,
         output_name: str = "kernel_mlir",
         flop: float | None = None,
+        pipeline_options: str | None = None,
     ) -> ExecutionResult:
         """Lower + run a self-contained WG-level .mlir file.
 
         Correctness is read from the in-file ``[ALLCLOSE: TRUE]`` marker;
         runtime (ms) from an rtclock-printed seconds value when present.
+
+        *pipeline_options* overrides the ``--gpu-lower-to-xevm-pipeline`` options
+        (e.g. to enable large-GRF via ``igc-cmd-options=-ze-opt-large-register-file``).
+        The options may contain spaces; the flag is passed as a single argv token.
         """
         if kernel_code is not None:
             src_path = Path(self.build_dir) / f"{output_name}.mlir"
@@ -167,10 +172,18 @@ class MlirExecutor:
         else:
             return ExecutionResult(success=False, error_message="No source code or path provided")
 
+        # Build the lowering flag. When options are given, pass the whole
+        # "--gpu-lower-to-xevm-pipeline=<opts>" as ONE argv token (opts may
+        # contain a space, e.g. the igc large-GRF option).
+        if pipeline_options is not None:
+            pipeline_args = [f"--gpu-lower-to-xevm-pipeline={pipeline_options}"]
+        else:
+            pipeline_args = self.pipeline.split()
+
         # Stage 1: lower with imex-opt.
         try:
             lowered = subprocess.run(
-                [self.imex_opt, str(src_path), *self.pipeline.split()],
+                [self.imex_opt, str(src_path), *pipeline_args],
                 capture_output=True,
                 timeout=self.compile_timeout,
             )
@@ -442,7 +455,13 @@ class MlirExecutor:
                 runnable = self._splice_kernel(timing_harness, wg, kernel_only=True)
             else:
                 runnable = self._splice_kernel(harness, wg)
-            r = self.execute(kernel_code=runnable, output_name="sweep", flop=flop)
+            # Large-GRF is a run-time (igc) lowering flag carried by the config.
+            r = self.execute(
+                kernel_code=runnable,
+                output_name="sweep",
+                flop=flop,
+                pipeline_options=cfg.run_pipeline_options(),
+            )
             ok_run = r.success and (r.output_correct is not False)
             ms = r.execution_time_ms if ok_run else None
             logger.info(
