@@ -118,9 +118,21 @@ class MlirExecutor:
         use_imex_profiling: bool = True,
         imex_warmups: int = 10,
         imex_runs: int = 10,
+        large_grf: bool | None = None,
     ):
         self.bin_dir = bin_dir
         self.lib_dir = lib_dir
+        # WG-level XeGPU kernels are often written for BMG large register file
+        # (their gpu.module carries the target attr, but the igc pipeline option
+        # must also be passed or they run ~9x slower). Append it to the default
+        # pipeline when large_grf is set (env MLIR_LARGE_GRF=1, or explicit arg).
+        if large_grf is None:
+            large_grf = os.environ.get("MLIR_LARGE_GRF", "") not in ("", "0", "false", "False")
+        self.large_grf = large_grf
+        if large_grf and "large-register-file" not in pipeline:
+            # Append the igc option INSIDE the pipeline value (it must stay one
+            # argv token — execute() handles the space via _pipeline_args()).
+            pipeline = pipeline + " igc-cmd-options=-ze-opt-large-register-file"
         self.pipeline = pipeline
         self.compile_timeout = compile_timeout
         self.run_timeout = run_timeout
@@ -188,11 +200,13 @@ class MlirExecutor:
         else:
             return ExecutionResult(success=False, error_message="No source code or path provided")
 
-        # Build the lowering flag. When options are given, pass the whole
-        # "--gpu-lower-to-xevm-pipeline=<opts>" as ONE argv token (opts may
-        # contain a space, e.g. the igc large-GRF option).
+        # Build the lowering flag. The pipeline value may contain a space (e.g.
+        # the igc large-GRF option), so the whole "--gpu-lower-to-xevm-pipeline=
+        # <opts>" must be ONE argv token, not naively split.
         if pipeline_options is not None:
             pipeline_args = [f"--gpu-lower-to-xevm-pipeline={pipeline_options}"]
+        elif self.pipeline.startswith("--gpu-lower-to-xevm-pipeline="):
+            pipeline_args = [self.pipeline]  # keep embedded spaces intact
         else:
             pipeline_args = self.pipeline.split()
 
@@ -313,19 +327,24 @@ class MlirExecutor:
 
         Each file self-verifies against its embedded CPU reference, so the
         optimized kernel's own ``[ALLCLOSE: TRUE]`` is the correctness gate.
-        Speedup uses rtclock timing when the harness prints it.
+        Timing uses IMEX level-zero profiling (Median ms) when enabled — this
+        works even for single-launch harnesses (no rtclock loop needed); it falls
+        back to any rtclock "Average time (ms)" the harness prints otherwise.
         """
+        prof = self.use_imex_profiling
         orig = self.execute(
             kernel_code=original_code,
             kernel_path=original_path,
             output_name="original_mlir",
             flop=flop,
+            profile=prof,
         )
         opt = self.execute(
             kernel_code=optimized_code,
             kernel_path=optimized_path,
             output_name="optimized_mlir",
             flop=flop,
+            profile=prof,
         )
 
         if not orig.success:
