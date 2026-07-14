@@ -94,11 +94,15 @@ patterns:
     name: Large register file with heavy subgroup tiles (<=32 subgroups)
     stage: device_specific
     description: |
-      wg=[256,256] sg=[64,32] k_tile=32 large_grf=true -> subgroup grid [4,8],
-      32 subgroups. Each subgroup does 2x the M-work of a 32x32 tile, raising
-      register pressure — exactly where BMG large-GRF (2x GRF per thread) helps.
-      Always try this as a large-GRF variant of a heavy-sg-tile config next to
-      its small-GRF version; the sweep picks the faster. large_grf caps subgroups
-      at 32, so it MUST be paired with larger sg tiles.
-    expected_speedup: "up to ~1.4x vs the same 32-subgroup tile without large GRF"
+      BEST-MEASURED 4K GEMM config on BMG: wg=[256,256] sg=[32,64] k_tile=32
+      large_grf=true -> subgroup grid [8,4], 32 subgroups, 512 threads. Measured
+      ~98 TFLOPS (IMEX profiling), matching/beating the hand-written reference WG
+      kernel — vs ~70 TFLOPS for the small-GRF 64-subgroup sg=[32,32] default.
+      The heavier per-subgroup N tile (sg_n=64) raises register pressure, which is
+      exactly where BMG large-GRF (2x GRF/thread, at the cost of halving the
+      subgroup budget to 32) pays off. Always propose this large-GRF config for a
+      compute-bound GEMM; also try sg=[64,32] (heavy-M) as a variant — the timed
+      sweep picks the faster. large_grf caps subgroups at 32, so pair it with
+      larger sg tiles (sg_m*... keeping (wg_m/sg_m)*(wg_n/sg_n) <= 32).
+    expected_speedup: "~1.4x vs small-GRF 64-subgroup default (70 -> 98 TFLOPS on 4K)"
     applies_to: ["gemm", "matmul"]
