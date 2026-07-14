@@ -194,6 +194,38 @@ def render_timing_harness(
     )
 
 
+def render_profiling_harness(
+    config: LoweringConfig,
+    m: int,
+    n: int,
+    k: int,
+    kernel_name: str = "test_kernel",
+    template_dir: str | Path = _TEMPLATE_DIR,
+) -> str:
+    """Render the single-launch IMEX-profiling harness for *config* at MxNxK.
+
+    Unlike the rtclock timing harness (which loops the launch on the host), this
+    emits ONE gpu.launch_func; IMEX level-zero profiling (env-enabled) does the
+    warmup/timed loops in the runtime and prints "Median: <ms>". Requires a
+    launch-idempotent kernel (zero-init accumulator). Same // KERNEL / // ALIASES
+    splice slots as the timing harness.
+    """
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        undefined=StrictUndefined,
+        keep_trailing_newline=True,
+    )
+    return env.get_template("profiling_harness.mlir.j2").render(
+        m=m,
+        n=n,
+        k=k,
+        grid_m=m // config.wg_m,
+        grid_n=n // config.wg_n,
+        nb_threads=config.nb_threads,
+        kernel_name=kernel_name,
+    )
+
+
 # The config proven end-to-end in Phase 0 (512^3, [ALLCLOSE: TRUE]).
 DEFAULT_CONFIG = LoweringConfig(wg_m=256, wg_n=256, sg_m=32, sg_n=32, k_tile=32)
 

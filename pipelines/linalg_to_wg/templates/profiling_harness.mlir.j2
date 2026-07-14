@@ -1,0 +1,71 @@
+// IMEX-profiling harness (rendered per lowering config).
+// A SINGLE gpu.launch_func: when IMEX_ENABLE_PROFILING is set, the level-zero
+// runtime wraps it in its own warmup + timed loops (with cache flushing) and
+// prints Min/Max/Avg/Median/Std Dev (ms) — pure kernel time, no host overhead.
+// The same launch's result is checked against the CPU reference ([ALLCLOSE]).
+// This requires a launch-idempotent kernel (zero-init accumulator, which the
+// lowering guarantees) since the runtime relaunches without re-zeroing C.
+//
+// Kernel ABI: @{{ kernel_name }}(C: memref<MxNxf32>, A: memref<MxKxf16>,
+// B: memref<KxNxf16>); grid [M/wg_m, N/wg_n]; threads nb_threads.
+// ALIASES
+module attributes {gpu.container_module} {
+  // KERNEL
+  func.func @main() attributes {llvm.emit_c_interface} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %cM = arith.constant {{ m }} : index
+    %cN = arith.constant {{ n }} : index
+    %grid_m = arith.constant {{ grid_m }} : index
+    %grid_n = arith.constant {{ grid_n }} : index
+    %threads = arith.constant {{ nb_threads }} : index
+    %c0_f32 = arith.constant 0.0 : f32
+    %c2_f32 = arith.constant 2.0 : f32
+    %c3_f32 = arith.constant 3.0 : f32
+
+    %A = memref.alloc() : memref<{{ m }}x{{ k }}xf16>
+    %B = memref.alloc() : memref<{{ k }}x{{ n }}xf16>
+    %C = memref.alloc() : memref<{{ m }}x{{ n }}xf32>
+    %C_ref = memref.alloc() : memref<{{ m }}x{{ n }}xf32>
+    %A_cast = memref.cast %A : memref<{{ m }}x{{ k }}xf16> to memref<*xf16>
+    call @fillResource1DF16(%A_cast, %c2_f32) : (memref<*xf16>, f32) -> ()
+    %B_cast = memref.cast %B : memref<{{ k }}x{{ n }}xf16> to memref<*xf16>
+    call @fillResource1DF16(%B_cast, %c3_f32) : (memref<*xf16>, f32) -> ()
+    scf.for %i = %c0 to %cM step %c1 {
+      scf.for %j = %c0 to %cN step %c1 {
+        memref.store %c0_f32, %C[%i, %j] : memref<{{ m }}x{{ n }}xf32>
+        memref.store %c0_f32, %C_ref[%i, %j] : memref<{{ m }}x{{ n }}xf32>
+      }
+    }
+    %A_gpu = gpu.alloc () : memref<{{ m }}x{{ k }}xf16>
+    gpu.memcpy %A_gpu, %A : memref<{{ m }}x{{ k }}xf16>, memref<{{ m }}x{{ k }}xf16>
+    %B_gpu = gpu.alloc () : memref<{{ k }}x{{ n }}xf16>
+    gpu.memcpy %B_gpu, %B : memref<{{ k }}x{{ n }}xf16>, memref<{{ k }}x{{ n }}xf16>
+    %C_gpu = gpu.alloc () : memref<{{ m }}x{{ n }}xf32>
+    gpu.memcpy %C_gpu, %C : memref<{{ m }}x{{ n }}xf32>, memref<{{ m }}x{{ n }}xf32>
+
+    // Single launch: IMEX profiles it internally; result feeds the allclose check.
+    gpu.launch_func @{{ kernel_name }}::@{{ kernel_name }} blocks in (%grid_m, %grid_n, %c1) threads in (%threads, %c1, %c1) args(%C_gpu : memref<{{ m }}x{{ n }}xf32>, %A_gpu : memref<{{ m }}x{{ k }}xf16>, %B_gpu : memref<{{ k }}x{{ n }}xf16>)
+    gpu.wait
+
+    gpu.memcpy %C, %C_gpu : memref<{{ m }}x{{ n }}xf32>, memref<{{ m }}x{{ n }}xf32>
+    %C_ref_cast = memref.cast %C_ref : memref<{{ m }}x{{ n }}xf32> to memref<*xf32>
+    call @gemmF16F16F32(%A_cast, %B_cast, %C_ref_cast) : (memref<*xf16>, memref<*xf16>, memref<*xf32>) -> ()
+    // CHECK: [ALLCLOSE: TRUE]
+    %C_cast = memref.cast %C : memref<{{ m }}x{{ n }}xf32> to memref<*xf32>
+    %eq = arith.constant false
+    call @printAllcloseF32(%C_cast, %C_ref_cast, %eq) : (memref<*xf32>, memref<*xf32>, i1) -> ()
+
+    gpu.dealloc %A_gpu : memref<{{ m }}x{{ k }}xf16>
+    gpu.dealloc %B_gpu : memref<{{ k }}x{{ n }}xf16>
+    gpu.dealloc %C_gpu : memref<{{ m }}x{{ n }}xf32>
+    memref.dealloc %A : memref<{{ m }}x{{ k }}xf16>
+    memref.dealloc %B : memref<{{ k }}x{{ n }}xf16>
+    memref.dealloc %C : memref<{{ m }}x{{ n }}xf32>
+    memref.dealloc %C_ref : memref<{{ m }}x{{ n }}xf32>
+    return
+  }
+  func.func private @fillResource1DF16(memref<*xf16>, f32) attributes {llvm.emit_c_interface}
+  func.func private @gemmF16F16F32(memref<*xf16>, memref<*xf16>, memref<*xf32>) attributes {llvm.emit_c_interface}
+  func.func private @printAllcloseF32(memref<*xf32>, memref<*xf32>, i1) attributes {llvm.emit_c_interface}
+}

@@ -66,6 +66,10 @@ _RUNTIME_LIBS = [
 # Markers emitted by the in-file harness.
 _ALLCLOSE_ANY_RE = re.compile(r"\[ALLCLOSE:\s*(TRUE|FALSE)\]", re.IGNORECASE)
 _FLOAT = r"([-+]?\d+\.\d+(?:[eE][-+]?\d+)?)"
+# IMEX level-zero profiling (mgpuLaunchKernel when IMEX_ENABLE_PROFILING is set)
+# prints "Median: <ms>" among Min/Max/Avg/Median/Std Dev. This is pure kernel
+# time (warmup + timed loops + cache flush inside the runtime), not host time.
+_IMEX_MEDIAN_RE = re.compile(r"^\s*Median:\s*" + _FLOAT, re.IGNORECASE | re.MULTILINE)
 # Preferred: an explicitly labeled timing line, e.g.
 #   "Average time (ms): 8.76411"  or  "GPU time: 1.23 ms"
 # We capture the value and remember whether the label says milliseconds.
@@ -111,6 +115,9 @@ class MlirExecutor:
         run_timeout: int = 300,
         require_correctness: bool = True,
         speedup_tol: float = 0.03,
+        use_imex_profiling: bool = True,
+        imex_warmups: int = 10,
+        imex_runs: int = 10,
     ):
         self.bin_dir = bin_dir
         self.lib_dir = lib_dir
@@ -118,6 +125,14 @@ class MlirExecutor:
         self.compile_timeout = compile_timeout
         self.run_timeout = run_timeout
         self.require_correctness = require_correctness
+        # IMEX level-zero profiling: accurate pure-kernel timing (warmup + timed
+        # loops + cache flush inside the runtime), report-comparable. The kernel
+        # must be launch-idempotent (zero-init accumulator) since IMEX relaunches
+        # it without re-zeroing C — our lowering guarantees this. When off, timing
+        # falls back to any rtclock/"Average time (ms)" the harness prints.
+        self.use_imex_profiling = use_imex_profiling
+        self.imex_warmups = imex_warmups
+        self.imex_runs = imex_runs
         # A candidate is only flagged "slower" when it regresses by more than
         # this fraction. Timing is measured across separate processes, so
         # run-to-run noise of a few percent is expected; without a band,
@@ -154,6 +169,7 @@ class MlirExecutor:
         output_name: str = "kernel_mlir",
         flop: float | None = None,
         pipeline_options: str | None = None,
+        profile: bool = False,
     ) -> ExecutionResult:
         """Lower + run a self-contained WG-level .mlir file.
 
@@ -202,12 +218,25 @@ class MlirExecutor:
             *_interleave("--shared-libs", self._shared_libs),
             "--entry-point-result=void",
         ]
+        run_env = None
+        if profile and self.use_imex_profiling:
+            # Enable IMEX level-zero profiling: the runtime wraps each
+            # gpu.launch_func in warmup + timed loops (+ cache flush) and prints
+            # Min/Max/Avg/Median/Std Dev. Requires a launch-idempotent kernel.
+            run_env = {
+                **os.environ,
+                "IMEX_ENABLE_PROFILING": "ON",
+                "IMEX_PROFILING_WARMUPS": str(self.imex_warmups),
+                "IMEX_PROFILING_RUNS": str(self.imex_runs),
+                "IMEX_ENABLE_CACHE_FLUSHING": "1",
+            }
         try:
             run = subprocess.run(
                 run_cmd,
                 input=lowered.stdout,
                 capture_output=True,
                 timeout=self.run_timeout,
+                env=run_env,
             )
         except subprocess.TimeoutExpired:
             return ExecutionResult(success=False, error_message="mlir-runner timed out")
@@ -231,11 +260,15 @@ class MlirExecutor:
         else:
             correct = True
 
-        # Timing: prefer an explicitly labeled line (already in ms); the harness
-        # computes the average over `nruns` and prints e.g. "Average time (ms): X".
+        # Timing: prefer IMEX profiling "Median:" (pure kernel time) when present,
+        # then an explicitly labeled "Average time (ms): X" (rtclock harness),
+        # then a lone float line (raw-seconds rtclock).
         time_ms: float | None = None
+        mi = _IMEX_MEDIAN_RE.search(stdout)
         m = _TIME_MS_RE.search(stdout)
-        if m:
+        if mi:
+            time_ms = float(mi.group(1))
+        elif m:
             time_ms = float(m.group(1))
         else:
             m = _TIME_LABELED_RE.search(stdout)
@@ -438,7 +471,10 @@ class MlirExecutor:
         (best_config, best_wg_code, best_result, all_results). Invalid/failing configs
         are skipped.
         """
-        from xe_forge.core.linalg_lowering import render_timing_harness
+        from xe_forge.core.linalg_lowering import (
+            render_profiling_harness,
+            render_timing_harness,
+        )
 
         results = []
         best = None
@@ -448,11 +484,17 @@ class MlirExecutor:
                 logger.info("config %s: lowering failed (%s)", cfg, _tail(err, 2))
                 results.append((cfg, None, err))
                 continue
+            use_profile = False
             if dims is not None:
                 m, n, k = dims
                 kname = _kernel_name(wg)
-                timing_harness = render_timing_harness(cfg, m, n, k, kernel_name=kname)
-                runnable = self._splice_kernel(timing_harness, wg, kernel_only=True)
+                if self.use_imex_profiling:
+                    # Single-launch harness; IMEX times the kernel (Median ms).
+                    hb = render_profiling_harness(cfg, m, n, k, kernel_name=kname)
+                    use_profile = True
+                else:
+                    hb = render_timing_harness(cfg, m, n, k, kernel_name=kname)
+                runnable = self._splice_kernel(hb, wg, kernel_only=True)
             else:
                 runnable = self._splice_kernel(harness, wg)
             # Large-GRF is a run-time (igc) lowering flag carried by the config.
@@ -461,6 +503,7 @@ class MlirExecutor:
                 output_name="sweep",
                 flop=flop,
                 pipeline_options=cfg.run_pipeline_options(),
+                profile=use_profile,
             )
             ok_run = r.success and (r.output_correct is not False)
             ms = r.execution_time_ms if ok_run else None
