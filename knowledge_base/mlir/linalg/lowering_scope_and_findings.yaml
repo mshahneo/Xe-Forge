@@ -62,3 +62,37 @@ constraints:
       ideas; for attention there is nothing there to reuse. Stay independent; a
       flash-attention lowering must be built (fuse QK^T + softmax + PV, tiled, no
       materialized scores tensor).
+
+  - id: attention_wg_large_grf_win
+    name: Lighthouse fused-attention WG kernel gains 1.73x from large-GRF
+    severity: info
+    description: |
+      The lighthouse fused flash-attention WG kernel (fused_attention.py output,
+      QK^T + softmax + PV in one gpu.func, 2x8x4096x64 f16, grid 16x32x1, 128
+      threads) does NOT request large register file, but is register-pressure
+      bound (128x64 accumulators). Adding the igc pipeline option
+      igc-cmd-options=-ze-opt-large-register-file drops it from 4.46ms -> 2.58ms
+      (1.73x, IMEX profiling). This is exactly the device-specific lever Xe-Forge
+      should auto-apply to attention kernels. Note: the kernel uses inst_data
+      [8,16]/[16,16] (NOT array_length [32,32]) despite the filename, so there may
+      be further headroom via array_length loads.
+
+  - id: attention_verify_harness_is_expensive
+    name: Verifying an attention WG kernel needs a costly CPU reference
+    severity: high
+    description: |
+      Xe-Forge's WG path requires each kernel file to self-verify with an in-file
+      [ALLCLOSE]. Lighthouse attention outputs (@__benchmark/@payload form) have
+      NO @main entry point and NO correctness oracle, so the executor can't run or
+      verify them and the CoVeR gate is blind. Building an in-MLIR oracle is
+      possible but expensive: the reference is the linalg attention
+      (transpose + batch_matmul + softmax + batch_matmul); linalg.softmax lowers
+      to CPU only after transform.structured.decompose_interface (a plain
+      convert-linalg-to-loops leaves it), then generalize + bufferize + loops
+      gives 0 linalg. BUT the reference materializes and scalar-loops a
+      16x4096x4096 scores tensor on CPU -> impractically slow per-verify (minutes),
+      making the CoVeR loop unusable at this size. Options for a usable oracle:
+      (a) verify at a SMALL shape (e.g. 1x1x256x64) then apply the found config at
+      4k; (b) GPU-computed reference (run a trusted kernel variant, dump output,
+      allclose in numpy) rather than CPU loops; (c) tolerance-free self-comparison
+      for layout-only changes that must be bitwise-identical.
