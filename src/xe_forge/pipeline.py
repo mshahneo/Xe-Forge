@@ -302,6 +302,57 @@ class XeForgePipeline:
         harness = render_timing_harness(best_cfg, m, n, k, kernel_name=_kernel_name(best_wg))
         return executor._splice_kernel(harness, best_wg, kernel_only=True)
 
+    def _maybe_sweep_grf(self, kernel_code: str, flop: float | None):
+        """Autonomously choose large-GRF vs default for a runnable WG-level kernel.
+
+        Large register file is a compile-time pipeline flag (not an IR edit), so
+        both variants run the same kernel IR — correctness is guaranteed and only
+        timing differs. Requires a *runnable* kernel (a @main that launches once);
+        the executor's IMEX profiling times each variant. On a win, flips the
+        executor's default pipeline to large-GRF for all subsequent runs and
+        returns a StageResult; otherwise returns None.
+        """
+        executor = self.executor
+        if not hasattr(executor, "sweep_grf"):
+            return None
+        # sweep_grf runs the kernel via execute(), which needs an @main entry
+        # point that launches once. WG inputs lacking one (e.g. lighthouse's
+        # @__benchmark/@payload form) aren't directly runnable — skip with a note
+        # rather than burning two failing lower+run attempts.
+        if "@main" not in kernel_code:
+            logger.info(
+                "GRF sweep: no @main entry point in WG kernel; skipping "
+                "(kernel not directly runnable)."
+            )
+            return None
+        try:
+            best_large, res = executor.sweep_grf(kernel_code, flop=flop)
+        except Exception as e:
+            logger.warning("GRF sweep failed (%s); skipping.", e)
+            return None
+        d, l = res.get("default_grf"), res.get("large_grf")
+        if d is None and l is None:
+            logger.info("GRF sweep: kernel not runnable as-is; skipping.")
+            return None
+        speedup = (d / l) if (best_large and d and l) else 1.0
+        if best_large:
+            # Persist the choice: subsequent executor runs use large-GRF.
+            if hasattr(executor, "large_grf"):
+                executor.large_grf = True
+                if "large-register-file" not in executor.pipeline:
+                    executor.pipeline = executor.pipeline + " igc-cmd-options=-ze-opt-large-register-file"
+            logger.info("GRF sweep: large-GRF chosen (%.2fx: %.4f -> %.4f ms)", speedup, d, l)
+            return StageResult(
+                stage=OptimizationStage.DEVICE_SPECIFIC,
+                success=True,
+                input_code=kernel_code,
+                output_code=kernel_code,  # IR unchanged; flag applied at lowering
+                changes_made=[f"enabled large register file (igc) — {speedup:.2f}x"],
+                speedup=speedup,
+            )
+        logger.info("GRF sweep: default GRF kept (large-GRF not faster).")
+        return None
+
     def optimize(
         self,
         kernel_code=None,
@@ -487,6 +538,21 @@ class XeForgePipeline:
                     )
                     kernel_code = lowered  # WG stages now operate on the lowered kernel
 
+            # --- Device-specific GRF sweep: for a runnable WG-level kernel, pick
+            # the faster of {default, large} register file. Correctness-free (same
+            # IR, compile-flag only); flips the executor to large-GRF on a win so
+            # all subsequent runs inherit it. Skipped for kernels without @main.
+            grf_stage_result = None
+            from xe_forge.core.linalg_lowering import detect_mlir_level as _detect_level
+
+            if (
+                self.config.device_config.dsl == DSL.MLIR
+                and lowering_stage_result is None  # lowered configs already choose GRF
+                and _detect_level(kernel_code) == "xegpu_wg"
+            ):
+                logger.info("=" * 60 + "\nSTAGE: GRF_SWEEP\n" + "=" * 60)
+                grf_stage_result = self._maybe_sweep_grf(kernel_code, flop)
+
             logger.info("=" * 60 + "\nSTAGE: ANALYSIS\n" + "=" * 60)
             analysis = self.analyzer.analyze(
                 kernel_code,
@@ -499,6 +565,8 @@ class XeForgePipeline:
             result.analysis = analysis
             if lowering_stage_result is not None:
                 result.stages_applied.append(lowering_stage_result)
+            if grf_stage_result is not None:
+                result.stages_applied.append(grf_stage_result)
 
             logger.info(f"Detected {len(analysis.detected_issues)} issues:")
             for iss in analysis.detected_issues:
