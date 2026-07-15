@@ -468,6 +468,47 @@ class MlirExecutor:
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
+    def sweep_grf(self, runnable_wg_kernel: str, flop: float | None = None):
+        """Autonomously pick the faster of {default GRF, large GRF} for a WG kernel.
+
+        Large register file (-ze-opt-large-register-file) is a compile-time igc
+        *pipeline flag*, not a kernel-IR edit, so both variants run the SAME kernel
+        IR — correctness is guaranteed identical and only timing differs. This is
+        the correctness-free, executor-level lever the LLM IR-editing stages can't
+        reach. *runnable_wg_kernel* is a self-contained module with an @main that
+        launches the kernel once (IMEX profiling times it). Returns
+        (best_large_grf: bool, results: dict[str,float]).
+        """
+        base = "xegpu-op-level=workgroup"
+        variants = {
+            "default_grf": base,
+            "large_grf": base + " " + "igc-cmd-options=-ze-opt-large-register-file",
+        }
+        results: dict[str, float | None] = {}
+        for name, opts in variants.items():
+            r = self.execute(
+                kernel_code=runnable_wg_kernel,
+                output_name=f"grf_{name}",
+                flop=flop,
+                pipeline_options=opts,
+                profile=True,
+            )
+            ok = r.success and (r.output_correct is not False)
+            results[name] = r.execution_time_ms if ok else None
+            logger.info(
+                "GRF sweep %s: %s%s",
+                name,
+                "OK" if ok else f"FAIL ({_tail(r.error_message or '', 2)})",
+                f" {r.execution_time_ms:.4f}ms" if ok and r.execution_time_ms else "",
+            )
+        d, l = results["default_grf"], results["large_grf"]
+        # Prefer large-GRF only if it is measurably faster (tolerance band).
+        best_large = (
+            l is not None
+            and (d is None or l < d * (1.0 - self.speedup_tol))
+        )
+        return best_large, results
+
     def sweep_configs(
         self,
         linalg_code: str,
