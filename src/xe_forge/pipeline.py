@@ -269,6 +269,12 @@ class XeForgePipeline:
 
         dims = extract_matmul_dims(kernel_code)
         if dims is None:
+            # Not a plain matmul. Try the fused-attention path (transpose +
+            # batch_matmul QK^T + softmax + batch_matmul PV) via the lighthouse
+            # schedule, which our single-matmul pipeline can't lower directly.
+            attn = self._maybe_lower_attention(kernel_code)
+            if attn is not None:
+                return attn
             logger.warning("Could not extract matmul dims; skipping Linalg lowering.")
             return None
         m, n, k = dims
@@ -301,6 +307,52 @@ class XeForgePipeline:
 
         harness = render_timing_harness(best_cfg, m, n, k, kernel_name=_kernel_name(best_wg))
         return executor._splice_kernel(harness, best_wg, kernel_only=True)
+
+    def _maybe_lower_attention(self, kernel_code: str) -> str | None:
+        """Lower a fused-attention Linalg graph to a runnable WG kernel.
+
+        Recognizes the attention pattern (batch_matmul QK^T + softmax +
+        batch_matmul PV), extracts (Z, H, n_ctx, n_head), and reuses lighthouse's
+        fused_attention.py --dump-kernel=xegpu-wg as the lowering engine (we only
+        consume the dumped .mlir — no run-time lighthouse dependency). Returns a
+        self-contained WG kernel wrapped in a runnable single-launch @main harness
+        (so the GRF sweep can time it), or None if this isn't attention / lowering
+        is unavailable.
+        """
+        from xe_forge.core.attention_lowering import (
+            detect_attention_shape,
+            lower_attention_to_wg,
+            synthesize_run_harness,
+        )
+
+        shape = detect_attention_shape(kernel_code)
+        if shape is None:
+            return None
+        z, h, n_ctx, n_head = shape
+        logger.info(
+            "STAGE: LINALG_LOWERING — fused attention Z=%d H=%d n_ctx=%d n_head=%d "
+            "(lowering via lighthouse)",
+            z,
+            h,
+            n_ctx,
+            n_head,
+        )
+        wg = lower_attention_to_wg(z, h, n_ctx, n_head)
+        if wg is None:
+            return None
+        harness = synthesize_run_harness(wg)
+        if harness is None:
+            logger.warning(
+                "Attention lowered to WG but harness synthesis failed; keeping input."
+            )
+            return None
+        logger.info("Attention lowered to WG-level kernel (runnable harness synthesized).")
+        # Unlike the matmul config sweep (which picks GRF as part of the search),
+        # the lighthouse attention kernel has NOT chosen a GRF mode — the GRF sweep
+        # is exactly where its ~1.7x win comes from. Flag it so optimize() runs the
+        # sweep on the lowered kernel despite a LINALG_LOWERING stage being recorded.
+        self._grf_sweep_after_lowering = True
+        return harness
 
     def _maybe_sweep_grf(self, kernel_code: str, flop: float | None):
         """Autonomously choose large-GRF vs default for a runnable WG-level kernel.
@@ -525,6 +577,7 @@ class XeForgePipeline:
             # --- MLIR two-level flow: lower Linalg -> XeGPU WG *before* analysis,
             # so the WG-level analyzer/stages operate on the lowered kernel.
             lowering_stage_result = None
+            self._grf_sweep_after_lowering = False  # reset per attempt
             if self.config.device_config.dsl == DSL.MLIR:
                 logger.info("=" * 60 + "\nSTAGE: LINALG_LOWERING\n" + "=" * 60)
                 lowered = self._maybe_lower_linalg(kernel_code, flop)
@@ -545,9 +598,13 @@ class XeForgePipeline:
             grf_stage_result = None
             from xe_forge.core.linalg_lowering import detect_mlir_level as _detect_level
 
+            # Matmul lowering picks GRF within its config search, so skip the sweep
+            # there; but an attention-lowered kernel (lighthouse output) hasn't, and
+            # sets _grf_sweep_after_lowering to opt back in.
+            _grf_after_lowering = getattr(self, "_grf_sweep_after_lowering", False)
             if (
                 self.config.device_config.dsl == DSL.MLIR
-                and lowering_stage_result is None  # lowered configs already choose GRF
+                and (lowering_stage_result is None or _grf_after_lowering)
                 and _detect_level(kernel_code) == "xegpu_wg"
             ):
                 logger.info("=" * 60 + "\nSTAGE: GRF_SWEEP\n" + "=" * 60)

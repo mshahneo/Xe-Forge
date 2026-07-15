@@ -77,6 +77,35 @@ constraints:
       [8,16]/[16,16] (NOT array_length [32,32]) despite the filename, so there may
       be further headroom via array_length loads.
 
+  - id: attention_lowering_via_lighthouse_dump
+    name: Fused-attention Linalg lowers to WG by reusing lighthouse's --dump-kernel
+    severity: info
+    description: |
+      The fused-attention Linalg graph (transpose + batch_matmul QK^T + scale +
+      softmax + batch_matmul PV) is out of our single-matmul pipeline's scope, but
+      it lowers end-to-end by reusing lighthouse's schedule as a *lowering engine*:
+      `examples/xegpu/fused_attention.py --dump-kernel=xegpu-wg --batch-size=Z
+      --num-heads=H --n-ctx=n_ctx --n-head=n_head` emits exactly the reference
+      WG kernel (@payload_kernel gpu.module) and EXITS without running — pure IR,
+      no GPU needed (~0.6s via /home/gta/.venv/bin/python which has lighthouse
+      pip-installed; also `uv run` from /data/gta/upstream/lighthouse). We consume
+      the dumped .mlir only (independence-friendly: no run-time lighthouse dep).
+      Implemented in src/xe_forge/core/attention_lowering.py:
+      detect_attention_shape (2 batch_matmul + softmax -> (Z,H,n_ctx,n_head) from
+      the 4-D memref), lower_attention_to_wg (shells out), synthesize_run_harness
+      (parses gpu.func known_grid_size/known_block_size + arg memref types, emits a
+      single-launch @main that gpu.allocs one buffer per kernel arg). Wired into
+      pipeline._maybe_lower_linalg (attention branch when extract_matmul_dims is
+      None). The dumped kernel has NOT chosen a GRF mode, so the pipeline sets
+      _grf_sweep_after_lowering to run the GRF sweep on it -> autonomous ~1.76x
+      (4.47->2.55ms) on the 2x8x4096x64 shape. Full CLI e2e verified from the raw
+      linalg_input.mlir: LINALG_LOWERING (lighthouse) + DEVICE_SPECIFIC (GRF) = 2
+      stages, output is WG-level (0 batch_matmul/softmax, xegpu.dpas + launch).
+      NOTE: the synthesized harness leaves buffers uninitialized (no allclose) —
+      valid ONLY because the GRF sweep compares identical IR (correctness-free);
+      it is a timing harness, not a verify harness (see
+      attention_verify_harness_is_expensive for the real-oracle problem).
+
   - id: attention_verify_harness_is_expensive
     name: Verifying an attention WG kernel needs a costly CPU reference
     severity: high
