@@ -1,0 +1,64 @@
+# Linalg->XeGPU-WG lowering: scope, batched/attention findings, and tooling notes.
+# These are hard-won engineering learnings (not per-kernel optimization patterns);
+# they guide what the lowering can/can't do today and how to extend it.
+
+constraints:
+  - id: lowering_supports_plain_matmul_only
+    name: The lowering pipeline currently supports a single linalg.matmul
+    severity: critical
+    description: |
+      The Linalg->XeGPU-WG transform pipeline (pipelines/linalg_to_wg) matches and
+      lowers exactly ONE linalg.matmul: tile_using_forall [wg_m, wg_n] -> k-loop ->
+      vectorize(contract) -> subset-hoist (register accumulator) -> bufferize ->
+      GPU outline -> convert-vector-to-xegpu -> WG layout anchor. Inputs that are
+      NOT a plain matmul (linalg.batch_matmul, linalg.softmax, linalg.transpose,
+      linalg.generic, fused attention) are NOT handled: extract_matmul_dims returns
+      None, LINALG_LOWERING no-ops, and feeding the raw Linalg to the WG pipeline
+      fails ("expected add/mul op in the body"). Detect this early and either
+      extend the pipeline or route to a dedicated schedule.
+
+  - id: lowering_batch_matmul_rank_reduce_segfaults
+    name: batch_matmul via rank-reduce produces i64-pointer tdescs that crash WG lowering
+    severity: high
+    description: |
+      A working recipe to reduce linalg.batch_matmul to the matmul path exists:
+      tile_using_forall [1, wg_m, wg_n] (one batch per workgroup) + fuse fill +
+      k-loop tile [0,0,0,k] + pass "test-linalg-rank-reduce-contraction-ops"
+      (collapses the batch=1 matmul to a 2D linalg.matmul) + vectorize -> a clean
+      2D vector.contract that convert-vector-to-xegpu turns into xegpu.dpas +
+      load_nd + store_nd, single gpu.launch (grid = batch).
+      HOWEVER: the rank-reduction leaves the kernel creating ALL tensor_descs from
+      raw i64 pointers (create_nd_tdesc %ptr, shape: [..], strides: [256,1]) rather
+      than directly from the memref argument (as the plain-matmul path does with
+      create_nd_tdesc %arg : memref<..>). That i64-pointer form (with strides that
+      don't encode the batch offset) SEGFAULTS the gpu-lower-to-xevm-pipeline
+      (imex-opt, no diagnostic, rc=139).
+      FIX DIRECTION: keep A/B/C as 2D memref subviews that create_nd_tdesc accepts
+      directly (offset the memref by batch id, drop the unit dim to a rank-2
+      memref), instead of extracting an i64 base pointer. i.e. avoid the
+      collapse_shape->pointer path; produce a rank-2 strided memref subview per
+      batch and tdesc from it.
+
+  - id: lowering_no_linalg_in_host_harness
+    name: Keep linalg ops out of the host @main harness
+    severity: high
+    description: |
+      The WG lowering pipeline (gpu-lower-to-xevm) only handles the XeGPU kernel;
+      linalg ops (e.g. linalg.fill) left in the host @main crash/deadend the
+      pipeline. Fill host buffers with scf.for + memref.store, not linalg.fill.
+
+  - id: lowering_lighthouse_reuse
+    name: lighthouse offers only an MLP/matmul schedule (no attention), on the same upstream ops
+    severity: info
+    description: |
+      The local lighthouse clone (/home/gta/lighthouse) has ONE xegpu schedule:
+      mlp_schedule.py (matmul/MLP). There is NO attention/softmax/flash schedule to
+      reuse. Its get_schedule_module emits a standard MLIR transform module via the
+      upstream mlir.dialects.transform Python bindings (structured.tile_using_for,
+      vectorize_children, loop.forall_to_parallel, xegpu.insert_prefetch,
+      set_gpu_launch_threads, set_op_layout_attr, convert_layout) — the same class
+      of ops our hand-written transform libraries use. So: it is reusable as a
+      dumped .mlir (independence-friendly), but for matmul we already encode these
+      ideas; for attention there is nothing there to reuse. Stay independent; a
+      flash-attention lowering must be built (fuse QK^T + softmax + PV, tiled, no
+      materialized scores tensor).
