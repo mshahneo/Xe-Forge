@@ -24,6 +24,11 @@ class LLMConfig:
     # dspy.LM model_type: "responses" (OpenAI Responses API) or "chat"
     # (Chat Completions). Some OpenAI-compatible proxies only support "chat".
     model_type: str = "responses"
+    # Per-request wall-clock cap (seconds) and retry count. Without a timeout a
+    # transient endpoint stall on a large generation hangs the whole run forever;
+    # retries let it recover from an occasional dropped/stalled request.
+    timeout: int = 600
+    num_retries: int = 2
 
 
 @dataclass
@@ -215,6 +220,8 @@ class ConfigManager:
             api_base=self._get_env("OPENAI_API_BASE") or self._get_env("OPENAI_BASE_URL"),
             api_key=self._get_env("OPENAI_API_KEY"),
             model_type=self._get_env("LLM_MODEL_TYPE", "responses"),
+            timeout=self._get_env("LLM_TIMEOUT", 600, int),
+            num_retries=self._get_env("LLM_NUM_RETRIES", 2, int),
         )
 
         # Agent Configuration

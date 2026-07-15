@@ -207,6 +207,10 @@ class XeForgePipeline:
                 api_key=self.config.llm.api_key or "",
                 temperature=self.config.llm.temperature,
                 max_tokens=self.config.llm.max_tokens,
+                # Bound each request so a transient endpoint stall can't hang the
+                # whole run; retry a couple times to ride out dropped requests.
+                timeout=self.config.llm.timeout,
+                num_retries=self.config.llm.num_retries,
                 cache=False,
             )
             dspy.configure(lm=lm, warn_on_type_mismatch=False)
