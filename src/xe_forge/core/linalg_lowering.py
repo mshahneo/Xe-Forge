@@ -272,6 +272,41 @@ def render_profiling_harness(
 DEFAULT_CONFIG = LoweringConfig(wg_m=256, wg_n=256, sg_m=32, sg_n=32, k_tile=32)
 
 
+def candidate_configs(m: int, n: int, k: int) -> list[LoweringConfig]:
+    """A shape-appropriate shortlist of valid LoweringConfigs to autotune over.
+
+    Covers the WG tiles that divide the shape at a few sizes, plus the large-GRF
+    heavy-subgroup variants (sg=[32,64]/[64,32], which need <=32 subgroups) that
+    are the measured-best on compute-bound GEMM. Every returned config passes
+    validate() + fits_shape(m,n,k); ordered default-first so a caller that just
+    takes [0] still gets a sane tile. Deduped.
+    """
+    tiles = [
+        # (wg_m, wg_n, sg_m, sg_n, k_tile, large_grf)
+        (256, 256, 32, 32, 32, False),
+        (256, 256, 32, 64, 32, True),   # heavy-N, large-GRF (best-measured on 4K)
+        (256, 256, 64, 32, 32, True),   # heavy-M, large-GRF
+        (128, 256, 32, 32, 32, False),
+        (256, 128, 32, 32, 32, False),
+        (128, 128, 32, 32, 32, False),
+        (256, 256, 32, 32, 64, False),  # larger k-tile
+        (64, 64, 32, 32, 32, False),
+        (32, 64, 32, 32, 32, False),
+        (64, 32, 32, 32, 32, False),
+        (32, 32, 32, 32, 32, False),
+    ]
+    out, seen = [], set()
+    for wm, wn, sm, sn, kt, grf in tiles:
+        cfg = LoweringConfig(wm, wn, sm, sn, kt, large_grf=grf)
+        key = (wm, wn, sm, sn, kt, grf)
+        if key in seen:
+            continue
+        seen.add(key)
+        if cfg.is_valid and not cfg.fits_shape(m, n, k):
+            out.append(cfg)
+    return out
+
+
 def detect_mlir_level(code: str) -> str:
     """Classify an MLIR kernel as 'linalg' or 'xegpu_wg'.
 

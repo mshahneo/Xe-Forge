@@ -131,7 +131,16 @@ class LinalgLoweringAgent:
         except Exception as e:
             logger.warning("Lowering-config proposal failed (%s); using default only", e)
 
-        # Safety net: always include a known-good default if it fits the shape.
+        # Safety net: when the LLM proposed nothing usable (unavailable / all
+        # discarded), fall back to the curated autotune shortlist so the downstream
+        # timed sweep still tunes across good tiles (incl. large-GRF heavy-sg) rather
+        # than settling for a single default. candidate_configs is shape-filtered and
+        # ordered default-first.
+        if not shortlist:
+            from xe_forge.core.linalg_lowering import candidate_configs
+
+            shortlist = candidate_configs(m, n, k)
+        # Always include the known-good default if it fits and isn't already present.
         if not DEFAULT_CONFIG.fits_shape(m, n, k) and DEFAULT_CONFIG not in shortlist:
             shortlist.append(DEFAULT_CONFIG)
         if not shortlist:

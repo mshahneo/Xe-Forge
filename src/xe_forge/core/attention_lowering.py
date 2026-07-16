@@ -168,16 +168,23 @@ def extract_gpu_module(code: str) -> str | None:
     return None
 
 
-def synthesize_run_harness(wg_code: str) -> str | None:
-    """Wrap a WG attention gpu.module in a runnable single-launch @main harness.
+def synthesize_run_harness(
+    wg_code: str,
+    grid: tuple[int, int, int] | None = None,
+    block: tuple[int, int, int] | None = None,
+) -> str | None:
+    """Wrap a WG gpu.module in a runnable single-launch @main harness.
 
     Parses the kernel name, grid/block sizes (from the gpu.func known_grid_size /
     known_block_size attributes) and argument memref types (from the gpu.func
     signature), then emits a self-contained module that gpu.allocs one buffer per
-    kernel argument and launches the kernel ONCE. This is a *timing* harness for
-    the correctness-free GRF sweep (large-GRF vs default run identical IR), so the
-    buffers are left uninitialized and no reference/allclose is emitted. Returns
-    None if the kernel signature/launch bounds can't be parsed.
+    kernel argument and launches the kernel ONCE. This is a *timing* harness (buffers
+    left uninitialized, no reference/allclose) — used by the correctness-free GRF
+    sweep and by tile autotuning. Returns None if the signature can't be parsed.
+
+    *grid* / *block* override the launch bounds when the kernel doesn't carry
+    known_grid_size (e.g. matmul/MLP kernels collapse the grid to 1-D and compute
+    it at launch). Pass grid explicitly (computed from config + dims) in that case.
     """
     gpu_module = extract_gpu_module(wg_code)
     if gpu_module is None:
@@ -189,12 +196,20 @@ def synthesize_run_harness(wg_code: str) -> str | None:
     arg_types = _ARG_TYPE_RE.findall(fm.group(2))
     if not arg_types:
         return None
-    gm = _GRID_RE.search(gpu_module)
-    bm = _BLOCK_RE.search(gpu_module)
-    if gm is None or bm is None:
-        return None
-    grid = [int(x) for x in gm.group(1).split(",") if x.strip()]
-    block = [int(x) for x in bm.group(1).split(",") if x.strip()]
+    if grid is None:
+        gm = _GRID_RE.search(gpu_module)
+        if gm is None:
+            return None
+        grid = [int(x) for x in gm.group(1).split(",") if x.strip()]
+    else:
+        grid = list(grid)
+    if block is None:
+        bm = _BLOCK_RE.search(gpu_module)
+        if bm is None:
+            return None
+        block = [int(x) for x in bm.group(1).split(",") if x.strip()]
+    else:
+        block = list(block)
     grid = (grid + [1, 1, 1])[:3]
     block = (block + [1, 1, 1])[:3]
 
@@ -212,7 +227,13 @@ def synthesize_run_harness(wg_code: str) -> str | None:
     gx, gy, gz = grid
     bx, by, bz = block
 
-    return f"""module attributes {{gpu.container_module}} {{
+    # Carry any top-level affine_map alias defs (#map = ...) the gpu.module uses.
+    aliases = "\n".join(
+        ln for ln in wg_code.splitlines() if ln.lstrip().startswith("#map")
+    )
+
+    return f"""{aliases}
+module attributes {{gpu.container_module}} {{
 {_indent_module(gpu_module)}
   func.func @main() attributes {{llvm.emit_c_interface}} {{
 {const_lines}

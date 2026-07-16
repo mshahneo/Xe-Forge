@@ -106,3 +106,31 @@ patterns:
       larger sg tiles (sg_m*... keeping (wg_m/sg_m)*(wg_n/sg_n) <= 32).
     expected_speedup: "~1.4x vs small-GRF 64-subgroup default (70 -> 98 TFLOPS on 4K)"
     applies_to: ["gemm", "matmul"]
+
+  - id: lowering_autotune_tile
+    name: Autotune the tile config by timing candidates (don't take first-divisible)
+    stage: device_specific
+    description: |
+      The first tile that divides a shape is usually NOT the fastest — the large-GRF
+      heavy-subgroup variants win on compute-bound GEMM. Two mechanisms exist:
+        (1) MlirExecutor.sweep_configs — the LLM/pipeline path: lowers each proposed
+            config, times via the plain-GEMM profiling harness, ranks by ms. Assumes
+            the plain-matmul harness ABI (C,A,B; B is KxN).
+        (2) MlirExecutor.autotune_tile — ABI-AGNOSTIC: for each candidate it lowers,
+            synthesizes a single-launch timing harness from the kernel's own gpu.func
+            signature (attention_lowering.synthesize_run_harness, given an explicit
+            grid = (M/wg_m, N/wg_n, 1) since matmul/transpose-B kernels use a 2-D
+            block_id grid; MLP epilogue-tiled kernels collapse to 1-D), times via IMEX
+            profiling, picks fastest. Works for plain/transpose-B matmul, MLP layer,
+            elementwise-epilogue GEMM. Timing-only (uninitialized buffers) — assumes
+            all candidates compute the same math; pair with a correctness gate.
+      candidate_configs(m,n,k) gives a curated, shape-filtered shortlist (default +
+      large-GRF sg=[32,64]/[64,32] + a few WG sizes + larger k-tile), default-first.
+      LinalgLoweringAgent.propose falls back to it when the LLM is unavailable, so
+      the timed sweep autotunes even with no LLM.
+      MEASURED (autotune_tile, IMEX): plain matmul 4096^3 -> large-GRF sg=[64,32]
+      63.6 TFLOPS vs sg=[32,32] default 55 TFLOPS (~16% faster, the tile a
+      first-divisible picker would have missed); transpose-B 2048x4096x8192 ->
+      wg=[256,128] 2.49ms vs wg=[256,256] 2.53ms.
+    expected_speedup: "~1.15-1.4x over first-divisible tile on compute-bound GEMM"
+    applies_to: ["gemm", "matmul", "mlp"]

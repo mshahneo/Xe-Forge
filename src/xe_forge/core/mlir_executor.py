@@ -656,6 +656,65 @@ class MlirExecutor:
             return None, None, None, results
         return best[1], best[2], best[3], results
 
+    def autotune_tile(self, linalg_code, dims, candidates, flop=None):
+        """Pick the fastest valid tile config for a lowerable kernel by timing each.
+
+        Works for any single-kernel Linalg (plain / transpose-B matmul, MLP layer,
+        elementwise-epilogue GEMM) — unlike sweep_configs, which assumes the plain
+        GEMM harness ABI. For each candidate LoweringConfig: lower to WG, synthesize
+        an ABI-agnostic single-launch timing harness (grid computed from the config
+        + problem dims), and time it via IMEX profiling. Returns
+        (best_config, best_wg_code, results[list of (cfg, ms|None)]). Candidates that
+        fail to lower or run are skipped. *dims* is (M, N, K); the launch grid is
+        (M/wg_m, N/wg_n, 1) — the 2-D grid the plain/transpose-B matmul lowering
+        emits (block_id x/y).
+
+        NOTE: this is a *timing-only* autotune (buffers uninitialized) — it ranks by
+        speed and assumes every candidate lowers the SAME math, so it does not
+        re-verify correctness per candidate. Pair with a correctness gate upstream.
+        """
+        from xe_forge.core.attention_lowering import synthesize_run_harness
+
+        m, n, _k = dims
+        results = []
+        best = None
+        for cfg in candidates:
+            errs = cfg.validate() + cfg.fits_shape(*dims)
+            if errs:
+                results.append((cfg, None))
+                continue
+            ok, wg, err = self.lower_linalg_to_wg(linalg_code, cfg)
+            if not ok:
+                logger.info("autotune %s: lowering failed (%s)", cfg, _tail(err, 2))
+                results.append((cfg, None))
+                continue
+            harness = synthesize_run_harness(
+                wg, grid=(m // cfg.wg_m, n // cfg.wg_n, 1), block=(cfg.nb_threads, 1, 1)
+            )
+            if harness is None:
+                results.append((cfg, None))
+                continue
+            r = self.execute(
+                kernel_code=harness,
+                output_name="autotune",
+                flop=flop,
+                pipeline_options=cfg.run_pipeline_options(),
+                profile=True,
+            )
+            ms = r.execution_time_ms if (r.success and r.output_correct is not False) else None
+            logger.info(
+                "autotune %s: %s%s",
+                cfg,
+                "OK" if ms else f"FAIL ({_tail(r.error_message or '', 2)})",
+                f" {ms:.4f}ms" if ms else "",
+            )
+            results.append((cfg, ms))
+            if ms is not None and (best is None or ms < best[0]):
+                best = (ms, cfg, wg)
+        if best is None:
+            return None, None, results
+        return best[1], best[2], results
+
     @staticmethod
     def _splice_kernel(harness: str, wg_code: str, kernel_only: bool = False) -> str:
         """Splice the lowered WG kernel into *harness*.

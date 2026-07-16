@@ -144,4 +144,10 @@ Level-3 kernels). **The biggest coverage unlocks next**, in order of leverage:
 1. **transpose-A / broadcast-batch / boundary tiles** → Level-1 kernels 8, 10, 16, 18.
 2. **A convolution lowering** → the single largest bucket (~50 % of Level 1 &
    Level 2), but a separate, large effort.
-3. **Autotune the tiles** (matmul + per-layer MLP; currently first-divisible).
+
+**Tile autotuning is now in place** (`MlirExecutor.autotune_tile` +
+`candidate_configs`): candidate tiles are timed on the GPU (IMEX) and the fastest
+is picked, instead of first-divisible. Measured: 4096³ matmul reaches ~64 TFLOPS
+(large-GRF `sg=[64,32]`) vs 55 TFLOPS for the default `sg=[32,32]`. The pipeline's
+LLM sweep already ranked configs by time; the fallback now uses the curated
+shortlist so autotuning happens even without the LLM.
