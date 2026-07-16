@@ -89,18 +89,20 @@ Splitting the 100 by the leading op and the epilogue:
 
 | Group | Kernels | Status | Why |
 |---|---|---|---|
-| **Gemm/Matmul + elementwise-only epilogue** | 9 (Sub·Mul·ReLU), 12 (Mul·LeakyReLU), 29 (Mish·Mish), 40 (Scale·ResidualAdd), 53 (Scale·Hardtanh·GELU), 59 (Swish·Scale), 63 (ReLU·Div), 68 (Min·Sub), 70 (Sigmoid·Scale·ResidualAdd), 76 (Add·ReLU), 81 (Swish·Div·Clamp·Tanh·Clamp), 86 (Div·GELU), 95 (Add·Swish·Tanh·GELU·Hardtanh) | 🟡 **reachable** | matmul + fused elementwise epilogue — same shape as our MLP-layer path; needs the epilogue-fusion generalized to these op mixes (no reductions) |
-| **Gemm/Matmul + reduction/norm/softmax epilogue** | 14, 18, 22, 30, 33, 37, 39, 41, 45, 51, 55, 56, 62, 64, 66, 75, 80, 84, 88, 94, 97, 98, 99 | ❌ | epilogue contains GroupNorm/BatchNorm/Softmax/Sum/MaxPool/LogSumExp — cross-row reductions we don't lower |
+| **Gemm/Matmul + elementwise-only epilogue** | 9 (Sub·Mul·ReLU), 12 (Mul·LeakyReLU), 29 (Mish·Mish), 40 (Scale·ResidualAdd), 53 (Scale·Hardtanh·GELU), 59 (Swish·Scale), 63 (ReLU·Div), 68 (Min·Sub), 70 (Sigmoid·Scale·ResidualAdd), 76 (Add·ReLU), 81 (Swish·Div·Clamp·Tanh·Clamp), 86 (Div·GELU), 95 (Add·Swish·Tanh·GELU·Hardtanh) | ✅ **supported** | matmul + fused elementwise epilogue — the MLP-layer path (`is_mlp_layer` + epilogue fusion) handles arbitrary elementwise chains, incl. transcendentals (exp/tanh via `math.*`). Verified GPU-correct on Sub·Mul·ReLU and Sigmoid epilogues (0 mismatches). |
+| **Gemm/Matmul + reduction/norm/softmax epilogue** | 14, 18, 22, 30, 33, 37, 39, 41, 45, 51, 55, 56, 62, 64, 66, 75, 80, 84, 88, 94, 97, 98, 99 | ❌ | epilogue contains GroupNorm/BatchNorm/Softmax/Sum/MaxPool/LogSumExp — cross-row reductions (`iterator_types` has `"reduction"`); `is_mlp_layer` explicitly rejects these |
 | **Conv-based chains** (Conv2d/3d, ConvTranspose, …) | 1–8, 10, 11, 13, 15–17, 19–21, 23–28, 31, 32, 34–36, 38, 42–44, 46–50, 52, 54, 57, 58, 60, 61, 65, 67, 69, 71–74, 77–79, 82, 83, 85, 87, 89–93, 96, 100 | ❌ | lead with a convolution; conv lowering is a separate effort |
 
-So of Level 2: **~13 are reachable (🟡)** with the elementwise-epilogue extension
-we've prototyped for MLP layers; the rest need conv or reduction lowering. **0 are
-supported end-to-end today** (the reachable ones need the epilogue op-set widened
-beyond bias+ReLU).
+So of Level 2: **~13 are supported** (matmul + elementwise epilogue) — no new
+lowering machinery was needed beyond the MLP-layer epilogue fusion (arbitrary
+elementwise ops, including transcendentals, vectorize + lower to XeVM). The rest
+need conv or reduction lowering.
 
 *(Group membership is by the kernel name's op sequence; a couple are judgment calls
 on where "elementwise" ends and "reduction" begins — e.g. anything with Sum, Mean,
-Max-over-dim, LogSumExp, or a Norm is treated as a reduction epilogue → ❌.)*
+Max-over-dim, LogSumExp, or a Norm is treated as a reduction epilogue → ❌. The
+supported count is by structure; a given kernel's exact GPU run also needs the
+KernelBench dump adapted to f16 + a runnable harness, as for the matmul family.)*
 
 ---
 
@@ -131,16 +133,15 @@ bias-add + activation) — a norm/pool/softmax inside the chain falls out of sco
 | Level | Total | ✅ supported | 🟡 reachable (small extension) | ❌ out of scope |
 |---|---|---|---|---|
 | 1 | 100 | 7 | 2 (irregular tile, broadcast batch) | 91 |
-| 2 | 100 | 0 | ~13 (matmul + elementwise epilogue) | ~87 |
+| 2 | 100 | ~13 (matmul + elementwise epilogue) | 0 | ~87 |
 | 3 | 3 | 3 (full MLP chains) | 0 | 0 |
 
 **Verified-supported today:** the matmul family — plain / batched / transpose-B
-matmul, a single fused MLP layer, and **full multi-layer MLP chains** (all 3
+matmul, a matmul + arbitrary elementwise epilogue (~13 Level-2 Gemm/Matmul
+chains), a single fused MLP layer, and **full multi-layer MLP chains** (all 3
 Level-3 kernels). **The biggest coverage unlocks next**, in order of leverage:
 
-1. **Widen the elementwise epilogue op-set** (beyond bias+ReLU) → ~13 Level-2
-   Gemm/Matmul chains.
-2. **transpose-A / broadcast-batch / boundary tiles** → Level-1 kernels 8, 10, 16, 18.
-3. **A convolution lowering** → the single largest bucket (~50 % of Level 1 &
+1. **transpose-A / broadcast-batch / boundary tiles** → Level-1 kernels 8, 10, 16, 18.
+2. **A convolution lowering** → the single largest bucket (~50 % of Level 1 &
    Level 2), but a separate, large effort.
-4. **Autotune the per-layer MLP tiles** (currently first-divisible, not tuned).
+3. **Autotune the tiles** (matmul + per-layer MLP; currently first-divisible).

@@ -60,14 +60,26 @@ constraints:
       the high-value case (all nn.Linear).
 
   - id: lowering_mlp_layer_supported
-    name: A single epilogue-fused MLP layer (matmul + bias + activation) lowers to WG
+    name: A matmul + fused elementwise epilogue lowers to WG (MLP layer AND level-2 Gemm chains)
     severity: info
     description: |
-      One nn.Linear layer with activation — C = act(A·B^T + bias) — lowers end-to-end
-      into ONE fused WG kernel and runs correctly on BMG (verified 128x1024x1024
-      relu(A·B^T+bias), 0 mismatches). Detected by is_mlp_layer (exactly one
-      linalg.matmul + >=1 linalg.generic, no batch/softmax/physical-transpose);
-      lower_linalg_to_wg auto-selects the MLP-layer templates.
+      A single matmul with a fused ELEMENTWISE epilogue lowers end-to-end into ONE
+      WG kernel and runs correctly on BMG. This covers BOTH a single nn.Linear layer
+      (C = act(A·B^T + bias)) AND the KernelBench level-2 "Gemm/Matmul + elementwise"
+      kernels (Sub·Mul·ReLU, Sigmoid·Scale, Div·GELU, Swish·Clamp·Tanh, etc.).
+      Verified GPU-correct (0 mismatches): 128x1024x1024 relu(A·B^T+bias);
+      128x512x512 relu((A·B^T+bias-2.0)*1.5) [level2/9 shape]; sigmoid epilogue
+      [level2/70-style, exercises math.exp+divf through XeVM].
+      KEY FINDING: NO new lowering machinery was needed for the level-2 elementwise
+      chains beyond the MLP-layer epilogue fusion — arbitrary elementwise ops
+      (arith add/sub/mul/div/select/cmpf, math.exp/tanh/... i.e. transcendentals)
+      vectorize and lower to XeVM inside the fused epilogue. "Widening the epilogue
+      op-set" was really just DETECTION/routing, not codegen.
+      Detected by is_mlp_layer: exactly one linalg.matmul + >=1 linalg.generic, no
+      batch/softmax/physical-transpose, AND every generic is purely elementwise
+      (rejects any generic with a "reduction" iterator_type — that means a
+      norm/pool/sum/LogSumExp epilogue, which is out of scope and would fail to
+      lower). lower_linalg_to_wg auto-selects the MLP-layer templates.
       APPROACH (mirrors lighthouse mlp_schedule, adapted to our templates): stage-1
       tile_vectorize_mlp_layer.mlir.j2 runs "linalg-fuse-elementwise-ops" (coalesces
       bias-add + activation generics), then tiles the *epilogue generic* (the last

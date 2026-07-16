@@ -15,6 +15,7 @@ Jinja2, matching the repo's existing template approach.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -330,10 +331,18 @@ def is_transpose_b_matmul(code: str) -> bool:
 
 
 def is_mlp_layer(code: str) -> bool:
-    """True if *code* is a single epilogue-fused MLP layer: one linalg.matmul whose
-    result feeds elementwise linalg.generic op(s) (bias-add / activation), ending in
-    a single materialized result. Detected as: exactly one linalg.matmul + at least
-    one linalg.generic + no batch_matmul / softmax / transpose op.
+    """True if *code* is a single matmul with a fused elementwise epilogue: one
+    linalg.matmul whose result feeds elementwise linalg.generic op(s) — bias-add,
+    activation (ReLU/GELU/Sigmoid/Tanh/Mish/Swish/…), scalar sub/mul/div, clamp,
+    residual add, etc. — ending in a single materialized result. This covers a
+    single nn.Linear layer AND the KernelBench level-2 "Gemm/Matmul + elementwise"
+    kernels; the epilogue fuses into the WG kernel after the k-loop accumulator.
+
+    Detected as: exactly one linalg.matmul + >=1 linalg.generic + no batch_matmul /
+    softmax / physical transpose, AND every generic is PURELY ELEMENTWISE (all
+    iterator_types parallel). A generic with a "reduction" iterator (Sum / Max /
+    Mean / LogSumExp / norm / pool epilogue) is out of scope — reject it so those
+    kernels don't get mis-routed here and fail at lowering.
     """
     if code.count("linalg.matmul") != 1:
         return False
@@ -341,7 +350,13 @@ def is_mlp_layer(code: str) -> bool:
         return False
     if "linalg.transpose" in code:
         return False  # physical transpose op unhandled; transpose-B via indexing_maps is fine
-    return "linalg.generic" in code
+    if "linalg.generic" not in code:
+        return False
+    # Reject reduction epilogues: any generic carrying a "reduction" iterator type.
+    # (Elementwise generics are all-"parallel"; a reduction means norm/pool/sum → OOS.)
+    if re.search(r'iterator_types\s*=\s*\[[^\]]*"reduction"', code):
+        return False
+    return True
 
 
 def extract_transpose_b_dims(code: str) -> tuple[int, int, int] | None:
