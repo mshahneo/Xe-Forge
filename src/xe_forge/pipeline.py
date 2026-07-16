@@ -199,7 +199,12 @@ class XeForgePipeline:
         if self.config.llm.api_key:
             os.environ["OPENAI_API_KEY"] = self.config.llm.api_key
         try:
-            litellm.client_session = httpx.Client(verify=False)
+            # This custom client is what litellm actually uses for requests, so it
+            # MUST carry the timeout — otherwise httpx's no-timeout default wins and
+            # a stalled generation hangs forever regardless of the dspy.LM timeout.
+            litellm.client_session = httpx.Client(
+                verify=False, timeout=httpx.Timeout(self.config.llm.timeout)
+            )
             lm = dspy.LM(
                 model=self.config.llm.model,
                 api_base=self.config.llm.api_base,
