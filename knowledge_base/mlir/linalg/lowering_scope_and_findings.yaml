@@ -13,11 +13,46 @@ constraints:
       GPU outline -> convert-vector-to-xegpu -> WG layout anchor.
       linalg.batch_matmul IS now also handled via a dedicated stage-1 template
       (see lowering_batch_matmul_supported: one batch per workgroup + rank-reduce +
-      cast-away-leading-unit-dim). Still NOT handled: linalg.softmax,
-      linalg.transpose, linalg.generic, and fully fused attention (feeding the raw
-      Linalg to the WG pipeline fails with "expected add/mul op in the body");
-      fused attention is routed to the lighthouse dump path
-      (attention_lowering_via_lighthouse_dump) instead.
+      cast-away-leading-unit-dim). Transpose-B matmul (C = A · B^T, the nn.Linear
+      form) IS handled via a dedicated stage-3 annotation (see
+      lowering_transpose_b_supported). Still NOT handled: transpose-A / transpose-both
+      matmul, linalg.softmax, linalg.generic (bias/ReLU/broadcast/masking), and
+      fully fused attention (feeding the raw Linalg to the WG pipeline fails with
+      "expected add/mul op in the body"); fused attention is routed to the
+      lighthouse dump path (attention_lowering_via_lighthouse_dump) instead.
+
+  - id: lowering_transpose_b_supported
+    name: transpose-B matmul (C = A·B^T, nn.Linear form) lowers to XeGPU-WG
+    severity: info
+    description: |
+      A transpose-B matmul — C[M,N] = A[M,K] · B[N,K]^T, i.e. B stored [N,K] — lowers
+      end-to-end and runs correctly on BMG (verified 2048x4096x8192, 0 mismatches).
+      This is the ubiquitous nn.Linear form (x @ W^T; every KernelBench MLP matmul).
+      Input form: linalg.matmul with explicit indexing_maps where the B map is
+      (m,n,k)->(n,k) (recent MLIR's spelling; the old linalg.matmul_transpose_b named
+      op is NOT registered in this build). detect via is_transpose_b_matmul (matches
+      a 3-D affine_map whose two results are the 2nd,3rd induction vars, name-agnostic
+      for (m,n,k) vs (d0,d1,d2)); dims via extract_transpose_b_dims (A is MxK, B is
+      NxK).
+      HOW IT WORKS: the stage-1 tile/vectorize template is UNCHANGED — it matches
+      linalg.matmul including the indexing_maps form, and the vectorizer lowers the
+      transposed B to a normal xegpu.load_nd of B's [N_tile,k] block + an in-register
+      vector.transpose feeding the dpas (exactly like the lighthouse attention
+      kernel). The FIX is a dedicated stage-3 annotation
+      (templates/wg_annotate_transpose_b.mlir.j2, selected via render(transpose_b=
+      True) / lower_linalg_to_wg auto-detect): the dpas B operand does NOT come
+      directly from a load, so get_load_op walks through the vector.transpose to the
+      real load, which is annotated on its PRE-transpose [N,k] shape
+      (sg_layout=[sg_grid_n,1], sg_data=[sg_n,k_tile], inst=[16,16]); dpas index=1 gets
+      sg_layout=[1,sg_grid_n] sg_data=[k_tile,sg_n]. Using the plain wg_annotate here
+      sets an inconsistent layout on the transposed operand and ABORTS
+      gpu-lower-to-xevm (XeGPUSgToLaneDistribute assert
+      "Expected one set of distributed offsets").
+      NOT YET: transpose-A (C = A^T·B) and transpose-both. transpose-A vectorizes the
+      same way (A via vector.transpose) but the analogous A-load annotation hits a
+      different assert (setupInsertStridedSliceResultLayout: srcShape must be
+      divisible by laneLayout) — needs its own layout, deferred. transpose-B covers
+      the high-value case (all nn.Linear).
 
   - id: lowering_batch_matmul_supported
     name: batch_matmul lowers to XeGPU-WG (fixed) — the crash was a rank-3 scatter fill, not i64 ptrs

@@ -149,14 +149,21 @@ class LoweringConfig:
         out_dir: str | Path,
         template_dir: str | Path = _TEMPLATE_DIR,
         batched: bool = False,
+        transpose_b: bool = False,
     ) -> tuple[Path, Path]:
         """Render both transform libraries into out_dir. Returns their paths.
 
         *batched* selects the batched-matmul stage-1 template
         (tile_vectorize_batch.mlir.j2: one batch per workgroup + rank-reduce +
-        cast-away-leading-unit-dim) instead of the plain-matmul one. The stage-3
-        layout-annotation library (wg_annotate) is shared: after rank-reduction the
-        batched kernel has the same 2-D xegpu.dpas/load_nd/store_nd shape.
+        cast-away-leading-unit-dim) instead of the plain-matmul one.
+
+        *transpose_b* selects the transpose-B stage-3 annotation
+        (wg_annotate_transpose_b.mlir.j2) for a C = A · B^T matmul (the nn.Linear /
+        "transposed B" form). The B operand reaches the dpas through an in-register
+        vector.transpose, so its load must be annotated on the pre-transpose [N, k]
+        shape; the shared wg_annotate would set an inconsistent layout and crash
+        gpu-lower-to-xevm. The stage-1 tile/vectorize template is unchanged (it
+        matches linalg.matmul, including the indexing_maps transpose form).
         """
         errs = self.validate()
         if errs:
@@ -172,8 +179,11 @@ class LoweringConfig:
         tile_path = out_dir / "tile_vectorize.mlir"
         anno_path = out_dir / "wg_annotate.mlir"
         tile_tmpl = "tile_vectorize_batch.mlir.j2" if batched else "tile_vectorize.mlir.j2"
+        anno_tmpl = (
+            "wg_annotate_transpose_b.mlir.j2" if transpose_b else "wg_annotate.mlir.j2"
+        )
         tile_path.write_text(env.get_template(tile_tmpl).render(**ctx))
-        anno_path.write_text(env.get_template("wg_annotate.mlir.j2").render(**ctx))
+        anno_path.write_text(env.get_template(anno_tmpl).render(**ctx))
         return tile_path, anno_path
 
 
@@ -275,6 +285,50 @@ def extract_matmul_dims(code: str) -> tuple[int, int, int] | None:
     a0, a1, b0, b1 = (int(g) for g in m.groups())
     # A is MxK, B is KxN
     return a0, b1, a1
+
+
+def is_transpose_b_matmul(code: str) -> bool:
+    """True if *code* is a C = A · B^T matmul (transpose-B indexing_maps form).
+
+    Torch-MLIR / recent Linalg spell a transposed-B matmul as `linalg.matmul` with
+    explicit indexing_maps where the B operand map is (m, n, k) -> (n, k) instead of
+    (k, n). We detect it structurally: an affine_map whose result is (n, k) —
+    i.e. `-> (d1, d2)` in a 3-D (m=d0, n=d1, k=d2) map — attached to a matmul.
+    """
+    import re
+
+    if "linalg.matmul" not in code or "indexing_maps" not in code:
+        return False
+    # The B map for transpose-B maps the 3-D iteration space (m, n, k) to (n, k):
+    # the two result dims are the 2nd and 3rd induction vars, in that order. Match
+    # on the map's arg names to stay independent of whether MLIR prints them as
+    # (m, n, k) or (d0, d1, d2).
+    for mm in re.finditer(r"affine_map<\(([^)]*)\)\s*->\s*\(([^)]*)\)>", code):
+        args = [a.strip() for a in mm.group(1).split(",")]
+        res = [r.strip() for r in mm.group(2).split(",")]
+        if len(args) == 3 and len(res) == 2 and res == [args[1], args[2]]:
+            return True  # B result is (n, k) -> transpose-B
+    return False
+
+
+def extract_transpose_b_dims(code: str) -> tuple[int, int, int] | None:
+    """(M, N, K) for a transpose-B matmul: A is MxK, B is stored NxK.
+
+    Parses `linalg.matmul ... ins(%a, %b : tensor<MxKxTy>, tensor<NxKxTy>)`.
+    """
+    import re
+
+    m = re.search(
+        r"linalg\.matmul\b.*?ins\([^:]*:\s*tensor<(\d+)x(\d+)x[^,>]+>,\s*tensor<(\d+)x(\d+)x[^>]+>",
+        code,
+        re.DOTALL,
+    )
+    if not m:
+        return None
+    am, ak, bn, bk = (int(g) for g in m.groups())
+    if ak != bk:
+        return None  # K must agree (A is MxK, B is NxK)
+    return am, bn, ak
 
 
 def extract_batch_matmul_dims(code: str) -> tuple[int, int, int, int] | None:

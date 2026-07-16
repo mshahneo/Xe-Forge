@@ -1,0 +1,36 @@
+// Stage-3 WG layout annotation for a TRANSPOSE-B matmul (C = A · B^T).
+// Rendered from a lowering config, like wg_annotate.mlir.j2, but for the case
+// where the B operand is stored transposed (KernelBench "Matmul_with_transposed_B"
+// and every nn.Linear: x @ W^T). The vectorizer lowers this to a normal
+// xegpu.load_nd of B's [N_tile, k] block followed by an in-register
+// vector.transpose feeding the dpas — so the dpas's B operand (index 1) does NOT
+// come directly from a load; get_load_op on it walks through the transpose to the
+// real load, which we annotate on its pre-transpose [N, k] shape.
+//
+// Layouts (derived from the config):
+//   A load  : sg_layout=[sg_grid_m, 1]        sg_data=[sg_m, k_tile]   inst=[8,16]
+//   B load  : sg_layout=[sg_grid_n, 1]        sg_data=[sg_n, k_tile]   inst=[16,16]
+//             (B is [N, k]; N tiled across subgroups, hence [sg_grid_n, 1])
+//   dpas a  : sg_layout=[sg_grid_m, 1]        sg_data=[sg_m, k_tile]   inst=[8,16]
+//   dpas b  : sg_layout=[1, sg_grid_n]        sg_data=[k_tile, sg_n]   inst=[16,16]
+//   dpas cd : sg_layout=[sg_grid_m,sg_grid_n] sg_data=[sg_m, sg_n]     inst=[8,16]
+//   store   : sg_layout=[sg_grid_m,sg_grid_n] sg_data=[sg_m, sg_n]     inst=[8,16]
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.any_op {transform.readonly}) {
+    %dpas = transform.structured.match ops{["xegpu.dpas"]} in %root : (!transform.any_op) -> !transform.any_op
+    %aval = transform.get_operand %dpas[0] : (!transform.any_op) -> !transform.any_value
+    %aload = transform.xegpu.get_load_op %aval : (!transform.any_value) -> !transform.any_op
+    %bval = transform.get_operand %dpas[1] : (!transform.any_op) -> !transform.any_value
+    %bload = transform.xegpu.get_load_op %bval : (!transform.any_value) -> !transform.any_op
+    // A operand: M tiled across subgroups, K whole per subgroup.
+    transform.xegpu.set_anchor_layout %aload sg_layout = [{{ sg_grid_m }}, 1] sg_data = [{{ sg_m }}, {{ k_tile }}] inst_data = [8, 16] : !transform.any_op
+    // B operand pre-transpose ([N, k]): N tiled across subgroups.
+    transform.xegpu.set_anchor_layout %bload sg_layout = [{{ sg_grid_n }}, 1] sg_data = [{{ sg_n }}, {{ k_tile }}] inst_data = [16, 16] : !transform.any_op
+    transform.xegpu.set_anchor_layout %dpas index = 0 sg_layout = [{{ sg_grid_m }}, 1] sg_data = [{{ sg_m }}, {{ k_tile }}] inst_data = [8, 16] : !transform.any_op
+    transform.xegpu.set_anchor_layout %dpas index = 1 sg_layout = [1, {{ sg_grid_n }}] sg_data = [{{ k_tile }}, {{ sg_n }}] inst_data = [16, 16] : !transform.any_op
+    transform.xegpu.set_anchor_layout %dpas index = 2 sg_layout = [{{ sg_grid_m }}, {{ sg_grid_n }}] sg_data = [{{ sg_m }}, {{ sg_n }}] inst_data = [8, 16] : !transform.any_op
+    %store = transform.structured.match ops{["xegpu.store_nd"]} in %root : (!transform.any_op) -> !transform.any_op
+    transform.xegpu.set_anchor_layout %store sg_layout = [{{ sg_grid_m }}, {{ sg_grid_n }}] sg_data = [{{ sg_m }}, {{ sg_n }}] inst_data = [8, 16] : !transform.any_op
+    transform.yield
+  }
+}
