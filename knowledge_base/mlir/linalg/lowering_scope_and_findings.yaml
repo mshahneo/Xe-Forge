@@ -10,34 +10,59 @@ constraints:
       The Linalg->XeGPU-WG transform pipeline (pipelines/linalg_to_wg) matches and
       lowers exactly ONE linalg.matmul: tile_using_forall [wg_m, wg_n] -> k-loop ->
       vectorize(contract) -> subset-hoist (register accumulator) -> bufferize ->
-      GPU outline -> convert-vector-to-xegpu -> WG layout anchor. Inputs that are
-      NOT a plain matmul (linalg.batch_matmul, linalg.softmax, linalg.transpose,
-      linalg.generic, fused attention) are NOT handled: extract_matmul_dims returns
-      None, LINALG_LOWERING no-ops, and feeding the raw Linalg to the WG pipeline
-      fails ("expected add/mul op in the body"). Detect this early and either
-      extend the pipeline or route to a dedicated schedule.
+      GPU outline -> convert-vector-to-xegpu -> WG layout anchor.
+      linalg.batch_matmul IS now also handled via a dedicated stage-1 template
+      (see lowering_batch_matmul_supported: one batch per workgroup + rank-reduce +
+      cast-away-leading-unit-dim). Still NOT handled: linalg.softmax,
+      linalg.transpose, linalg.generic, and fully fused attention (feeding the raw
+      Linalg to the WG pipeline fails with "expected add/mul op in the body");
+      fused attention is routed to the lighthouse dump path
+      (attention_lowering_via_lighthouse_dump) instead.
 
-  - id: lowering_batch_matmul_rank_reduce_segfaults
-    name: batch_matmul via rank-reduce produces i64-pointer tdescs that crash WG lowering
-    severity: high
+  - id: lowering_batch_matmul_supported
+    name: batch_matmul lowers to XeGPU-WG (fixed) — the crash was a rank-3 scatter fill, not i64 ptrs
+    severity: info
     description: |
-      A working recipe to reduce linalg.batch_matmul to the matmul path exists:
-      tile_using_forall [1, wg_m, wg_n] (one batch per workgroup) + fuse fill +
-      k-loop tile [0,0,0,k] + pass "test-linalg-rank-reduce-contraction-ops"
-      (collapses the batch=1 matmul to a 2D linalg.matmul) + vectorize -> a clean
-      2D vector.contract that convert-vector-to-xegpu turns into xegpu.dpas +
-      load_nd + store_nd, single gpu.launch (grid = batch).
-      HOWEVER: the rank-reduction leaves the kernel creating ALL tensor_descs from
-      raw i64 pointers (create_nd_tdesc %ptr, shape: [..], strides: [256,1]) rather
-      than directly from the memref argument (as the plain-matmul path does with
-      create_nd_tdesc %arg : memref<..>). That i64-pointer form (with strides that
-      don't encode the batch offset) SEGFAULTS the gpu-lower-to-xevm-pipeline
-      (imex-opt, no diagnostic, rc=139).
-      FIX DIRECTION: keep A/B/C as 2D memref subviews that create_nd_tdesc accepts
-      directly (offset the memref by batch id, drop the unit dim to a rank-2
-      memref), instead of extracting an i64 base pointer. i.e. avoid the
-      collapse_shape->pointer path; produce a rank-2 strided memref subview per
-      batch and tdesc from it.
+      linalg.batch_matmul now lowers end-to-end and runs CORRECTLY on BMG
+      (verified: 4x256x256x256, 0 mismatches / 262144 elements). Recipe (stage-1
+      template pipelines/linalg_to_wg/templates/tile_vectorize_batch.mlir.j2,
+      auto-selected by lower_linalg_to_wg when the input contains
+      linalg.batch_matmul; stages 2/3 are shared with the plain-matmul path):
+        tile_using_forall [1, wg_m, wg_n]  (one batch per workgroup, grid = batch)
+        + fuse fill + tile_using_for [0,0,0,k_tile]
+        + "test-linalg-rank-reduce-contraction-ops" (func-scoped; collapses the
+          batch=1 matmul to a 2-D linalg.matmul via collapse_shape)
+        + vectorize {fold_type_extensions_into_contract}
+        + CAST-AWAY-LEADING-UNIT-DIM  <-- the actual fix
+        + hoist/canonicalize/bufferize/forall->gpu/set_gpu_launch_threads.
+      ROOT CAUSE (corrected — the earlier "i64-pointer tdesc" theory was WRONG; the
+      plain-matmul path also tdescs from i64 pointers and works fine): after
+      rank-reduction the *inner matmul* is cleanly 2-D, but the *fused zero-fill*
+      stays rank-3 (vector<1 x wg_m x wg_n> transfer_write). convert-vector-to-xegpu
+      turns that rank-3 unit-leading write into a SCATTER `xegpu.store` (indices +
+      mask, no layout attr). gpu-lower-to-xevm then crashes in
+      XeGPUPropagateLayout -> inferMaskOffsetLayoutForScatterIO ->
+      DistributeLayoutAttr::getRank() on a NULL layout (SIGSEGV, rc=139, no
+      diagnostic). FIX: apply transform.apply_patterns.vector.{
+      cast_away_vector_leading_one_dim, drop_unit_dims_with_shape_cast} after
+      vectorize so the rank-3 fill becomes a clean 2-D block transfer_write ->
+      lowers to xegpu.store_nd (block), no scatter, no crash.
+      GOTCHA: launch threads must match the sg grid. wg=256x256 sg=32x32 -> sg grid
+      [8,8] = 64 subgroups = 1024 threads (not 512); a wrong thread count computes
+      only part of each tile (corners read 0) even though the lowering is correct.
+      KNOWN LIMITATION (non-square / partial-tile shapes): when the per-batch M/N/K
+      don't divide evenly the same way as the verified 256^3 case, the accumulator's
+      initial vector.transfer_read of the C tile can survive on a memref with
+      DYNAMIC strides (strided<[?,?]>) that convert-vector-to-xegpu can't lower ->
+      "Failed to update operation with the layout" at gpu-lower-to-xevm. Root: the
+      fused zero-fill didn't fully fold into a register (zero-const) accumulator, so
+      a real C load remains; with static strides (256^3) it converts fine, with
+      dynamic strides it doesn't. FIX DIRECTION: force the zero-fill to fold to an
+      arith.constant dense<0.0> iter_arg (as the plain-matmul path does) so there is
+      NO accumulator transfer_read to convert — e.g. a stronger hoist/canonicalize
+      or an explicit fill->zero-const rewrite before bufferize. Until then, treat
+      the batched path as verified for uniform/static-stride shapes (e.g. GxSxSxS)
+      and validate any new shape through the CoVeR gate.
 
   - id: lowering_no_linalg_in_host_harness
     name: Keep linalg ops out of the host @main harness

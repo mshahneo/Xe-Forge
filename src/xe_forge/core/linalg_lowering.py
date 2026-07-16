@@ -144,8 +144,20 @@ class LoweringConfig:
             "nb_threads": self.nb_threads,
         }
 
-    def render(self, out_dir: str | Path, template_dir: str | Path = _TEMPLATE_DIR) -> tuple[Path, Path]:
-        """Render both transform libraries into out_dir. Returns their paths."""
+    def render(
+        self,
+        out_dir: str | Path,
+        template_dir: str | Path = _TEMPLATE_DIR,
+        batched: bool = False,
+    ) -> tuple[Path, Path]:
+        """Render both transform libraries into out_dir. Returns their paths.
+
+        *batched* selects the batched-matmul stage-1 template
+        (tile_vectorize_batch.mlir.j2: one batch per workgroup + rank-reduce +
+        cast-away-leading-unit-dim) instead of the plain-matmul one. The stage-3
+        layout-annotation library (wg_annotate) is shared: after rank-reduction the
+        batched kernel has the same 2-D xegpu.dpas/load_nd/store_nd shape.
+        """
         errs = self.validate()
         if errs:
             raise ValueError(f"invalid LoweringConfig: {'; '.join(errs)}")
@@ -159,7 +171,8 @@ class LoweringConfig:
         ctx = self._ctx()
         tile_path = out_dir / "tile_vectorize.mlir"
         anno_path = out_dir / "wg_annotate.mlir"
-        tile_path.write_text(env.get_template("tile_vectorize.mlir.j2").render(**ctx))
+        tile_tmpl = "tile_vectorize_batch.mlir.j2" if batched else "tile_vectorize.mlir.j2"
+        tile_path.write_text(env.get_template(tile_tmpl).render(**ctx))
         anno_path.write_text(env.get_template("wg_annotate.mlir.j2").render(**ctx))
         return tile_path, anno_path
 
@@ -262,3 +275,26 @@ def extract_matmul_dims(code: str) -> tuple[int, int, int] | None:
     a0, a1, b0, b1 = (int(g) for g in m.groups())
     # A is MxK, B is KxN
     return a0, b1, a1
+
+
+def extract_batch_matmul_dims(code: str) -> tuple[int, int, int, int] | None:
+    """Best-effort (batch, M, N, K) from a linalg.batch_matmul's operand shapes.
+
+    Parses `linalg.batch_matmul ins(%a, %b : tensor<GxMxKxTy>, tensor<GxKxNxTy>)`.
+    Returns None if it cannot be determined. Requires both operands to share the
+    batch size G (a plain 3-D batched matmul).
+    """
+    import re
+
+    m = re.search(
+        r"linalg\.batch_matmul\s+ins\([^:]*:\s*"
+        r"tensor<(\d+)x(\d+)x(\d+)x[^,>]+>,\s*tensor<(\d+)x(\d+)x(\d+)x[^>]+>",
+        code,
+    )
+    if not m:
+        return None
+    ga, am, ak, gb, bk, bn = (int(g) for g in m.groups())
+    if ga != gb or ak != bk:
+        return None  # not a well-formed batched matmul (batch/K must agree)
+    # A is G x M x K, B is G x K x N
+    return ga, am, bn, ak

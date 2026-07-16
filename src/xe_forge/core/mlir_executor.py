@@ -419,15 +419,20 @@ class MlirExecutor:
           2. gpu-kernel-outlining + xevm-attach-target + gpu.module(vector->xegpu)
           3. transform-interpreter with the WG layout-annotation library
 
+        A ``linalg.batch_matmul`` input auto-selects the batched stage-1 template
+        (one batch per workgroup + rank-reduce + cast-away-leading-unit-dim); a
+        plain ``linalg.matmul`` uses the default template. Stages 2/3 are shared.
+
         Returns (success, wg_code, error_message).
         """
         errs = config.validate()
         if errs:
             return False, "", f"invalid lowering config: {'; '.join(errs)}"
 
+        batched = "linalg.batch_matmul" in linalg_code
         work = tempfile.mkdtemp(prefix="mlir_lower_")
         try:
-            tile_lib, anno_lib = config.render(work)
+            tile_lib, anno_lib = config.render(work, batched=batched)
             src = Path(work) / "input.mlir"
             src.write_text(linalg_code)
 
