@@ -17,9 +17,11 @@ constraints:
       form) IS handled via a dedicated stage-3 annotation (see
       lowering_transpose_b_supported). A single epilogue-fused MLP layer
       (C = act(A·B^T + bias)) IS handled via the MLP-layer templates (see
-      lowering_mlp_layer_supported). Still NOT handled: transpose-A / transpose-both
-      matmul, multi-layer MLP chains (per-layer outlining not yet ported),
-      linalg.softmax, arbitrary linalg.generic (masking / reductions), and
+      lowering_mlp_layer_supported), and full MULTI-LAYER MLP chains lower to N
+      kernels via MlirExecutor.lower_mlp_to_wg (see
+      lowering_mlp_multilayer_supported). Still NOT handled: transpose-A /
+      transpose-both matmul, linalg.softmax, arbitrary linalg.generic
+      (masking / reductions / norm / pool), and
       fully fused attention (feeding the raw Linalg to the WG pipeline fails with
       "expected add/mul op in the body"); fused attention is routed to the
       lighthouse dump path (attention_lowering_via_lighthouse_dump) instead.
@@ -81,15 +83,47 @@ constraints:
       COLLAPSED 1-D grid (num_tiles, 1, 1) with block_id x divided internally — launch
       (M/wg_m * N/wg_n, 1, 1), NOT a 2-D grid (a 2-D launch runs only the first tile
       row -> mostly-zero output though the lowering is correct).
-      NOT YET — MULTI-LAYER CHAINS (KernelBench level3 MLPs, 3..17 layers): each
-      layer lowers individually, but chaining N layers in one payload currently
-      merges the per-layer scf.parallel loops into a SINGLE gpu.launch, and
-      convert-vector-to-xegpu (scoped to gpu.module) then converts only one layer's
-      contract (the other stays as vector.contract -> won't lower). lighthouse
-      handles this with an explicit nlayers-aware outline
-      (vectorize_bufferize_and_outline_gpu_func + match_and_split gpu.module by
-      nlayers) that keeps each layer a separate kernel. Porting that per-layer
-      outlining is the remaining work to lower full MLPs.
+      MULTI-LAYER CHAINS are now supported too — see lowering_mlp_multilayer_supported.
+
+  - id: lowering_mlp_multilayer_supported
+    name: Full multi-layer MLP chains lower to N XeGPU-WG kernels
+    severity: info
+    description: |
+      A full MLP (chain of nn.Linear+activation layers; KernelBench level3, 3..17
+      layers) now lowers into N sequential XeGPU-WG kernels (one per layer), chained
+      through intermediate buffers. Entry point MlirExecutor.lower_mlp_to_wg;
+      generator in src/xe_forge/core/mlp_lowering.py. Verified GPU-correct on a
+      2-layer relu(x·W^T+bias) chain (0 mismatches); parser + recipe generator
+      handle all 3 real level3 dumps incl. the 17-layer DeepNarrowMLP.
+      PIPELINE: (1) fold_transpose_into_matmul rewrites each physical
+      "linalg.transpose(W); matmul(A,t)" into a transpose-B matmul (indexing_maps
+      B=(n,k)) and DROPS the transpose op — this keeps the transpose in-register
+      (in-loop vector.transpose fused before dpas, the proven transpose-B path)
+      instead of the physical form, which materializes the whole transposed weight
+      up-front (extra load + a 2nd layout that crashes XeGPUSgToLaneDistribute with
+      "Expected one set of distributed offsets"). (2) parse_mlp extracts per-layer
+      (M,N,K) + picks a non-degenerate divisible tile each. (3) render_mlp_recipe
+      GENERATES the stage-1 + stage-3 transform libraries PROGRAMMATICALLY (the
+      recipe structure depends on layer count, unlike the Jinja2 per-config
+      templates): linalg-fuse-elementwise-ops, then per layer split-handle the
+      generic/matmul/fill, tile the epilogue generic to the WG tile, fuse matmul+fill
+      as producers, k-tile; then split-handle the N scf.forall for per-layer
+      forall_to_parallel + per-launch set_gpu_launch_threads; stage-3 splits the N
+      gpu.func and applies the MLP-layer annotation (transpose-B + bias-broadcast
+      slice) to each. Two hard-won gotchas baked in:
+        - forall_to_parallel / set_gpu_launch_threads / gpu.func annotation are
+          SINGLE-target ops -> must split_handle the N-op match and apply per handle
+          (matching all at once = "expected a single payload op").
+        - each layer needs a NON-DEGENERATE tile (grid>=2 in M or N); a tile equal to
+          the layer's full M×N collapses the forall to a func-scope loop (NOT a
+          merge — that was the original misdiagnosis) so its matmul never becomes a
+          separate kernel. _pick_tile enforces grid>=2.
+      Also: intermediate buffers are host memref.alloc in the fused function; for a
+      standalone run they must be gpu.alloc (lighthouse's convert_allocs_to_gpu). In
+      the verified harness the layers were launched inline from @main with a gpu.alloc
+      intermediate. NOT YET: autotuning the per-layer tiles (first-divisible only);
+      any non-(matmul+bias+activation) op in the chain (norm/pool/softmax) is out of
+      scope.
 
   - id: lowering_batch_matmul_supported
     name: batch_matmul lowers to XeGPU-WG (fixed) — the crash was a rank-3 scatter fill, not i64 ptrs

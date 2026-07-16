@@ -480,6 +480,68 @@ class MlirExecutor:
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
+    def lower_mlp_to_wg(self, linalg_code: str) -> tuple[bool, str, str]:
+        """Lower a multi-layer MLP (chain of nn.Linear + activation) to XeGPU-WG.
+
+        Folds physical transposes into the matmul (transpose-B indexing_maps),
+        parses the per-layer shapes, generates an N-layer transform recipe
+        (tile the epilogue + fuse matmul/fill as producers, per layer), and runs
+        the shared 3-stage lowering. Unlike lower_linalg_to_wg (one gpu.module),
+        the result has N gpu.modules — one kernel per layer, chained through
+        intermediate buffers in the host function. Returns (ok, wg_code, err).
+        """
+        from xe_forge.core.mlp_lowering import (
+            fold_transpose_into_matmul,
+            parse_mlp,
+            render_mlp_recipe,
+        )
+
+        folded = fold_transpose_into_matmul(linalg_code)
+        layers = parse_mlp(folded)
+        if not layers:
+            return False, "", "not a recognized multi-layer MLP (parse returned no layers)"
+        tile_src, anno_src = render_mlp_recipe(layers)
+
+        work = tempfile.mkdtemp(prefix="mlir_mlp_")
+        try:
+            tile_lib = Path(work) / "tile_vectorize.mlir"
+            anno_lib = Path(work) / "wg_annotate.mlir"
+            tile_lib.write_text(tile_src)
+            anno_lib.write_text(anno_src)
+            src = Path(work) / "input.mlir"
+            src.write_text(folded)
+
+            s1 = self._run_opt(
+                [str(src),
+                 f"--transform-preload-library=transform-library-paths={tile_lib}",
+                 "--transform-interpreter"],
+                use_imex=False,
+            )
+            if not s1.ok:
+                return False, "", f"MLP LOWERING stage1 failed:\n{_tail(s1.err)}"
+            s2 = self._run_opt(
+                ["-",
+                 "--pass-pipeline=builtin.module(gpu-kernel-outlining, "
+                 "xevm-attach-target{chip=bmg O=3}, "
+                 "gpu.module(convert-vector-to-xegpu))"],
+                use_imex=False,
+                stdin=s1.out,
+            )
+            if not s2.ok:
+                return False, "", f"MLP LOWERING stage2 failed:\n{_tail(s2.err)}"
+            s3 = self._run_opt(
+                ["-",
+                 f"--transform-preload-library=transform-library-paths={anno_lib}",
+                 "--transform-interpreter"],
+                use_imex=False,
+                stdin=s2.out,
+            )
+            if not s3.ok:
+                return False, "", f"MLP LOWERING stage3 failed:\n{_tail(s3.err)}"
+            return True, s3.out.decode(errors="replace"), ""
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
     def sweep_grf(self, runnable_wg_kernel: str, flop: float | None = None):
         """Autonomously pick the faster of {default GRF, large GRF} for a WG kernel.
 

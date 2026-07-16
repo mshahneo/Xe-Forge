@@ -108,17 +108,21 @@ Max-over-dim, LogSumExp, or a Norm is treated as a reduction epilogue → ❌.)*
 
 | # | Kernel | Structure | Status |
 |---|---|---|---|
-| 1 | MLP | 3 Linear layers (`x·Wᵀ + bias`, ReLU between) | ⚠️ per-layer |
-| 2 | ShallowWideMLP | 3 wide Linear layers + ReLU | ⚠️ per-layer |
-| 3 | DeepNarrowMLP | ~8 narrow Linear layers + ReLU (17 matmuls total after import) | ⚠️ per-layer |
+| 1 | MLP | 3 Linear layers (`x·Wᵀ + bias`, ReLU between) | ✅ multi-layer |
+| 2 | ShallowWideMLP | 3 wide Linear layers + ReLU | ✅ multi-layer |
+| 3 | DeepNarrowMLP | ~8 narrow Linear layers + ReLU (17 matmuls total after import) | ✅ multi-layer |
 
-Every layer is exactly the pattern we lower — `relu(x·Wᵀ + bias)` — and a **single
-layer lowers and runs correctly on GPU**. What's missing is the **multi-layer
-chain**: stitching N layers in one payload currently merges the per-layer parallel
-loops into one `gpu.launch`, after which only one layer's contract converts to
-XeGPU. Lowering a full MLP needs porting lighthouse's *nlayers-aware outline*
-(keep each layer a separate kernel + intermediate buffers). Until then: **each MLP
-layer is lowerable, no full MLP is.**
+Full MLP chains now lower: `MlirExecutor.lower_mlp_to_wg` folds the physical
+transposes into the matmul (transpose-B indexing_maps), parses the per-layer
+shapes, and generates an **N-layer transform recipe** (tile each layer's epilogue
++ fuse its matmul/fill as producers, per layer) that outlines **one XeGPU kernel
+per layer**, chained through intermediate buffers. Verified GPU-correct on a
+2-layer `relu(x·Wᵀ + bias)` chain (0 mismatches); the parser + recipe generator
+handle all 3 real level3 dumps (incl. the 17-layer DeepNarrowMLP).
+
+Caveats: the recipe picks a per-layer divisible tile automatically (not yet
+autotuned); layers must be the `relu(x·Wᵀ + bias)` shape (transpose-B matmul +
+bias-add + activation) — a norm/pool/softmax inside the chain falls out of scope.
 
 ---
 
@@ -128,15 +132,15 @@ layer is lowerable, no full MLP is.**
 |---|---|---|---|---|
 | 1 | 100 | 7 | 2 (irregular tile, broadcast batch) | 91 |
 | 2 | 100 | 0 | ~13 (matmul + elementwise epilogue) | ~87 |
-| 3 | 3 | 0 full | 3 (per-layer works; chain WIP) | 0 |
+| 3 | 3 | 3 (full MLP chains) | 0 | 0 |
 
 **Verified-supported today:** the matmul family — plain / batched / transpose-B
-matmul and a single fused MLP layer. **The biggest coverage unlocks next**, in
-order of leverage:
+matmul, a single fused MLP layer, and **full multi-layer MLP chains** (all 3
+Level-3 kernels). **The biggest coverage unlocks next**, in order of leverage:
 
-1. **Multi-layer MLP outlining** → all 3 Level-3 MLPs (reuses the layer path).
-2. **Widen the elementwise epilogue op-set** (beyond bias+ReLU) → ~13 Level-2
+1. **Widen the elementwise epilogue op-set** (beyond bias+ReLU) → ~13 Level-2
    Gemm/Matmul chains.
-3. **transpose-A / broadcast-batch / boundary tiles** → Level-1 kernels 8, 10, 16, 18.
-4. **A convolution lowering** → the single largest bucket (~50 % of Level 1 &
+2. **transpose-A / broadcast-batch / boundary tiles** → Level-1 kernels 8, 10, 16, 18.
+3. **A convolution lowering** → the single largest bucket (~50 % of Level 1 &
    Level 2), but a separate, large effort.
+4. **Autotune the per-layer MLP tiles** (currently first-divisible, not tuned).
