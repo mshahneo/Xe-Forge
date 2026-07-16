@@ -23,18 +23,32 @@ constraints:
     name: batch_matmul lowers to XeGPU-WG (fixed) — the crash was a rank-3 scatter fill, not i64 ptrs
     severity: info
     description: |
-      linalg.batch_matmul now lowers end-to-end and runs CORRECTLY on BMG
-      (verified: 4x256x256x256, 0 mismatches / 262144 elements). Recipe (stage-1
-      template pipelines/linalg_to_wg/templates/tile_vectorize_batch.mlir.j2,
-      auto-selected by lower_linalg_to_wg when the input contains
-      linalg.batch_matmul; stages 2/3 are shared with the plain-matmul path):
-        tile_using_forall [1, wg_m, wg_n]  (one batch per workgroup, grid = batch)
-        + fuse fill + tile_using_for [0,0,0,k_tile]
+      linalg.batch_matmul now lowers end-to-end and runs CORRECTLY on BMG for both
+      square and non-square shapes (verified 0 mismatches: 4x256x256x256 /262144;
+      2x512x256x128 /262144; 3x384x512x64 /589824). Recipe (stage-1 template
+      pipelines/linalg_to_wg/templates/tile_vectorize_batch.mlir.j2, auto-selected by
+      lower_linalg_to_wg when the input contains linalg.batch_matmul; stages 2/3 are
+      shared with the plain-matmul path):
+        tile_using_forall [1, wg_m, wg_n]  (one batch per workgroup; grid becomes
+          [batch, M/wg_m, N/wg_n])
+        + fuse fill
         + "test-linalg-rank-reduce-contraction-ops" (func-scoped; collapses the
-          batch=1 matmul to a 2-D linalg.matmul via collapse_shape)
+          batch=1 matmul to a 2-D linalg.matmul) + canonicalize
+        + tile_using_for [0, 0, k_tile] on the resulting 2-D linalg.matmul
+          (NOT [0,0,0,k_tile] on the 4-D op — see ORDERING below)
         + vectorize {fold_type_extensions_into_contract}
-        + CAST-AWAY-LEADING-UNIT-DIM  <-- the actual fix
+        + CAST-AWAY-LEADING-UNIT-DIM (fixes the scatter-fill segfault)
         + hoist/canonicalize/bufferize/forall->gpu/set_gpu_launch_threads.
+      ORDERING (critical for non-square): rank-reduce+canonicalize BEFORE k-tiling,
+      and tile k on the 2-D matmul. If k is tiled on the 4-D op first, the k-loop
+      carries a 1 x wg_m x wg_n accumulator with a collapse_shape inside;
+      loop-invariant-subset-hoisting can't fold the zero-fill through that reshape,
+      leaving an accumulator transfer_read on a DYNAMIC-stride memref
+      (strided<[?,?]>) that convert-vector-to-xegpu rejects on non-square shapes
+      ("Failed to update operation with the layout"). Rank-reducing first makes the
+      k-loop carry a clean 2-D vector<wg_m x wg_n> iter_arg (arith.constant
+      dense<0.0>), exactly like the plain-matmul path -> no accumulator
+      transfer_read survives, works for square AND non-square.
       ROOT CAUSE (corrected — the earlier "i64-pointer tdesc" theory was WRONG; the
       plain-matmul path also tdescs from i64 pointers and works fine): after
       rank-reduction the *inner matmul* is cleanly 2-D, but the *fused zero-fill*
@@ -47,22 +61,12 @@ constraints:
       cast_away_vector_leading_one_dim, drop_unit_dims_with_shape_cast} after
       vectorize so the rank-3 fill becomes a clean 2-D block transfer_write ->
       lowers to xegpu.store_nd (block), no scatter, no crash.
-      GOTCHA: launch threads must match the sg grid. wg=256x256 sg=32x32 -> sg grid
-      [8,8] = 64 subgroups = 1024 threads (not 512); a wrong thread count computes
-      only part of each tile (corners read 0) even though the lowering is correct.
-      KNOWN LIMITATION (non-square / partial-tile shapes): when the per-batch M/N/K
-      don't divide evenly the same way as the verified 256^3 case, the accumulator's
-      initial vector.transfer_read of the C tile can survive on a memref with
-      DYNAMIC strides (strided<[?,?]>) that convert-vector-to-xegpu can't lower ->
-      "Failed to update operation with the layout" at gpu-lower-to-xevm. Root: the
-      fused zero-fill didn't fully fold into a register (zero-const) accumulator, so
-      a real C load remains; with static strides (256^3) it converts fine, with
-      dynamic strides it doesn't. FIX DIRECTION: force the zero-fill to fold to an
-      arith.constant dense<0.0> iter_arg (as the plain-matmul path does) so there is
-      NO accumulator transfer_read to convert — e.g. a stronger hoist/canonicalize
-      or an explicit fill->zero-const rewrite before bufferize. Until then, treat
-      the batched path as verified for uniform/static-stride shapes (e.g. GxSxSxS)
-      and validate any new shape through the CoVeR gate.
+      GOTCHA: launch grid + threads must match the tiling. grid = [batch, M/wg_m,
+      N/wg_n]; threads = (wg_m/sg_m)*(wg_n/sg_n)*16. wg=256x256 sg=32x32 -> sg grid
+      [8,8] = 64 subgroups = 1024 threads (not 512). A wrong thread count computes
+      only part of each tile (corners read 0); a wrong grid computes only some tiles
+      (e.g. launching (batch,1,1) for an M=512 wg_m=128 kernel covers 1 of 4 M-tiles
+      -> 75% of the output stays zero) even though the lowering itself is correct.
 
   - id: lowering_no_linalg_in_host_harness
     name: Keep linalg ops out of the host @main harness

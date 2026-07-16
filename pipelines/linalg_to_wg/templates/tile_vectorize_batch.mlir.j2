@@ -4,12 +4,16 @@
 // matmul path.
 //
 // Recipe (differences from the plain-matmul template called out):
-//   - tile_using_forall [1, wg_m, wg_n]  -> one batch per workgroup (grid = batch)
+//   - tile_using_forall [1, wg_m, wg_n]  -> one batch per workgroup
+//     (grid = [batch, M/wg_m, N/wg_n])
 //   - fuse the zero-fill into the WG tile
-//   - tile_using_for [0, 0, 0, k_tile]   -> k-loop (4-D op: batch,m,n,k)
 //   - "test-linalg-rank-reduce-contraction-ops" collapses the batch=1 matmul to a
 //     2-D linalg.matmul (via collapse_shape on the operands) so it becomes a clean
-//     2-D vector.contract -> xegpu.dpas, exactly like the plain path.
+//     2-D vector.contract -> xegpu.dpas, exactly like the plain path. Run this
+//     (+canonicalize) BEFORE k-tiling so the k-loop carries a 2-D accumulator; the
+//     zero-fill then folds to a vector<wg_m x wg_n> iter_arg (see ORDERING note in
+//     the body). Tiling k on the 4-D op first breaks the fold on non-square shapes.
+//   - tile_using_for [0, 0, k_tile] on the resulting 2-D linalg.matmul -> k-loop.
 //   - vectorize (folding f16->f32 extf into the mixed-precision contract).
 //   - CAST AWAY LEADING UNIT DIMS: the fused fill stays rank-3
 //     (vector<1 x wg_m x wg_n>) after rank-reduction and would lower to a *scatter*
@@ -26,11 +30,21 @@ module attributes {transform.with_named_sequence} {
     // One batch per workgroup: batch tile 1, WG tile [wg_m, wg_n].
     %t, %fa = transform.structured.tile_using_forall %mm tile_sizes [1, {{ wg_m }}, {{ wg_n }}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %ff, %nc = transform.structured.fuse_into_containing_op %fill into %fa : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    // K-loop tile (4-D iteration space: batch, m, n, k).
-    %tk, %kl = transform.structured.tile_using_for %t tile_sizes [0, 0, 0, {{ k_tile }}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    // Collapse the batch=1 matmul to a 2-D linalg.matmul (func-scoped pass).
+    // Collapse the batch=1 matmul to a 2-D linalg.matmul (func-scoped pass) BEFORE
+    // tiling k. Order matters: rank-reducing first means the k-loop is built around
+    // a 2-D accumulator, so loop-invariant-subset-hoisting folds the zero-fill into
+    // a vector iter_arg (arith.constant dense<0.0>) exactly like the plain-matmul
+    // path. If k is tiled first (on the 4-D op), the loop carries a 1 x wg_m x wg_n
+    // accumulator with a collapse_shape inside; hoisting can't fold through the
+    // reshape, leaving a dynamic-stride accumulator transfer_read that
+    // convert-vector-to-xegpu rejects on non-square/partial-tile shapes.
     %frr = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op
     %rr = transform.apply_registered_pass "test-linalg-rank-reduce-contraction-ops" to %frr : (!transform.any_op) -> !transform.any_op
+    %fcan = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op
+    %cann = transform.apply_registered_pass "canonicalize" to %fcan : (!transform.any_op) -> !transform.any_op
+    // K-loop tile on the now-2-D matmul (iteration space m, n, k -> [0, 0, k_tile]).
+    %mm2 = transform.structured.match ops{["linalg.matmul"]} in %root : (!transform.any_op) -> !transform.any_op
+    %tk, %kl = transform.structured.tile_using_for %mm2 tile_sizes [0, 0, {{ k_tile }}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %f = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op
     %v = transform.structured.vectorize_children_and_apply_patterns %f {fold_type_extensions_into_contract} : (!transform.any_op) -> !transform.any_op
     // Strip leading unit dims so the fused fill's vector<1 x wg_m x wg_n> write
