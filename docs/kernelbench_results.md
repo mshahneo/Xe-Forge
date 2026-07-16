@@ -108,9 +108,12 @@ matmul; per-matmul lowering for MLP chains; boundary tiles for irregular shapes)
 
 1. **transpose-A / both** (kernels 16, 18) — the analogous A-side annotation; the
    vectorizer already emits the right shape, only the WG layout needs work.
-2. **Per-matmul lowering for MLP chains** (level3) → each MLP layer is
-   transpose-B matmul + bias + ReLU; the matmuls are now lowerable, so this needs
-   graph splitting + elementwise epilogue handling.
+2. **MLP chains** (level3) → a *single* MLP layer (`C = relu(A·Bᵀ + bias)`) now
+   lowers into one fused WG kernel (matmul + bias + activation), verified GPU-correct.
+   Remaining: chaining N layers — each lowers individually, but N-layer outlining
+   (keeping each layer a separate kernel) needs porting lighthouse's nlayers-aware
+   outline; today the per-layer parallel loops merge into one launch and only one
+   layer's contract converts.
 3. **Boundary/partial-tile handling** → unlocks irregular shapes (kernel 8).
 4. **Autotune the tile config** (use the existing LLM config sweep instead of the
    first divisible tile) to reach the ~98 TFLOPS peak on the 4K GEMMs.

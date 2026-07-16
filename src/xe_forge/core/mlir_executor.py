@@ -429,14 +429,16 @@ class MlirExecutor:
         if errs:
             return False, "", f"invalid lowering config: {'; '.join(errs)}"
 
-        from xe_forge.core.linalg_lowering import is_transpose_b_matmul
+        from xe_forge.core.linalg_lowering import is_mlp_layer, is_transpose_b_matmul
 
         batched = "linalg.batch_matmul" in linalg_code
-        transpose_b = is_transpose_b_matmul(linalg_code)
+        mlp_layer = is_mlp_layer(linalg_code)
+        # A plain transpose-B matmul (no epilogue); mlp_layer subsumes the epilogue case.
+        transpose_b = is_transpose_b_matmul(linalg_code) and not mlp_layer
         work = tempfile.mkdtemp(prefix="mlir_lower_")
         try:
             tile_lib, anno_lib = config.render(
-                work, batched=batched, transpose_b=transpose_b
+                work, batched=batched, transpose_b=transpose_b, mlp_layer=mlp_layer
             )
             src = Path(work) / "input.mlir"
             src.write_text(linalg_code)

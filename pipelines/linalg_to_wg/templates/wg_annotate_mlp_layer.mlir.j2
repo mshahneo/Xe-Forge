@@ -1,0 +1,31 @@
+// Stage-3 WG layout annotation for a single MLP layer (transpose-B matmul with a
+// fused bias-add + activation epilogue). Combines:
+//   - the transpose-B matmul layouts (B reaches the dpas through a vector.transpose,
+//     so its load is annotated on the pre-transpose [N, k] shape — see
+//     wg_annotate_transpose_b.mlir.j2), and
+//   - a SLICE layout on the bias: the bias is a 1-D xegpu.load feeding a
+//     vector.broadcast to [wg_m, wg_n]; it gets the output (C) layout sliced on
+//     dim 0 (broadcast down the M rows), matching lighthouse's mlp_schedule.
+// Layouts are derived from the config.
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.any_op {transform.readonly}) {
+    %dpas = transform.structured.match ops{["xegpu.dpas"]} in %root : (!transform.any_op) -> !transform.any_op
+    %aval = transform.get_operand %dpas[0] : (!transform.any_op) -> !transform.any_value
+    %aload = transform.xegpu.get_load_op %aval : (!transform.any_value) -> !transform.any_op
+    %bval = transform.get_operand %dpas[1] : (!transform.any_op) -> !transform.any_value
+    %bload = transform.xegpu.get_load_op %bval : (!transform.any_value) -> !transform.any_op
+    // A: M tiled across subgroups, K whole per subgroup.
+    transform.xegpu.set_anchor_layout %aload sg_layout = [{{ sg_grid_m }}, 1] sg_data = [{{ sg_m }}, {{ k_tile }}] inst_data = [8, 16] : !transform.any_op
+    // B (transpose-B) pre-transpose [N, k]: N tiled across subgroups.
+    transform.xegpu.set_anchor_layout %bload sg_layout = [{{ sg_grid_n }}, 1] sg_data = [{{ sg_n }}, {{ k_tile }}] inst_data = [16, 16] : !transform.any_op
+    transform.xegpu.set_anchor_layout %dpas index = 0 sg_layout = [{{ sg_grid_m }}, 1] sg_data = [{{ sg_m }}, {{ k_tile }}] inst_data = [8, 16] : !transform.any_op
+    transform.xegpu.set_anchor_layout %dpas index = 1 sg_layout = [1, {{ sg_grid_n }}] sg_data = [{{ k_tile }}, {{ sg_n }}] inst_data = [16, 16] : !transform.any_op
+    transform.xegpu.set_anchor_layout %dpas index = 2 sg_layout = [{{ sg_grid_m }}, {{ sg_grid_n }}] sg_data = [{{ sg_m }}, {{ sg_n }}] inst_data = [8, 16] : !transform.any_op
+    %store = transform.structured.match ops{["xegpu.store_nd"]} in %root : (!transform.any_op) -> !transform.any_op
+    transform.xegpu.set_anchor_layout %store sg_layout = [{{ sg_grid_m }}, {{ sg_grid_n }}] sg_data = [{{ sg_m }}, {{ sg_n }}] inst_data = [8, 16] : !transform.any_op
+    // bias: 1-D xegpu.load feeding vector.broadcast -> output layout, sliced on dim 0.
+    %bcast_load = transform.structured.match ops{["xegpu.load"]} in %root : (!transform.any_op) -> !transform.any_op
+    transform.xegpu.set_anchor_layout %bcast_load index = 0 sg_layout = [{{ sg_grid_m }}, {{ sg_grid_n }}] sg_data = [{{ sg_m }}, {{ sg_n }}] inst_data = [8, 16] slice_dims = [0] : !transform.any_op
+    transform.yield
+  }
+}

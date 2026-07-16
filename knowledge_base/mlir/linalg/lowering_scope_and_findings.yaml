@@ -15,8 +15,11 @@ constraints:
       (see lowering_batch_matmul_supported: one batch per workgroup + rank-reduce +
       cast-away-leading-unit-dim). Transpose-B matmul (C = A · B^T, the nn.Linear
       form) IS handled via a dedicated stage-3 annotation (see
-      lowering_transpose_b_supported). Still NOT handled: transpose-A / transpose-both
-      matmul, linalg.softmax, linalg.generic (bias/ReLU/broadcast/masking), and
+      lowering_transpose_b_supported). A single epilogue-fused MLP layer
+      (C = act(A·B^T + bias)) IS handled via the MLP-layer templates (see
+      lowering_mlp_layer_supported). Still NOT handled: transpose-A / transpose-both
+      matmul, multi-layer MLP chains (per-layer outlining not yet ported),
+      linalg.softmax, arbitrary linalg.generic (masking / reductions), and
       fully fused attention (feeding the raw Linalg to the WG pipeline fails with
       "expected add/mul op in the body"); fused attention is routed to the
       lighthouse dump path (attention_lowering_via_lighthouse_dump) instead.
@@ -53,6 +56,40 @@ constraints:
       different assert (setupInsertStridedSliceResultLayout: srcShape must be
       divisible by laneLayout) — needs its own layout, deferred. transpose-B covers
       the high-value case (all nn.Linear).
+
+  - id: lowering_mlp_layer_supported
+    name: A single epilogue-fused MLP layer (matmul + bias + activation) lowers to WG
+    severity: info
+    description: |
+      One nn.Linear layer with activation — C = act(A·B^T + bias) — lowers end-to-end
+      into ONE fused WG kernel and runs correctly on BMG (verified 128x1024x1024
+      relu(A·B^T+bias), 0 mismatches). Detected by is_mlp_layer (exactly one
+      linalg.matmul + >=1 linalg.generic, no batch/softmax/physical-transpose);
+      lower_linalg_to_wg auto-selects the MLP-layer templates.
+      APPROACH (mirrors lighthouse mlp_schedule, adapted to our templates): stage-1
+      tile_vectorize_mlp_layer.mlir.j2 runs "linalg-fuse-elementwise-ops" (coalesces
+      bias-add + activation generics), then tiles the *epilogue generic* (the last
+      consumer) to the WG tile with tile_using_forall and fuses the matmul + fill in
+      as PRODUCERS (fuse_into_containing_op), then k-loop-tiles the fused matmul.
+      After vectorize the epilogue becomes vector arith (addf bias-broadcast, cmpf/
+      select relu) sitting after the k-loop accumulator — one kernel, no
+      intermediate global buffer. stage-3 wg_annotate_mlp_layer.mlir.j2 = the
+      transpose-B layouts (matmuls are the x·W^T form) PLUS a SLICE layout on the
+      bias: the bias is a 1-D xegpu.load feeding vector.broadcast; it gets the C
+      layout with slice_dims=[0] (broadcast down M), exactly as lighthouse does.
+      GRID GOTCHA: the fused epilogue's forall over [M/wg_m, N/wg_n] maps to a
+      COLLAPSED 1-D grid (num_tiles, 1, 1) with block_id x divided internally — launch
+      (M/wg_m * N/wg_n, 1, 1), NOT a 2-D grid (a 2-D launch runs only the first tile
+      row -> mostly-zero output though the lowering is correct).
+      NOT YET — MULTI-LAYER CHAINS (KernelBench level3 MLPs, 3..17 layers): each
+      layer lowers individually, but chaining N layers in one payload currently
+      merges the per-layer scf.parallel loops into a SINGLE gpu.launch, and
+      convert-vector-to-xegpu (scoped to gpu.module) then converts only one layer's
+      contract (the other stays as vector.contract -> won't lower). lighthouse
+      handles this with an explicit nlayers-aware outline
+      (vectorize_bufferize_and_outline_gpu_func + match_and_split gpu.module by
+      nlayers) that keeps each layer a separate kernel. Porting that per-layer
+      outlining is the remaining work to lower full MLPs.
 
   - id: lowering_batch_matmul_supported
     name: batch_matmul lowers to XeGPU-WG (fixed) — the crash was a rank-3 scatter fill, not i64 ptrs

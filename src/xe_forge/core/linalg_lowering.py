@@ -150,6 +150,7 @@ class LoweringConfig:
         template_dir: str | Path = _TEMPLATE_DIR,
         batched: bool = False,
         transpose_b: bool = False,
+        mlp_layer: bool = False,
     ) -> tuple[Path, Path]:
         """Render both transform libraries into out_dir. Returns their paths.
 
@@ -164,6 +165,13 @@ class LoweringConfig:
         shape; the shared wg_annotate would set an inconsistent layout and crash
         gpu-lower-to-xevm. The stage-1 tile/vectorize template is unchanged (it
         matches linalg.matmul, including the indexing_maps transpose form).
+
+        *mlp_layer* selects the epilogue-fused MLP-layer templates
+        (tile_vectorize_mlp_layer + wg_annotate_mlp_layer): one nn.Linear layer,
+        C = act(A·B^T + bias). Stage 1 tiles the elementwise epilogue and fuses the
+        (transpose-B) matmul + fill in as producers; stage 3 adds the transpose-B
+        layouts plus a slice layout on the bias broadcast. Takes precedence over
+        *transpose_b* (which it subsumes).
         """
         errs = self.validate()
         if errs:
@@ -178,10 +186,20 @@ class LoweringConfig:
         ctx = self._ctx()
         tile_path = out_dir / "tile_vectorize.mlir"
         anno_path = out_dir / "wg_annotate.mlir"
-        tile_tmpl = "tile_vectorize_batch.mlir.j2" if batched else "tile_vectorize.mlir.j2"
-        anno_tmpl = (
-            "wg_annotate_transpose_b.mlir.j2" if transpose_b else "wg_annotate.mlir.j2"
-        )
+        if mlp_layer:
+            tile_tmpl, anno_tmpl = (
+                "tile_vectorize_mlp_layer.mlir.j2",
+                "wg_annotate_mlp_layer.mlir.j2",
+            )
+        elif batched:
+            tile_tmpl, anno_tmpl = "tile_vectorize_batch.mlir.j2", "wg_annotate.mlir.j2"
+        elif transpose_b:
+            tile_tmpl, anno_tmpl = (
+                "tile_vectorize.mlir.j2",
+                "wg_annotate_transpose_b.mlir.j2",
+            )
+        else:
+            tile_tmpl, anno_tmpl = "tile_vectorize.mlir.j2", "wg_annotate.mlir.j2"
         tile_path.write_text(env.get_template(tile_tmpl).render(**ctx))
         anno_path.write_text(env.get_template(anno_tmpl).render(**ctx))
         return tile_path, anno_path
@@ -309,6 +327,21 @@ def is_transpose_b_matmul(code: str) -> bool:
         if len(args) == 3 and len(res) == 2 and res == [args[1], args[2]]:
             return True  # B result is (n, k) -> transpose-B
     return False
+
+
+def is_mlp_layer(code: str) -> bool:
+    """True if *code* is a single epilogue-fused MLP layer: one linalg.matmul whose
+    result feeds elementwise linalg.generic op(s) (bias-add / activation), ending in
+    a single materialized result. Detected as: exactly one linalg.matmul + at least
+    one linalg.generic + no batch_matmul / softmax / transpose op.
+    """
+    if code.count("linalg.matmul") != 1:
+        return False
+    if "linalg.batch_matmul" in code or "linalg.softmax" in code:
+        return False
+    if "linalg.transpose" in code:
+        return False  # physical transpose op unhandled; transpose-B via indexing_maps is fine
+    return "linalg.generic" in code
 
 
 def extract_transpose_b_dims(code: str) -> tuple[int, int, int] | None:
