@@ -383,7 +383,7 @@ def is_mlp_layer(code: str) -> bool:
         return False
     if "linalg.batch_matmul" in code or "linalg.softmax" in code:
         return False
-    if "linalg.transpose" in code:
+    if re.search(r"^\s*%\w+ = linalg\.transpose\b", code, re.MULTILINE):
         return False  # physical transpose op unhandled; transpose-B via indexing_maps is fine
     if "linalg.generic" not in code:
         return False

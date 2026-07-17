@@ -124,6 +124,12 @@ patterns:
             profiling, picks fastest. Works for plain/transpose-B matmul, MLP layer,
             elementwise-epilogue GEMM. Timing-only (uninitialized buffers) — assumes
             all candidates compute the same math; pair with a correctness gate.
+            GRID: auto-detected per candidate — 2-D (M/wg_m, N/wg_n) when the kernel
+            uses block_id y, else 1-D ((M/wg_m)*(N/wg_n)); the dimensionality varies
+            with the tile for MLP-layer kernels, so this must be detected not assumed.
+      WIRED INTO MLP: lower_mlp_to_wg(autotune=True) autotunes each distinct layer
+      shape's tile (parse_mlp caches by shape). Restricted to default-GRF candidates
+      there (the multi-kernel MLP recipe has no per-layer igc flag).
       candidate_configs(m,n,k) gives a curated, shape-filtered shortlist (default +
       large-GRF sg=[32,64]/[64,32] + a few WG sizes + larger k-tile), default-first.
       LinalgLoweringAgent.propose falls back to it when the LLM is unavailable, so

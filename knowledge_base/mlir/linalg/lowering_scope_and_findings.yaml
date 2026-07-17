@@ -133,9 +133,22 @@ constraints:
       Also: intermediate buffers are host memref.alloc in the fused function; for a
       standalone run they must be gpu.alloc (lighthouse's convert_allocs_to_gpu). In
       the verified harness the layers were launched inline from @main with a gpu.alloc
-      intermediate. NOT YET: autotuning the per-layer tiles (first-divisible only);
-      any non-(matmul+bias+activation) op in the chain (norm/pool/softmax) is out of
-      scope.
+      intermediate.
+      PER-LAYER TILE AUTOTUNING is wired: lower_mlp_to_wg(autotune=True) times each
+      DISTINCT layer shape's candidate tiles on the GPU (via autotune_tile on a
+      standalone single-layer kernel) and bakes the fastest into the recipe;
+      parse_mlp(code, executor=...) caches by shape so a 17-layer MLP of one repeated
+      shape autotunes once. Restricted to default-GRF tiles (the multi-kernel recipe
+      has no per-layer igc flag; large-GRF would need that wired). Verified GPU-correct
+      with non-default autotuned tiles (L1 wg=64x64, L2 wg=32x64; 0 mismatches).
+      GRID GOTCHA (bit me during verify): the WG grid dimensionality DEPENDS ON THE
+      TILE — some MLP-layer tiles collapse the epilogue forall to a 1-D grid
+      (block_id x only), others keep a 2-D grid (block_id x AND y). autotune_tile
+      auto-detects via "block_id y" in the lowered kernel and launches
+      (M/wg_m*N/wg_n,1,1) vs (M/wg_m,N/wg_n,1) accordingly; a hand harness must do the
+      same or it silently computes only part of the output.
+      NOT YET: any non-(matmul+bias+activation) op in the chain (norm/pool/softmax) is
+      out of scope.
 
   - id: lowering_batch_matmul_supported
     name: batch_matmul lowers to XeGPU-WG (fixed) — the crash was a rank-3 scatter fill, not i64 ptrs

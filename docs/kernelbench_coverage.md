@@ -150,4 +150,6 @@ Level-3 kernels). **The biggest coverage unlocks next**, in order of leverage:
 is picked, instead of first-divisible. Measured: 4096³ matmul reaches ~64 TFLOPS
 (large-GRF `sg=[64,32]`) vs 55 TFLOPS for the default `sg=[32,32]`. The pipeline's
 LLM sweep already ranked configs by time; the fallback now uses the curated
-shortlist so autotuning happens even without the LLM.
+shortlist so autotuning happens even without the LLM. **Multi-layer MLPs** autotune
+per layer too via `lower_mlp_to_wg(autotune=True)` (each distinct layer shape tuned
+once; verified GPU-correct with non-default tiles).

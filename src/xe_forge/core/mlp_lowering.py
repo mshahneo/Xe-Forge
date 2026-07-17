@@ -75,6 +75,67 @@ def _pick_tile(m: int, n: int, k: int) -> tuple[int, int, int, int, int] | None:
     return None
 
 
+def _standalone_layer_kernel(m: int, n: int, k: int) -> str:
+    """A standalone transpose-B MLP layer C = relu(A·W^T + bias) for tile autotuning.
+
+    Used to time a single layer's candidate tiles in isolation (the layer's own
+    matmul + bias + ReLU, f16 in / f32 out), so autotune_tile can rank tiles for
+    that exact shape before we bake the winner into the N-layer recipe.
+    """
+    return f"""#mA = affine_map<(m, n, k) -> (m, k)>
+#mB = affine_map<(m, n, k) -> (n, k)>
+#mC = affine_map<(m, n, k) -> (m, n)>
+#e2 = affine_map<(m, n) -> (m, n)>
+#eb = affine_map<(m, n) -> (n)>
+func.func @layer(%A: memref<{m}x{k}xf16>, %W: memref<{n}x{k}xf16>, %bias: memref<{n}xf32>, %C: memref<{m}x{n}xf32>) {{
+  %cA = bufferization.to_tensor %A restrict : memref<{m}x{k}xf16> to tensor<{m}x{k}xf16>
+  %cW = bufferization.to_tensor %W restrict : memref<{n}x{k}xf16> to tensor<{n}x{k}xf16>
+  %cbias = bufferization.to_tensor %bias restrict : memref<{n}xf32> to tensor<{n}xf32>
+  %c0 = arith.constant 0.0 : f32
+  %e0 = tensor.empty() : tensor<{m}x{n}xf32>
+  %filled = linalg.fill ins(%c0 : f32) outs(%e0 : tensor<{m}x{n}xf32>) -> tensor<{m}x{n}xf32>
+  %mm = linalg.matmul indexing_maps = [#mA, #mB, #mC] ins(%cA, %cW : tensor<{m}x{k}xf16>, tensor<{n}x{k}xf16>) outs(%filled : tensor<{m}x{n}xf32>) -> tensor<{m}x{n}xf32>
+  %e1 = tensor.empty() : tensor<{m}x{n}xf32>
+  %r = linalg.generic {{indexing_maps = [#e2, #eb, #e2], iterator_types = ["parallel", "parallel"]}} ins(%mm, %cbias : tensor<{m}x{n}xf32>, tensor<{n}xf32>) outs(%e1 : tensor<{m}x{n}xf32>) {{
+  ^bb0(%in: f32, %b: f32, %o: f32):
+    %s = arith.addf %in, %b : f32
+    %cmp = arith.cmpf ugt, %s, %c0 : f32
+    %sel = arith.select %cmp, %s, %c0 : f32
+    linalg.yield %sel : f32
+  }} -> tensor<{m}x{n}xf32>
+  bufferization.materialize_in_destination %r in restrict writable %C : (tensor<{m}x{n}xf32>, memref<{m}x{n}xf32>) -> ()
+  return
+}}"""
+
+
+def autotune_layer_tile(executor, m: int, n: int, k: int):
+    """Return the fastest (wg_m, wg_n, sg_m, sg_n, k_tile) tile for an MLP layer of
+    shape (M, N, K), by timing candidates on the GPU via executor.autotune_tile on a
+    standalone single-layer kernel. Falls back to _pick_tile (first-divisible) if
+    autotuning is unavailable or finds nothing runnable.
+    """
+    from xe_forge.core.linalg_lowering import candidate_configs
+
+    fallback = _pick_tile(m, n, k)
+    if executor is None or not hasattr(executor, "autotune_tile"):
+        return fallback
+    # The multi-kernel MLP recipe applies one pipeline (no per-layer igc flag), so
+    # only autotune over default-GRF tiles; large-GRF would need the igc option
+    # wired per layer (not yet supported here). See lowering_autotune_tile / MLP KB.
+    cands = [c for c in candidate_configs(m, n, k) if not c.large_grf]
+    if not cands:
+        return fallback
+    try:
+        best, _wg, _res = executor.autotune_tile(
+            _standalone_layer_kernel(m, n, k), (m, n, k), cands, flop=2 * m * n * k
+        )
+    except Exception:
+        return fallback
+    if best is None:
+        return fallback
+    return best.wg_m, best.wg_n, best.sg_m, best.sg_n, best.k_tile
+
+
 def fold_transpose_into_matmul(code: str) -> str:
     """Rewrite `t = linalg.transpose(W); matmul(A, t)` into a transpose-B matmul in
     the indexing_maps form (B map (m,n,k)->(n,k)), and drop the now-dead transpose
@@ -118,16 +179,23 @@ def fold_transpose_into_matmul(code: str) -> str:
     return code
 
 
-def parse_mlp(code: str) -> list[MlpLayer] | None:
+def parse_mlp(code: str, executor=None) -> list[MlpLayer] | None:
     """Parse an imported MLP into a list of MlpLayer, in execution order.
 
     Expects the transpose-folded form (call fold_transpose_into_matmul first):
     >=2 transpose-B linalg.matmul (indexing_maps B = (n,k)), each followed by
     elementwise linalg.generic (bias/activation). Returns None if it isn't this
     shape (e.g. a conv/norm slipped in, or a plain non-transpose-B matmul).
+
+    *executor*: if given (an MlirExecutor), each layer's tile is AUTOTUNED on the
+    GPU (time candidates, pick fastest) instead of first-divisible. Distinct layer
+    shapes are autotuned once and cached (level3 MLPs repeat the same shape many
+    times, so this keeps the tuning cost ~= number of distinct shapes).
     """
-    if "linalg.transpose" in code:
-        return None  # must be folded first
+    # Must be folded first: any *real* transpose op left (ignore mentions in
+    # comments) means the input wasn't run through fold_transpose_into_matmul.
+    if re.search(r"^\s*%\w+ = linalg\.transpose\b", code, re.MULTILINE):
+        return None
     # transpose-B matmul: ins(%A : tensor<MxK>, %W : tensor<NxK>) with indexing_maps.
     matmuls = re.findall(
         r"linalg\.matmul\s+indexing_maps.*?ins\(%\w+, %\w+\s*:\s*"
@@ -136,13 +204,21 @@ def parse_mlp(code: str) -> list[MlpLayer] | None:
     )
     if len(matmuls) < 2:
         return None
+    tile_cache: dict[tuple[int, int, int], tuple | None] = {}
     layers: list[MlpLayer] = []
     for am, ak, wn, wk in ((int(a), int(b), int(c), int(d)) for a, b, c, d in matmuls):
         # A is [M, K]; W is stored [N, K] (transpose-B). K must agree.
         m, k, n = am, ak, wn
         if wk != k:
             return None
-        tile = _pick_tile(m, n, k)
+        shape = (m, n, k)
+        if shape not in tile_cache:
+            tile_cache[shape] = (
+                autotune_layer_tile(executor, m, n, k)
+                if executor is not None
+                else _pick_tile(m, n, k)
+            )
+        tile = tile_cache[shape]
         if tile is None:
             return None
         wm, wnn, sm, sn, kt = tile

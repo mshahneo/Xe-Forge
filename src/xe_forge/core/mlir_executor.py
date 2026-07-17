@@ -480,7 +480,7 @@ class MlirExecutor:
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
-    def lower_mlp_to_wg(self, linalg_code: str) -> tuple[bool, str, str]:
+    def lower_mlp_to_wg(self, linalg_code: str, autotune: bool = False) -> tuple[bool, str, str]:
         """Lower a multi-layer MLP (chain of nn.Linear + activation) to XeGPU-WG.
 
         Folds physical transposes into the matmul (transpose-B indexing_maps),
@@ -489,6 +489,9 @@ class MlirExecutor:
         the shared 3-stage lowering. Unlike lower_linalg_to_wg (one gpu.module),
         the result has N gpu.modules — one kernel per layer, chained through
         intermediate buffers in the host function. Returns (ok, wg_code, err).
+
+        *autotune*: when True, each distinct layer shape's tile is chosen by timing
+        candidates on the GPU (autotune_tile) instead of first-divisible.
         """
         from xe_forge.core.mlp_lowering import (
             fold_transpose_into_matmul,
@@ -497,7 +500,7 @@ class MlirExecutor:
         )
 
         folded = fold_transpose_into_matmul(linalg_code)
-        layers = parse_mlp(folded)
+        layers = parse_mlp(folded, executor=self if autotune else None)
         if not layers:
             return False, "", "not a recognized multi-layer MLP (parse returned no layers)"
         tile_src, anno_src = render_mlp_recipe(layers)
@@ -666,8 +669,9 @@ class MlirExecutor:
         + problem dims), and time it via IMEX profiling. Returns
         (best_config, best_wg_code, results[list of (cfg, ms|None)]). Candidates that
         fail to lower or run are skipped. *dims* is (M, N, K); the launch grid is
-        (M/wg_m, N/wg_n, 1) — the 2-D grid the plain/transpose-B matmul lowering
-        emits (block_id x/y).
+        derived per kernel — 2-D (M/wg_m, N/wg_n) for the plain/transpose-B matmul
+        (block_id x/y), or 1-D ((M/wg_m)*(N/wg_n)) for the MLP epilogue-tiled kernels
+        that collapse the grid (block_id x only).
 
         NOTE: this is a *timing-only* autotune (buffers uninitialized) — it ranks by
         speed and assumes every candidate lowers the SAME math, so it does not
@@ -688,8 +692,19 @@ class MlirExecutor:
                 logger.info("autotune %s: lowering failed (%s)", cfg, _tail(err, 2))
                 results.append((cfg, None))
                 continue
+            # Grid convention depends on how the kernel indexes work-groups:
+            #   - plain / transpose-B matmul uses a 2-D block_id (x, y) grid
+            #     [M/wg_m, N/wg_n];
+            #   - MLP epilogue-tiled kernels collapse it to a 1-D grid
+            #     [(M/wg_m)*(N/wg_n)] (block_id x only, divided internally).
+            # Detect from the kernel body so autotune works for both.
+            n_m, n_n = m // cfg.wg_m, n // cfg.wg_n
+            if "block_id y" in wg:
+                grid = (n_m, n_n, 1)
+            else:
+                grid = (n_m * n_n, 1, 1)
             harness = synthesize_run_harness(
-                wg, grid=(m // cfg.wg_m, n // cfg.wg_n, 1), block=(cfg.nb_threads, 1, 1)
+                wg, grid=grid, block=(cfg.nb_threads, 1, 1)
             )
             if harness is None:
                 results.append((cfg, None))
