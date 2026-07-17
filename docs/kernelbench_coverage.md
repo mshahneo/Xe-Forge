@@ -120,6 +120,15 @@ shapes, and generates an **N-layer transform recipe** (tile each layer's epilogu
 + fuse its matmul/fill as producers, per layer) that outlines **one XeGPU kernel
 per layer**, chained through intermediate buffers.
 
+**Wired into the pipeline / CLI**: `XeForgePipeline._maybe_lower_mlp` routes a
+multi-matmul chain (≥2 `linalg.matmul`) to this path during LINALG_LOWERING,
+autotunes per-layer tiles, and synthesizes a runnable N-launch `@main` harness so
+the WG analysis/optimization stages run on the lowered chain. Confirmed genuinely
+end-to-end via `python -m xe_forge.cli --dsl mlir` on a 2-layer MLP: the log shows
+`LINALG_LOWERING — MLP chain of 2 layers (autotune)` → `MLP lowered to 2 chained
+XeGPU-WG kernels` → ANALYSIS (7 issues) → PLANNING → WG stages. (Single-matmul
+inputs still route to the plain-GEMM path — the MLP branch is guarded on ≥2 matmuls.)
+
 **End-to-end verified on the real level3/3 DeepNarrowMLP** (the 17-layer one):
 `lower_mlp_to_wg(autotune=True, large_grf=True)` lowered all 17 layers in ~3.6 s
 (3 distinct shapes autotuned once each → all picked large-GRF `sg=[64,32]`/`[32,64]`

@@ -276,11 +276,24 @@ class XeForgePipeline:
             logger.warning("Executor has no sweep_configs; skipping Linalg lowering.")
             return None
 
+        # A multi-matmul chain (>=2 linalg.matmul) is an MLP, not a single GEMM —
+        # route it FIRST. extract_matmul_dims would otherwise match just the first
+        # matmul and mis-lower the chain as one GEMM.
+        if kernel_code.count("linalg.matmul") >= 2:
+            mlp = self._maybe_lower_mlp(kernel_code)
+            if mlp is not None:
+                return mlp
+            # fall through: maybe attention (batch_matmul-based) or unsupported.
+
         dims = extract_matmul_dims(kernel_code)
         if dims is None:
-            # Not a plain matmul. Try the fused-attention path (transpose +
-            # batch_matmul QK^T + softmax + batch_matmul PV) via the lighthouse
-            # schedule, which our single-matmul pipeline can't lower directly.
+            # Not a single plain matmul. Try the multi-layer MLP path (a chain of
+            # transpose-B matmul + bias/activation epilogues) -> N chained WG kernels.
+            mlp = self._maybe_lower_mlp(kernel_code)
+            if mlp is not None:
+                return mlp
+            # Else the fused-attention path (transpose + batch_matmul QK^T + softmax
+            # + batch_matmul PV) via the lighthouse schedule.
             attn = self._maybe_lower_attention(kernel_code)
             if attn is not None:
                 return attn
@@ -361,6 +374,59 @@ class XeForgePipeline:
         # is exactly where its ~1.7x win comes from. Flag it so optimize() runs the
         # sweep on the lowered kernel despite a LINALG_LOWERING stage being recorded.
         self._grf_sweep_after_lowering = True
+        return harness
+
+    def _maybe_lower_mlp(self, kernel_code: str) -> str | None:
+        """Lower a multi-layer MLP (chain of nn.Linear + activation) to a runnable
+        WG kernel.
+
+        Recognizes the MLP chain (>=2 transpose-B matmuls each with a bias/activation
+        epilogue), lowers it to N chained XeGPU-WG kernels via
+        MlirExecutor.lower_mlp_to_wg (autotuning each layer's tile, and picking
+        large-GRF tiles when the executor is in large-GRF mode), then synthesizes a
+        runnable @main that launches the N kernels in sequence with intermediate
+        buffers. Returns the harness, or None if this isn't an MLP / can't be lowered.
+        """
+        from xe_forge.core.mlp_lowering import (
+            fold_transpose_into_matmul,
+            parse_mlp,
+            synthesize_mlp_run_harness,
+        )
+
+        executor = self.executor
+        if not hasattr(executor, "lower_mlp_to_wg"):
+            return None
+        folded = fold_transpose_into_matmul(kernel_code)
+        layers = parse_mlp(folded)  # cheap structural check (no autotune)
+        if not layers:
+            return None
+        # Autotune per-layer tiles once; use large-GRF tiles when the executor is in
+        # large-GRF mode (the module is then run with the igc flag — see below).
+        want_grf = bool(getattr(executor, "large_grf", False))
+        logger.info(
+            "STAGE: LINALG_LOWERING — MLP chain of %d layers (autotune, large_grf=%s)",
+            len(layers),
+            want_grf,
+        )
+        tuned = parse_mlp(folded, executor=executor, large_grf=want_grf)
+        if not tuned:
+            return None
+        # Lower with the exact tuned tiles (no second autotune → harness grid matches).
+        ok, wg, err, used = executor.lower_mlp_to_wg(kernel_code, layers=tuned)
+        if not ok:
+            logger.warning("MLP lowering failed (%s); keeping input.", (err or "")[:200])
+            return None
+        harness = synthesize_mlp_run_harness(wg, used)
+        if harness is None:
+            logger.warning("MLP lowered to WG but harness synthesis failed; keeping input.")
+            return None
+        logger.info(
+            "MLP lowered to %d chained XeGPU-WG kernels (runnable harness synthesized).",
+            len(layers),
+        )
+        # Tiles (incl. GRF) are already chosen by the autotune; the WG stages should
+        # NOT re-run the GRF sweep on this multi-kernel module.
+        self._grf_sweep_after_lowering = False
         return harness
 
     def _maybe_sweep_grf(self, kernel_code: str, flop: float | None):

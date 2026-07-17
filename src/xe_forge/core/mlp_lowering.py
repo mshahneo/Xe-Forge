@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from xe_forge.core.attention_lowering import _indent_module
 from xe_forge.core.linalg_lowering import DPAS_A_TILE, DPAS_B_TILE, NB_WORKITEMS
 
 
@@ -338,3 +339,97 @@ def render_mlp_recipe(layers: list[MlpLayer]) -> tuple[str, str]:
     s3 += ["    transform.yield", "  }", "}"]
 
     return "\n".join(s1) + "\n", "\n".join(s3) + "\n"
+
+
+def synthesize_mlp_run_harness(wg_code: str, layers: list[MlpLayer]) -> str | None:
+    """Wrap an N-kernel MLP WG module in a runnable single-@main harness.
+
+    The lowered MLP has one gpu.module per layer (layer i: C_i = act(H_{i-1}·W_i^T +
+    bias_i), H_{-1} = A). This emits @main that gpu.allocs the inputs (A + per-layer
+    W_i/bias_i) and the intermediate/output buffers, then launches the N kernels in
+    sequence, chaining H_{i-1} -> H_i. Buffers are uninitialized (a *timing/run*
+    harness, matching attention_lowering.synthesize_run_harness); correctness is
+    checked separately. Returns None if the kernels can't be parsed.
+
+    Per-kernel launch bounds: threads = known_block_size; grid = 2-D (M/wg_m, N/wg_n)
+    when the kernel indexes block_id y, else 1-D ((M/wg_m)*(N/wg_n)) — matching how
+    the epilogue-tiled kernel maps work-groups (varies with the tile).
+    Kernel ABI (from the recipe): (A_in, W, C_out, bias).
+    """
+    # brace-match each gpu.module
+    mods, idx = [], 0
+    while True:
+        i = wg_code.find("gpu.module", idx)
+        if i == -1:
+            break
+        depth, start = 0, wg_code.find("{", i)
+        end = None
+        for j in range(start, len(wg_code)):
+            if wg_code[j] == "{":
+                depth += 1
+            elif wg_code[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+        if end is None:
+            return None
+        mods.append(wg_code[i:end])
+        idx = end
+    if len(mods) != len(layers):
+        return None
+
+    mod_names, inner_names, blocks, two_d = [], [], [], []
+    for m in mods:
+        mn = re.search(r"gpu\.module @(\w+)", m)
+        fn = re.search(r"gpu\.func @(\w+)", m)
+        bs = re.search(r"known_block_size = array<i32:\s*(\d+)", m)
+        if not (mn and fn and bs):
+            return None
+        mod_names.append(mn.group(1))
+        inner_names.append(fn.group(1))
+        blocks.append(int(bs.group(1)))
+        two_d.append("block_id y" in m)
+
+    aliases = "\n".join(ln for ln in wg_code.splitlines() if ln.lstrip().startswith("#map"))
+
+    # index constants needed
+    consts = {0, 1}
+    for L, b, td in zip(layers, blocks, two_d):
+        consts.add(b)
+        if td:
+            consts.update({L.m // L.wg_m, L.n // L.wg_n})
+        else:
+            consts.add((L.m // L.wg_m) * (L.n // L.wg_n))
+    cst = "\n".join(f"    %c{v} = arith.constant {v} : index" for v in sorted(consts))
+
+    M = layers[0].m
+    lines = [aliases, "module attributes {gpu.container_module} {"]
+    lines += [_indent_module(m) for m in mods]
+    lines.append("  func.func @main() attributes {llvm.emit_c_interface} {")
+    lines.append(cst)
+    K0 = layers[0].k
+    lines.append(f"    %A = gpu.alloc() : memref<{M}x{K0}xf16>")
+    prev, prev_k = "%A", K0
+    for i, (L, mod, inner, b, td) in enumerate(
+        zip(layers, mod_names, inner_names, blocks, two_d)
+    ):
+        last = i == len(layers) - 1
+        oty = "f32" if last else "f16"
+        lines.append(f"    %W{i} = gpu.alloc() : memref<{L.n}x{L.k}xf16>")
+        lines.append(f"    %bias{i} = gpu.alloc() : memref<{L.n}xf32>")
+        lines.append(f"    %H{i} = gpu.alloc() : memref<{L.m}x{L.n}x{oty}>")
+        if td:
+            gx, gy = L.m // L.wg_m, L.n // L.wg_n
+            gstr = f"blocks in (%c{gx}, %c{gy}, %c1)"
+        else:
+            gstr = f"blocks in (%c{(L.m // L.wg_m) * (L.n // L.wg_n)}, %c1, %c1)"
+        lines.append(
+            f"    gpu.launch_func @{mod}::@{inner} {gstr} threads in (%c{b}, %c1, %c1) "
+            f"args({prev} : memref<{L.m}x{prev_k}xf16>, %W{i} : memref<{L.n}x{L.k}xf16>, "
+            f"%H{i} : memref<{L.m}x{L.n}x{oty}>, %bias{i} : memref<{L.n}xf32>)"
+        )
+        lines.append("    gpu.wait")
+        prev, prev_k = f"%H{i}", L.n
+    lines += ["    return", "  }", "}"]
+    return "\n".join(lines) + "\n"

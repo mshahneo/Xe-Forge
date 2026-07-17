@@ -481,8 +481,9 @@ class MlirExecutor:
             shutil.rmtree(work, ignore_errors=True)
 
     def lower_mlp_to_wg(
-        self, linalg_code: str, autotune: bool = False, large_grf: bool = False
-    ) -> tuple[bool, str, str]:
+        self, linalg_code: str, autotune: bool = False, large_grf: bool = False,
+        layers=None,
+    ) -> tuple[bool, str, str, list]:
         """Lower a multi-layer MLP (chain of nn.Linear + activation) to XeGPU-WG.
 
         Folds physical transposes into the matmul (transpose-B indexing_maps),
@@ -490,7 +491,13 @@ class MlirExecutor:
         (tile the epilogue + fuse matmul/fill as producers, per layer), and runs
         the shared 3-stage lowering. Unlike lower_linalg_to_wg (one gpu.module),
         the result has N gpu.modules — one kernel per layer, chained through
-        intermediate buffers in the host function. Returns (ok, wg_code, err).
+        intermediate buffers in the host function. Returns (ok, wg_code, err, layers)
+        — the returned layers carry the exact tiles used, so a caller can build a
+        matching launch harness (grid derives from each layer's wg tile).
+
+        *layers*: pre-parsed MlpLayer list to lower as-is (skips the parse/autotune;
+        pass this to reuse tiles already chosen, avoiding a second autotune pass
+        whose timing noise could pick different tiles than the harness assumes).
 
         *autotune*: when True, each distinct layer shape's tile is chosen by timing
         candidates on the GPU (autotune_tile) instead of first-divisible.
@@ -509,10 +516,11 @@ class MlirExecutor:
         )
 
         folded = fold_transpose_into_matmul(linalg_code)
-        use_exec = self if (autotune or large_grf) else None
-        layers = parse_mlp(folded, executor=use_exec, large_grf=large_grf)
+        if layers is None:
+            use_exec = self if (autotune or large_grf) else None
+            layers = parse_mlp(folded, executor=use_exec, large_grf=large_grf)
         if not layers:
-            return False, "", "not a recognized multi-layer MLP (parse returned no layers)"
+            return False, "", "not a recognized multi-layer MLP (parse returned no layers)", []
         tile_src, anno_src = render_mlp_recipe(layers)
 
         work = tempfile.mkdtemp(prefix="mlir_mlp_")
@@ -531,7 +539,7 @@ class MlirExecutor:
                 use_imex=False,
             )
             if not s1.ok:
-                return False, "", f"MLP LOWERING stage1 failed:\n{_tail(s1.err)}"
+                return False, "", f"MLP LOWERING stage1 failed:\n{_tail(s1.err)}", layers
             s2 = self._run_opt(
                 ["-",
                  "--pass-pipeline=builtin.module(gpu-kernel-outlining, "
@@ -541,7 +549,7 @@ class MlirExecutor:
                 stdin=s1.out,
             )
             if not s2.ok:
-                return False, "", f"MLP LOWERING stage2 failed:\n{_tail(s2.err)}"
+                return False, "", f"MLP LOWERING stage2 failed:\n{_tail(s2.err)}", layers
             s3 = self._run_opt(
                 ["-",
                  f"--transform-preload-library=transform-library-paths={anno_lib}",
@@ -550,8 +558,8 @@ class MlirExecutor:
                 stdin=s2.out,
             )
             if not s3.ok:
-                return False, "", f"MLP LOWERING stage3 failed:\n{_tail(s3.err)}"
-            return True, s3.out.decode(errors="replace"), ""
+                return False, "", f"MLP LOWERING stage3 failed:\n{_tail(s3.err)}", layers
+            return True, s3.out.decode(errors="replace"), "", layers
         finally:
             shutil.rmtree(work, ignore_errors=True)
 

@@ -149,6 +149,17 @@ constraints:
       2-layer 1024-wide chain (both wg=256x256 sg=32x64, 32 subgroups) runs correct
       with the igc flag (0 mismatches, after accounting for f16 rounding of the
       intermediate activation).
+      PIPELINE/CLI WIRING: XeForgePipeline._maybe_lower_mlp routes a multi-matmul
+      chain (>=2 linalg.matmul) to this path during LINALG_LOWERING (guarded on the
+      matmul count BEFORE extract_matmul_dims, which otherwise matches just the first
+      matmul and mis-lowers the chain as one GEMM). It autotunes per-layer tiles once,
+      lowers with those exact tiles (lower_mlp_to_wg(layers=...) — avoids a second
+      autotune whose timing noise could pick tiles the harness doesn't match), and
+      synthesize_mlp_run_harness builds a runnable N-launch @main so the WG stages run
+      on the chain. Confirmed via `python -m xe_forge.cli --dsl mlir` on a 2-layer MLP:
+      log shows "MLP chain of 2 layers (autotune)" -> "MLP lowered to 2 chained
+      XeGPU-WG kernels" -> ANALYSIS (7 issues) -> PLANNING -> WG stages. Single-matmul
+      inputs still route to the plain-GEMM path.
       END-TO-END on real KernelBench level3/3 (DeepNarrowMLP, 17 layers, ~66.6 GFLOP):
       lower_mlp_to_wg(autotune=True, large_grf=True) lowered all 17 layers in ~3.6s
       (3 distinct shapes autotuned once each -> all large-GRF sg=[64,32]/[32,64]),
