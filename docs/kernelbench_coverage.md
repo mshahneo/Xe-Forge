@@ -139,7 +139,7 @@ MLP lowers and runs correctly (verified 0 mismatches). This closes the one remai
 turnkey gap for feeding literal KernelBench dumps. The cast is applied on **all**
 lowering paths — plain matmul, transpose-B, batch_matmul, and MLP — so any f32
 matmul input is handled (XeGPU requires f16 A/B; C stays f32). It's a documented
-hard requirement in the KB (`lowering_matmul_ab_must_be_f16`, critical). f16-native
+hard requirement in the KB (`lowering_matmul_ab_must_be_16bit_float`, critical). f16-native
 inputs are unaffected.
 
 **End-to-end verified on the real level3/3 DeepNarrowMLP** (the 17-layer one):

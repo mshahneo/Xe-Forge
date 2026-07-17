@@ -101,9 +101,10 @@ constraints:
     name: f32 matmul A/B operands are auto-cast to f16 on ALL paths (XeGPU needs f16 in)
     severity: info
     description: |
-      Implements the lowering_matmul_ab_must_be_f16 requirement. XeGPU/DPAS needs f16
-      A/B; C stays f32. Torch-MLIR imports KernelBench ALL-f32, so the cast is applied
-      AUTOMATICALLY on EVERY lowering entry point:
+      Implements the lowering_matmul_ab_must_be_16bit_float requirement. XeGPU/DPAS
+      needs a 16-bit float A/B (f16 or bf16); C stays f32. Torch-MLIR imports
+      KernelBench ALL-f32, so the cast is applied AUTOMATICALLY on EVERY lowering
+      entry point:
         - lower_linalg_to_wg (plain matmul, transpose-B, batch_matmul): detects an
           f32-operand matmul/batch_matmul (regex), runs cast_matmul_operands_to_f16,
           and renders the stage-1 template with cast_ab=True — which fuses the A/B

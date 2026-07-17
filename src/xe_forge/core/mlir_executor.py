@@ -442,7 +442,7 @@ class MlirExecutor:
         # XeGPU/DPAS requires f16 A/B operands (C may be f32). If the matmul(s) have
         # f32 operands (e.g. raw Torch-MLIR / KernelBench import), insert f32->f16
         # truncf casts on A/B; the stage-1 template fuses them into the tile.
-        # (KB: lowering_matmul_ab_must_be_f16 — a hard requirement on ALL paths.)
+        # (KB: lowering_matmul_ab_must_be_16bit_float — a hard requirement on ALL paths.)
         cast_ab = bool(
             re.search(r"linalg\.(matmul|batch_matmul)\b[^\n]*tensor<[0-9x]+xf32>,", linalg_code)
         )
