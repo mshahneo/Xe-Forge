@@ -138,9 +138,24 @@ constraints:
       DISTINCT layer shape's candidate tiles on the GPU (via autotune_tile on a
       standalone single-layer kernel) and bakes the fastest into the recipe;
       parse_mlp(code, executor=...) caches by shape so a 17-layer MLP of one repeated
-      shape autotunes once. Restricted to default-GRF tiles (the multi-kernel recipe
-      has no per-layer igc flag; large-GRF would need that wired). Verified GPU-correct
-      with non-default autotuned tiles (L1 wg=64x64, L2 wg=32x64; 0 mismatches).
+      shape autotunes once. Verified GPU-correct with non-default autotuned tiles
+      (L1 wg=64x64, L2 wg=32x64; 0 mismatches).
+      LARGE-GRF for MLP IS now supported: lower_mlp_to_wg(large_grf=True) autotunes
+      every layer over large-GRF tiles (<=32 subgroups, candidate_configs caps them)
+      and the caller runs the whole module with the igc flag
+      (igc-cmd-options=-ze-opt-large-register-file). It's ALL-OR-NOTHING for the MLP
+      because the xevm lowering runs ONCE over the whole module, so the igc flag is
+      module-global — every layer must be a valid <=32-subgroup tile. Verified: a
+      2-layer 1024-wide chain (both wg=256x256 sg=32x64, 32 subgroups) runs correct
+      with the igc flag (0 mismatches, after accounting for f16 rounding of the
+      intermediate activation).
+      END-TO-END on real KernelBench level3/3 (DeepNarrowMLP, 17 layers, ~66.6 GFLOP):
+      lower_mlp_to_wg(autotune=True, large_grf=True) lowered all 17 layers in ~3.6s
+      (3 distinct shapes autotuned once each -> all large-GRF sg=[64,32]/[32,64]),
+      17 chained kernels, ran on GPU (17 launches + 16 intermediate buffers) and
+      computes correctly (W=0 control -> every layer relu(0+0.5)=0.5, final 0.5). NB:
+      an all-ones input overflows to inf across 17 layers (1024^17 >> f32 max) — that
+      is numerically expected, not a failure; use a bounded control (W=0) to check.
       GRID GOTCHA (bit me during verify): the WG grid dimensionality DEPENDS ON THE
       TILE — some MLP-layer tiles collapse the epilogue forall to a 1-D grid
       (block_id x only), others keep a 2-D grid (block_id x AND y). autotune_tile

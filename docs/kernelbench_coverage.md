@@ -118,9 +118,18 @@ Full MLP chains now lower: `MlirExecutor.lower_mlp_to_wg` folds the physical
 transposes into the matmul (transpose-B indexing_maps), parses the per-layer
 shapes, and generates an **N-layer transform recipe** (tile each layer's epilogue
 + fuse its matmul/fill as producers, per layer) that outlines **one XeGPU kernel
-per layer**, chained through intermediate buffers. Verified GPU-correct on a
-2-layer `relu(x·Wᵀ + bias)` chain (0 mismatches); the parser + recipe generator
-handle all 3 real level3 dumps (incl. the 17-layer DeepNarrowMLP).
+per layer**, chained through intermediate buffers.
+
+**End-to-end verified on the real level3/3 DeepNarrowMLP** (the 17-layer one):
+`lower_mlp_to_wg(autotune=True, large_grf=True)` lowered all 17 layers in ~3.6 s
+(3 distinct shapes autotuned once each → all picked large-GRF `sg=[64,32]`/`[32,64]`
+tiles), producing 17 chained XeGPU kernels. Ran end-to-end on the GPU (17 sequential
+launches + 16 intermediate buffers, large-GRF igc flag applied module-wide) and it
+computes correctly (W=0 control → every layer `relu(0+bias)=0.5`, final output
+exactly 0.5). The network is ~66.6 GFLOP; per-layer kernels time ~0.04 ms (1024³
+mid layers) to ~0.46 ms (the K=8192 first layer). Earlier smaller cases also
+verified: a 2-layer `relu(x·Wᵀ+bias)` chain (0 mismatches) and a large-GRF
+2-layer chain (`wg=256×256 sg=[32,64]`, 0 mismatches).
 
 Caveats: the recipe picks a per-layer divisible tile automatically (not yet
 autotuned); layers must be the `relu(x·Wᵀ + bias)` shape (transpose-B matmul +

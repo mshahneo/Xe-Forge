@@ -480,7 +480,9 @@ class MlirExecutor:
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
-    def lower_mlp_to_wg(self, linalg_code: str, autotune: bool = False) -> tuple[bool, str, str]:
+    def lower_mlp_to_wg(
+        self, linalg_code: str, autotune: bool = False, large_grf: bool = False
+    ) -> tuple[bool, str, str]:
         """Lower a multi-layer MLP (chain of nn.Linear + activation) to XeGPU-WG.
 
         Folds physical transposes into the matmul (transpose-B indexing_maps),
@@ -492,6 +494,13 @@ class MlirExecutor:
 
         *autotune*: when True, each distinct layer shape's tile is chosen by timing
         candidates on the GPU (autotune_tile) instead of first-divisible.
+        *large_grf*: when True (implies autotune), every layer autotunes over
+        large-GRF tiles (<=32 subgroups) and the WG output should be RUN with the
+        igc large-register-file flag module-wide. Large-GRF is a module-global igc
+        option (the xevm lowering runs once over all layers), so it's all-or-nothing
+        for the MLP — every layer must be a valid <=32-subgroup tile. Callers pass
+        run_pipeline_options() with LARGE_GRF_IGC_OPTION appended (or set the
+        executor's large_grf) when running the returned module.
         """
         from xe_forge.core.mlp_lowering import (
             fold_transpose_into_matmul,
@@ -500,7 +509,8 @@ class MlirExecutor:
         )
 
         folded = fold_transpose_into_matmul(linalg_code)
-        layers = parse_mlp(folded, executor=self if autotune else None)
+        use_exec = self if (autotune or large_grf) else None
+        layers = parse_mlp(folded, executor=use_exec, large_grf=large_grf)
         if not layers:
             return False, "", "not a recognized multi-layer MLP (parse returned no layers)"
         tile_src, anno_src = render_mlp_recipe(layers)

@@ -108,21 +108,27 @@ func.func @layer(%A: memref<{m}x{k}xf16>, %W: memref<{n}x{k}xf16>, %bias: memref
 }}"""
 
 
-def autotune_layer_tile(executor, m: int, n: int, k: int):
+def autotune_layer_tile(executor, m: int, n: int, k: int, large_grf: bool = False):
     """Return the fastest (wg_m, wg_n, sg_m, sg_n, k_tile) tile for an MLP layer of
     shape (M, N, K), by timing candidates on the GPU via executor.autotune_tile on a
     standalone single-layer kernel. Falls back to _pick_tile (first-divisible) if
     autotuning is unavailable or finds nothing runnable.
+
+    *large_grf*: when True, autotune over the large-GRF candidates (each timed WITH
+    the igc flag via run_pipeline_options, and <=32 subgroups by construction), and
+    the layer's igc flag is applied module-wide at run time — see lower_mlp_to_wg.
+    When False, only default-GRF tiles (64-subgroup budget) are considered.
     """
     from xe_forge.core.linalg_lowering import candidate_configs
 
     fallback = _pick_tile(m, n, k)
     if executor is None or not hasattr(executor, "autotune_tile"):
         return fallback
-    # The multi-kernel MLP recipe applies one pipeline (no per-layer igc flag), so
-    # only autotune over default-GRF tiles; large-GRF would need the igc option
-    # wired per layer (not yet supported here). See lowering_autotune_tile / MLP KB.
-    cands = [c for c in candidate_configs(m, n, k) if not c.large_grf]
+    # Large-GRF is a module-global igc flag (the xevm lowering runs once over the
+    # whole module), so for an MLP it's all-or-nothing: every layer must be a valid
+    # large-GRF tile (<=32 subgroups). candidate_configs already caps large-GRF tiles
+    # at 32 subgroups; filter to the requested GRF mode.
+    cands = [c for c in candidate_configs(m, n, k) if c.large_grf == large_grf]
     if not cands:
         return fallback
     try:
@@ -179,7 +185,7 @@ def fold_transpose_into_matmul(code: str) -> str:
     return code
 
 
-def parse_mlp(code: str, executor=None) -> list[MlpLayer] | None:
+def parse_mlp(code: str, executor=None, large_grf: bool = False) -> list[MlpLayer] | None:
     """Parse an imported MLP into a list of MlpLayer, in execution order.
 
     Expects the transpose-folded form (call fold_transpose_into_matmul first):
@@ -191,6 +197,8 @@ def parse_mlp(code: str, executor=None) -> list[MlpLayer] | None:
     GPU (time candidates, pick fastest) instead of first-divisible. Distinct layer
     shapes are autotuned once and cached (level3 MLPs repeat the same shape many
     times, so this keeps the tuning cost ~= number of distinct shapes).
+    *large_grf*: autotune over large-GRF tiles (<=32 subgroups); the caller applies
+    the igc flag module-wide (all layers share it). Requires executor.
     """
     # Must be folded first: any *real* transpose op left (ignore mentions in
     # comments) means the input wasn't run through fold_transpose_into_matmul.
@@ -214,7 +222,7 @@ def parse_mlp(code: str, executor=None) -> list[MlpLayer] | None:
         shape = (m, n, k)
         if shape not in tile_cache:
             tile_cache[shape] = (
-                autotune_layer_tile(executor, m, n, k)
+                autotune_layer_tile(executor, m, n, k, large_grf=large_grf)
                 if executor is not None
                 else _pick_tile(m, n, k)
             )
