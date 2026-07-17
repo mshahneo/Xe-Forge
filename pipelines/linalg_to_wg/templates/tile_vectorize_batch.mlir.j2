@@ -45,7 +45,13 @@ module attributes {transform.with_named_sequence} {
     // K-loop tile on the now-2-D matmul (iteration space m, n, k -> [0, 0, k_tile]).
     %mm2 = transform.structured.match ops{["linalg.matmul"]} in %root : (!transform.any_op) -> !transform.any_op
     %tk, %kl = transform.structured.tile_using_for %mm2 tile_sizes [0, 0, {{ k_tile }}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %f = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op
+{% if cast_ab %}    // f32->f16 A/B cast: fuse the truncf-cast producers into the k-loop (XeGPU
+    // requires f16 A/B; C stays f32).
+    %casta = transform.get_producer_of_operand %tk[0] : (!transform.any_op) -> !transform.any_op
+    %fca, %fcal = transform.structured.fuse_into_containing_op %casta into %kl : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %castb = transform.get_producer_of_operand %tk[1] : (!transform.any_op) -> !transform.any_op
+    %fcb, %fcbl = transform.structured.fuse_into_containing_op %castb into %kl : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+{% endif %}    %f = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op
     %v = transform.structured.vectorize_children_and_apply_patterns %f {fold_type_extensions_into_contract} : (!transform.any_op) -> !transform.any_op
     // Strip leading unit dims so the fused fill's vector<1 x wg_m x wg_n> write
     // becomes a 2-D block transfer (not a scatter store) -> avoids the WG-lowering

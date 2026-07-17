@@ -430,15 +430,29 @@ class MlirExecutor:
             return False, "", f"invalid lowering config: {'; '.join(errs)}"
 
         from xe_forge.core.linalg_lowering import is_mlp_layer, is_transpose_b_matmul
+        from xe_forge.core.mlp_lowering import cast_matmul_operands_to_f16
 
+        # Classify the ORIGINAL code (before casting) — the f32->f16 cast adds
+        # truncf linalg.generic ops that would otherwise flip is_mlp_layer to True.
         batched = "linalg.batch_matmul" in linalg_code
         mlp_layer = is_mlp_layer(linalg_code)
         # A plain transpose-B matmul (no epilogue); mlp_layer subsumes the epilogue case.
         transpose_b = is_transpose_b_matmul(linalg_code) and not mlp_layer
+
+        # XeGPU/DPAS requires f16 A/B operands (C may be f32). If the matmul(s) have
+        # f32 operands (e.g. raw Torch-MLIR / KernelBench import), insert f32->f16
+        # truncf casts on A/B; the stage-1 template fuses them into the tile.
+        # (KB: lowering_matmul_ab_must_be_f16 — a hard requirement on ALL paths.)
+        cast_ab = bool(
+            re.search(r"linalg\.(matmul|batch_matmul)\b[^\n]*tensor<[0-9x]+xf32>,", linalg_code)
+        )
+        if cast_ab:
+            linalg_code = cast_matmul_operands_to_f16(linalg_code)
         work = tempfile.mkdtemp(prefix="mlir_lower_")
         try:
             tile_lib, anno_lib = config.render(
-                work, batched=batched, transpose_b=transpose_b, mlp_layer=mlp_layer
+                work, batched=batched, transpose_b=transpose_b, mlp_layer=mlp_layer,
+                cast_ab=cast_ab,
             )
             src = Path(work) / "input.mlir"
             src.write_text(linalg_code)

@@ -9,6 +9,24 @@
 # B=[16,16] C=[8,16]. Max 1024 work-items per workgroup.
 
 constraints:
+  - id: lowering_matmul_ab_must_be_f16
+    name: Matmul A/B operands MUST be f16 (bf16); C/accumulator may be f32
+    severity: critical
+    description: |
+      REQUIREMENT — a matmul (matmul / batch_matmul / transpose-B / MLP layer) that
+      reaches XeGPU-WG lowering must have its INPUT operands A and B in f16 (or
+      bf16); the DPAS/XMX unit consumes f16 inputs only. The accumulator/output C
+      may (and should) be f32 — XeGPU accumulates in f32. An f32 A or B either falls
+      off the XMX path or fails to lower.
+      Torch-MLIR imports KernelBench in ALL-f32 (A, B, AND C f32), so any imported
+      matmul VIOLATES this and must be fixed before lowering. FIX (required, applied
+      automatically): mlp_lowering.cast_matmul_operands_to_f16 inserts f32->f16
+      truncf casts on each matmul's A/B and keeps C f32; the lowering fuses the cast
+      into the k-loop (in-register truncf). Every lowering entry point runs this on
+      f32-operand matmuls: lower_mlp_to_wg AND lower_linalg_to_wg (plain /
+      transpose-B / batch_matmul). Do NOT feed an f32-A/B matmul to the WG pipeline
+      without the cast.
+
   - id: lowering_wg_divisible_by_sg
     name: Workgroup tile must be divisible by subgroup tile
     severity: critical

@@ -461,21 +461,29 @@ def cast_matmul_operands_to_f16(code: str) -> str:
     (fuse producers) folds them into the WG kernel (an in-kernel truncf on load).
 
     Idempotent: matmuls whose operands are already f16 are left unchanged. Handles
-    both the plain and indexing_maps (transpose-B) matmul spellings.
+    the plain, indexing_maps (transpose-B), AND batch_matmul (3-D operand) spellings.
     """
-    id2 = "affine_map<(d0, d1) -> (d0, d1)>"
-    cast_hdr = f"#__castmap = {id2}\n" if "#__castmap" not in code else ""
+    # Identity elementwise maps, one per operand rank (2-D matmul, 3-D batch_matmul).
+    hdrs = {
+        2: ("#__castmap2", "affine_map<(d0, d1) -> (d0, d1)>", '"parallel", "parallel"'),
+        3: ("#__castmap3", "affine_map<(d0, d1, d2) -> (d0, d1, d2)>",
+            '"parallel", "parallel", "parallel"'),
+    }
+    used_ranks: set[int] = set()
     counter = [0]
 
     def _emit_cast(ssa: str, shape: str) -> tuple[str, str]:
+        rank = shape.count("x") + 1
+        mapname, _mapdef, iters = hdrs[rank]
+        used_ranks.add(rank)
         i = counter[0]
         counter[0] += 1
         out = f"%__f16_{i}"
         emp = f"%__e16_{i}"
         block = (
             f"    {emp} = tensor.empty() : tensor<{shape}xf16>\n"
-            f"    {out} = linalg.generic {{indexing_maps = [#__castmap, #__castmap], "
-            f'iterator_types = ["parallel", "parallel"]}} ins({ssa} : tensor<{shape}xf32>) '
+            f"    {out} = linalg.generic {{indexing_maps = [{mapname}, {mapname}], "
+            f"iterator_types = [{iters}]}} ins({ssa} : tensor<{shape}xf32>) "
             f"outs({emp} : tensor<{shape}xf16>) {{\n"
             f"    ^bb0(%__in: f32, %__o: f16):\n"
             f"      %__t = arith.truncf %__in : f32 to f16\n"
@@ -484,9 +492,9 @@ def cast_matmul_operands_to_f16(code: str) -> str:
         )
         return out, block
 
-    # Match a matmul, capture the two operands + their f32 shapes.
+    # Match a matmul OR batch_matmul, capture the two operands + their f32 shapes.
     mm_re = re.compile(
-        r"(?P<res>%\w+) = linalg\.matmul(?P<attrs>\s+indexing_maps\s*=\s*\[[^\]]*\])?"
+        r"(?P<res>%\w+) = linalg\.(?P<op>matmul|batch_matmul)(?P<attrs>\s+indexing_maps\s*=\s*\[[^\]]*\])?"
         r"\s+ins\((?P<a>%\w+), (?P<b>%\w+)\s*:\s*tensor<(?P<as>[0-9x]+)xf32>,\s*"
         r"tensor<(?P<bs>[0-9x]+)xf32>\)\s+outs\((?P<c>%\w+)\s*:\s*(?P<cty>tensor<[0-9x]+xf32>)\)"
         r"\s*->\s*(?P<rty>tensor<[0-9x]+xf32>)"
@@ -496,10 +504,10 @@ def cast_matmul_operands_to_f16(code: str) -> str:
     def _repl(m):
         aout, ablk = _emit_cast(m.group("a"), m.group("as"))
         bout, bblk = _emit_cast(m.group("b"), m.group("bs"))
-        pre_blocks.append((m.group(0), ablk + bblk))
+        pre_blocks.append((m.group("res"), ablk + bblk))
         attrs = m.group("attrs") or ""
         return (
-            f'{m.group("res")} = linalg.matmul{attrs} ins({aout}, {bout} : '
+            f'{m.group("res")} = linalg.{m.group("op")}{attrs} ins({aout}, {bout} : '
             f'tensor<{m.group("as")}xf16>, tensor<{m.group("bs")}xf16>) '
             f'outs({m.group("c")} : {m.group("cty")}) -> {m.group("rty")}'
         )
@@ -508,14 +516,15 @@ def cast_matmul_operands_to_f16(code: str) -> str:
     if new == code:
         return code  # nothing to cast (already f16, or no matching matmul)
     # Insert each matmul's cast block immediately before that matmul line.
-    for mm_line, cast_block in pre_blocks:
-        # mm_line was rewritten in `new`; find the rewritten matmul and prepend casts.
-        # Locate by the result SSA (unique).
-        res = mm_line.split(" = ")[0].strip()
-        idx = new.find(f"    {res} = linalg.matmul")
+    for res, cast_block in pre_blocks:
+        idx = new.find(f"    {res} = linalg.")
         if idx == -1:
-            idx = new.find(f"{res} = linalg.matmul")
+            idx = new.find(f"{res} = linalg.")
         if idx != -1:
             line_start = new.rfind("\n", 0, idx) + 1
             new = new[:line_start] + cast_block + new[line_start:]
+    cast_hdr = "".join(
+        f"{hdrs[r][0]} = {hdrs[r][1]}\n" for r in sorted(used_ranks)
+        if hdrs[r][0] not in code
+    )
     return cast_hdr + new

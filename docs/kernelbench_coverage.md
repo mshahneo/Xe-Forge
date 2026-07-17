@@ -136,8 +136,11 @@ plain-GEMM path — the MLP branch is guarded on ≥2 matmuls.)
 KernelBench in all-f32. `lower_mlp_to_wg` auto-inserts f32→f16 truncf casts on each
 matmul's A/B (accumulator stays f32) and fuses them into the k-loop, so a raw-f32
 MLP lowers and runs correctly (verified 0 mismatches). This closes the one remaining
-turnkey gap for feeding literal KernelBench dumps. *(The single plain/transpose-B
-matmul path doesn't auto-cast yet — only the MLP path.)*
+turnkey gap for feeding literal KernelBench dumps. The cast is applied on **all**
+lowering paths — plain matmul, transpose-B, batch_matmul, and MLP — so any f32
+matmul input is handled (XeGPU requires f16 A/B; C stays f32). It's a documented
+hard requirement in the KB (`lowering_matmul_ab_must_be_f16`, critical). f16-native
+inputs are unaffected.
 
 **End-to-end verified on the real level3/3 DeepNarrowMLP** (the 17-layer one):
 `lower_mlp_to_wg(autotune=True, large_grf=True)` lowered all 17 layers in ~3.6 s

@@ -152,6 +152,7 @@ class LoweringConfig:
         batched: bool = False,
         transpose_b: bool = False,
         mlp_layer: bool = False,
+        cast_ab: bool = False,
     ) -> tuple[Path, Path]:
         """Render both transform libraries into out_dir. Returns their paths.
 
@@ -173,6 +174,12 @@ class LoweringConfig:
         (transpose-B) matmul + fill in as producers; stage 3 adds the transpose-B
         layouts plus a slice layout on the bias broadcast. Takes precedence over
         *transpose_b* (which it subsumes).
+
+        *cast_ab* (plain/batched templates): the matmul's A/B operands were cast
+        f32->f16 by a truncf producer (cast_matmul_operands_to_f16); emit the extra
+        fuse-into-k-loop steps so the cast rides in-register. Set it whenever the
+        input matmul had f32 A/B (XeGPU requires f16 A/B — see the
+        lowering_matmul_ab_must_be_f16 KB constraint).
         """
         errs = self.validate()
         if errs:
@@ -185,6 +192,7 @@ class LoweringConfig:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         ctx = self._ctx()
+        ctx["cast_ab"] = cast_ab
         tile_path = out_dir / "tile_vectorize.mlir"
         anno_path = out_dir / "wg_annotate.mlir"
         if mlp_layer:

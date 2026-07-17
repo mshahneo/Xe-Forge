@@ -21,7 +21,15 @@ module attributes {transform.with_named_sequence} {
     // Fuse the zero-fill into the workgroup tile so the zero sits adjacent to the
     // accumulator read (lets canonicalize forward it into the k-loop init).
     %ff, %nc = transform.structured.fuse_into_containing_op %fill into %fa : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %tk, %kl = transform.structured.tile_using_for %t tile_sizes [0, 0, {{ k_tile }}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+{% if cast_ab %}    // f32->f16 A/B cast: fuse the truncf-cast producers into the WG forall (before
+    // k-tiling) so they become in-register truncf on the loaded tiles (XeGPU
+    // requires f16 A/B). Done here (on %t/%fa) rather than after k-tiling to keep
+    // the fill-fusion + accumulator hoisting below working on a clean matmul.
+    %casta = transform.get_producer_of_operand %t[0] : (!transform.any_op) -> !transform.any_op
+    %fca, %fcal = transform.structured.fuse_into_containing_op %casta into %fa : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %castb = transform.get_producer_of_operand %t[1] : (!transform.any_op) -> !transform.any_op
+    %fcb, %fcbl = transform.structured.fuse_into_containing_op %castb into %fa : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+{% endif %}    %tk, %kl = transform.structured.tile_using_for %t tile_sizes [0, 0, {{ k_tile }}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %f = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op
     %v = transform.structured.vectorize_children_and_apply_patterns %f {fold_type_extensions_into_contract} : (!transform.any_op) -> !transform.any_op
     // Promote accumulator to a zero-initialized vector iter_arg (hoist + fold).

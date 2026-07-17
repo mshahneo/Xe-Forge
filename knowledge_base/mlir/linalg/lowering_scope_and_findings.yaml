@@ -98,28 +98,32 @@ constraints:
       MULTI-LAYER CHAINS are now supported too — see lowering_mlp_multilayer_supported.
 
   - id: lowering_matmul_f32_operands_cast_to_f16
-    name: f32 matmul A/B operands are cast to f16 (XeGPU needs f16 inputs)
+    name: f32 matmul A/B operands are auto-cast to f16 on ALL paths (XeGPU needs f16 in)
     severity: info
     description: |
-      XeGPU/DPAS requires the matmul INPUTS (A, B) to be f16/bf16; the accumulator C
-      stays f32. Torch-MLIR imports KernelBench in ALL-f32 (A, B, and C all f32),
-      which won't hit the XMX path. cast_matmul_operands_to_f16 (mlp_lowering.py)
-      rewrites each linalg.matmul's A/B to f16 via truncf linalg.generic casts,
-      keeping C f32. lower_mlp_to_wg auto-applies it when it sees an f32-operand
-      matmul (with_casts), and render_mlp_recipe(with_casts=True) fuses each cast
-      into the k-loop via get_producer_of_operand + fuse_into_containing_op (the cast
-      then rides in-register / hoisted to a whole-tile truncf; after bufferization
-      with function_boundary_type_conversion the kernel ABI ends up f16 A/W). Verified
-      GPU-correct: a raw-f32 2-layer MLP lowers (4 truncf) and computes right (W=0
-      control -> 0.5, 0 mismatches).
-      RECIPE ROBUSTNESS: the casts add extra linalg.generic ops, so render_mlp_recipe
-      no longer split_handles ALL generics (that count is now variable). It matches
-      the N matmuls (stable) and finds each layer's epilogue as the matmul's
-      get_consumers_of_result — robust to cast generics AND to how many elementwise
-      ops the epilogue fused into.
-      NOTE: only the MLP path (lower_mlp_to_wg) auto-casts today; the single plain/
-      transpose-B matmul path (lower_linalg_to_wg) still expects f16 in. A standalone
-      f32 GEMM would need the same cast wired there.
+      Implements the lowering_matmul_ab_must_be_f16 requirement. XeGPU/DPAS needs f16
+      A/B; C stays f32. Torch-MLIR imports KernelBench ALL-f32, so the cast is applied
+      AUTOMATICALLY on EVERY lowering entry point:
+        - lower_linalg_to_wg (plain matmul, transpose-B, batch_matmul): detects an
+          f32-operand matmul/batch_matmul (regex), runs cast_matmul_operands_to_f16,
+          and renders the stage-1 template with cast_ab=True — which fuses the A/B
+          truncf producers into the tile (plain/transpose-B: into the WG forall
+          BEFORE k-tiling, so the fill-fusion + accumulator hoist stay on a clean
+          matmul; batch: into the k-loop). Verified GPU-correct: plain f32 256^3
+          -> kernel ABI (C f32, A f16, B f16), C=1536, 0 mismatches. transpose-B and
+          batch f32 also lower (2 truncf each).
+        - lower_mlp_to_wg: same cast, with render_mlp_recipe(with_casts=True). Raw-f32
+          MLP verified (W=0 -> 0.5, 0 mismatches).
+      cast_matmul_operands_to_f16 (mlp_lowering.py) handles plain, indexing_maps
+      (transpose-B), and batch_matmul (3-D operands, rank-appropriate identity map);
+      idempotent (skips already-f16). CLASSIFY BEFORE CASTING: is_mlp_layer /
+      is_transpose_b_matmul must run on the ORIGINAL code — the cast adds truncf
+      linalg.generic ops that would otherwise flip is_mlp_layer to True and mis-route
+      a plain matmul to the MLP template.
+      RECIPE ROBUSTNESS: the casts add generics, so render_mlp_recipe no longer
+      split_handles ALL generics; it splits the N matmuls (stable) and finds each
+      epilogue via get_consumers_of_result — robust to cast generics.
+      f16-native inputs are unaffected (cast_ab False -> 0 truncf, unchanged).
 
   - id: lowering_mlp_multilayer_supported
     name: Full multi-layer MLP chains lower to N XeGPU-WG kernels
