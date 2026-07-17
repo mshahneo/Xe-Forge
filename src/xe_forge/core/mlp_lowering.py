@@ -238,7 +238,7 @@ def parse_mlp(code: str, executor=None, large_grf: bool = False) -> list[MlpLaye
     return layers
 
 
-def render_mlp_recipe(layers: list[MlpLayer]) -> tuple[str, str]:
+def render_mlp_recipe(layers: list[MlpLayer], with_casts: bool = False) -> tuple[str, str]:
     """Generate (stage1_tile_vectorize, stage3_annotate) transform libraries for
     an N-layer MLP. The layers are matched in program order and each is tiled +
     fused + annotated with its own config.
@@ -253,7 +253,11 @@ def render_mlp_recipe(layers: list[MlpLayer]) -> tuple[str, str]:
         '    %f0 = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op',
         '    %ff0 = transform.apply_registered_pass "linalg-fuse-elementwise-ops" to %f0 : (!transform.any_op) -> !transform.any_op',
     ]
-    # split the N epilogue generics, matmuls, fills, transposes
+    # Match the N matmuls + fills (stable counts) and split into per-layer handles.
+    # The epilogue generic is found per-layer as the matmul's CONSUMER (not by
+    # splitting all generics) — that's robust to extra elementwise producers such as
+    # the f32->f16 operand casts (cast_matmul_operands_to_f16), whose generics would
+    # otherwise inflate the generic count and break a split_handle.
     def _split(match_op, base):
         names = ", ".join(idx(base))
         s1.append(
@@ -264,19 +268,26 @@ def render_mlp_recipe(layers: list[MlpLayer]) -> tuple[str, str]:
             f"    {names} = transform.split_handle %{base}_all : (!transform.any_op) -> {rets}"
         )
 
-    # NOTE: fuse-elementwise coalesces bias+activation into ONE generic per layer.
-    # fuse-elementwise coalesces bias+activation into ONE generic per layer;
-    # transposes are already folded into the matmul indexing_maps (no transpose op).
-    _split("linalg.generic", "gen")
     _split("linalg.matmul", "mm")
     _split("linalg.fill", "fill")
     for i, L in enumerate(layers):
         s1 += [
-            f"    %t{i}, %fa{i} = transform.structured.tile_using_forall %gen{i} tile_sizes [{L.wg_m}, {L.wg_n}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)",
+            # epilogue = matmul's consumer (the fused bias+activation generic).
+            f"    %epi{i} = transform.get_consumers_of_result %mm{i}[0] : (!transform.any_op) -> !transform.any_op",
+            f"    %t{i}, %fa{i} = transform.structured.tile_using_forall %epi{i} tile_sizes [{L.wg_m}, {L.wg_n}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)",
             f"    %fm{i}, %fml{i} = transform.structured.fuse_into_containing_op %mm{i} into %fa{i} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)",
             f"    %ffl{i}, %ffll{i} = transform.structured.fuse_into_containing_op %fill{i} into %fa{i} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)",
             f"    %tk{i}, %kl{i} = transform.structured.tile_using_for %fm{i} tile_sizes [0, 0, {L.k_tile}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)",
         ]
+        if with_casts:
+            # Fuse the A/B f32->f16 cast producers into the k-loop so they become
+            # in-register arith.truncf on the loaded tiles (XeGPU wants f16 A/B).
+            s1 += [
+                f"    %casta{i} = transform.get_producer_of_operand %tk{i}[0] : (!transform.any_op) -> !transform.any_op",
+                f"    %fcasta{i}, %fcastal{i} = transform.structured.fuse_into_containing_op %casta{i} into %kl{i} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)",
+                f"    %castb{i} = transform.get_producer_of_operand %tk{i}[1] : (!transform.any_op) -> !transform.any_op",
+                f"    %fcastb{i}, %fcastbl{i} = transform.structured.fuse_into_containing_op %castb{i} into %kl{i} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)",
+            ]
     s1 += [
         '    %fv = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op',
         "    %v = transform.structured.vectorize_children_and_apply_patterns %fv {fold_type_extensions_into_contract} : (!transform.any_op) -> !transform.any_op",
@@ -433,3 +444,78 @@ def synthesize_mlp_run_harness(wg_code: str, layers: list[MlpLayer]) -> str | No
         prev, prev_k = f"%H{i}", L.n
     lines += ["    return", "  }", "}"]
     return "\n".join(lines) + "\n"
+
+
+def cast_matmul_operands_to_f16(code: str) -> str:
+    """Insert f32->f16 truncation on every linalg.matmul's A and B operands.
+
+    XeGPU/DPAS requires the matmul *inputs* (A, B) to be f16/bf16; the accumulator
+    (C) stays f32. Torch-MLIR imports KernelBench in pure f32 (A, B, and C all f32),
+    which won't hit the XMX path. This rewrites each
+
+        linalg.matmul ins(%a, %b : tensor<..xf32>, tensor<..xf32>) outs(%c ..f32)
+
+    into a pair of `linalg.generic` truncf casts producing f16 A/B, then a matmul
+    reading those f16 operands into the same f32 accumulator. The casts are ordinary
+    elementwise producers — the MLP recipe's linalg-fuse-elementwise-ops + tile
+    (fuse producers) folds them into the WG kernel (an in-kernel truncf on load).
+
+    Idempotent: matmuls whose operands are already f16 are left unchanged. Handles
+    both the plain and indexing_maps (transpose-B) matmul spellings.
+    """
+    id2 = "affine_map<(d0, d1) -> (d0, d1)>"
+    cast_hdr = f"#__castmap = {id2}\n" if "#__castmap" not in code else ""
+    counter = [0]
+
+    def _emit_cast(ssa: str, shape: str) -> tuple[str, str]:
+        i = counter[0]
+        counter[0] += 1
+        out = f"%__f16_{i}"
+        emp = f"%__e16_{i}"
+        block = (
+            f"    {emp} = tensor.empty() : tensor<{shape}xf16>\n"
+            f"    {out} = linalg.generic {{indexing_maps = [#__castmap, #__castmap], "
+            f'iterator_types = ["parallel", "parallel"]}} ins({ssa} : tensor<{shape}xf32>) '
+            f"outs({emp} : tensor<{shape}xf16>) {{\n"
+            f"    ^bb0(%__in: f32, %__o: f16):\n"
+            f"      %__t = arith.truncf %__in : f32 to f16\n"
+            f"      linalg.yield %__t : f16\n"
+            f"    }} -> tensor<{shape}xf16>\n"
+        )
+        return out, block
+
+    # Match a matmul, capture the two operands + their f32 shapes.
+    mm_re = re.compile(
+        r"(?P<res>%\w+) = linalg\.matmul(?P<attrs>\s+indexing_maps\s*=\s*\[[^\]]*\])?"
+        r"\s+ins\((?P<a>%\w+), (?P<b>%\w+)\s*:\s*tensor<(?P<as>[0-9x]+)xf32>,\s*"
+        r"tensor<(?P<bs>[0-9x]+)xf32>\)\s+outs\((?P<c>%\w+)\s*:\s*(?P<cty>tensor<[0-9x]+xf32>)\)"
+        r"\s*->\s*(?P<rty>tensor<[0-9x]+xf32>)"
+    )
+    pre_blocks: list[str] = []
+
+    def _repl(m):
+        aout, ablk = _emit_cast(m.group("a"), m.group("as"))
+        bout, bblk = _emit_cast(m.group("b"), m.group("bs"))
+        pre_blocks.append((m.group(0), ablk + bblk))
+        attrs = m.group("attrs") or ""
+        return (
+            f'{m.group("res")} = linalg.matmul{attrs} ins({aout}, {bout} : '
+            f'tensor<{m.group("as")}xf16>, tensor<{m.group("bs")}xf16>) '
+            f'outs({m.group("c")} : {m.group("cty")}) -> {m.group("rty")}'
+        )
+
+    new = mm_re.sub(_repl, code)
+    if new == code:
+        return code  # nothing to cast (already f16, or no matching matmul)
+    # Insert each matmul's cast block immediately before that matmul line.
+    for mm_line, cast_block in pre_blocks:
+        # mm_line was rewritten in `new`; find the rewritten matmul and prepend casts.
+        # Locate by the result SSA (unique).
+        res = mm_line.split(" = ")[0].strip()
+        idx = new.find(f"    {res} = linalg.matmul")
+        if idx == -1:
+            idx = new.find(f"{res} = linalg.matmul")
+        if idx != -1:
+            line_start = new.rfind("\n", 0, idx) + 1
+            new = new[:line_start] + cast_block + new[line_start:]
+    return cast_hdr + new

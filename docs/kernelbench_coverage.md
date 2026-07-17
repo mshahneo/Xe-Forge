@@ -124,10 +124,20 @@ per layer**, chained through intermediate buffers.
 multi-matmul chain (≥2 `linalg.matmul`) to this path during LINALG_LOWERING,
 autotunes per-layer tiles, and synthesizes a runnable N-launch `@main` harness so
 the WG analysis/optimization stages run on the lowered chain. Confirmed genuinely
-end-to-end via `python -m xe_forge.cli --dsl mlir` on a 2-layer MLP: the log shows
-`LINALG_LOWERING — MLP chain of 2 layers (autotune)` → `MLP lowered to 2 chained
-XeGPU-WG kernels` → ANALYSIS (7 issues) → PLANNING → WG stages. (Single-matmul
-inputs still route to the plain-GEMM path — the MLP branch is guarded on ≥2 matmuls.)
+end-to-end via `python -m xe_forge.cli --dsl mlir` on a 2-layer MLP with
+**qwen3-coder-480b**: the full pipeline ran to completion (`CLI_EXIT=0`) — LINALG_LOWERING
+(MLP, 2 chained kernels) → ANALYSIS → PLANNING → ALGORITHMIC → FUSION → MEMORY_ACCESS
+→ DEVICE_SPECIFIC → `OPTIMIZATION COMPLETE`, WG output saved (2 launch_funcs, 2 dpas,
+0 linalg.matmul). qwen worked through every WG stage without stalling (deepseek hangs
+on the large kernel-rewrite generations). (Single-matmul inputs still route to the
+plain-GEMM path — the MLP branch is guarded on ≥2 matmuls.)
+
+**Raw-f32 dumps handled**: XeGPU needs f16 A/B operands, but Torch-MLIR imports
+KernelBench in all-f32. `lower_mlp_to_wg` auto-inserts f32→f16 truncf casts on each
+matmul's A/B (accumulator stays f32) and fuses them into the k-loop, so a raw-f32
+MLP lowers and runs correctly (verified 0 mismatches). This closes the one remaining
+turnkey gap for feeding literal KernelBench dumps. *(The single plain/transpose-B
+matmul path doesn't auto-cast yet — only the MLP path.)*
 
 **End-to-end verified on the real level3/3 DeepNarrowMLP** (the 17-layer one):
 `lower_mlp_to_wg(autotune=True, large_grf=True)` lowered all 17 layers in ~3.6 s

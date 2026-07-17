@@ -510,18 +510,25 @@ class MlirExecutor:
         executor's large_grf) when running the returned module.
         """
         from xe_forge.core.mlp_lowering import (
+            cast_matmul_operands_to_f16,
             fold_transpose_into_matmul,
             parse_mlp,
             render_mlp_recipe,
         )
 
         folded = fold_transpose_into_matmul(linalg_code)
+        # XeGPU/DPAS needs f16 A/B operands. If the imported matmuls are f32 (raw
+        # KernelBench dumps are all-f32), insert f32->f16 truncf casts on A/B; the
+        # recipe fuses them into the k-loop as in-register truncf (C stays f32).
+        with_casts = bool(re.search(r"linalg\.matmul[^\n]*tensor<[0-9x]+xf32>,", folded))
+        if with_casts:
+            folded = cast_matmul_operands_to_f16(folded)
         if layers is None:
             use_exec = self if (autotune or large_grf) else None
             layers = parse_mlp(folded, executor=use_exec, large_grf=large_grf)
         if not layers:
             return False, "", "not a recognized multi-layer MLP (parse returned no layers)", []
-        tile_src, anno_src = render_mlp_recipe(layers)
+        tile_src, anno_src = render_mlp_recipe(layers, with_casts=with_casts)
 
         work = tempfile.mkdtemp(prefix="mlir_mlp_")
         try:

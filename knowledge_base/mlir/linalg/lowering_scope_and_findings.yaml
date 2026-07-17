@@ -97,6 +97,30 @@ constraints:
       row -> mostly-zero output though the lowering is correct).
       MULTI-LAYER CHAINS are now supported too — see lowering_mlp_multilayer_supported.
 
+  - id: lowering_matmul_f32_operands_cast_to_f16
+    name: f32 matmul A/B operands are cast to f16 (XeGPU needs f16 inputs)
+    severity: info
+    description: |
+      XeGPU/DPAS requires the matmul INPUTS (A, B) to be f16/bf16; the accumulator C
+      stays f32. Torch-MLIR imports KernelBench in ALL-f32 (A, B, and C all f32),
+      which won't hit the XMX path. cast_matmul_operands_to_f16 (mlp_lowering.py)
+      rewrites each linalg.matmul's A/B to f16 via truncf linalg.generic casts,
+      keeping C f32. lower_mlp_to_wg auto-applies it when it sees an f32-operand
+      matmul (with_casts), and render_mlp_recipe(with_casts=True) fuses each cast
+      into the k-loop via get_producer_of_operand + fuse_into_containing_op (the cast
+      then rides in-register / hoisted to a whole-tile truncf; after bufferization
+      with function_boundary_type_conversion the kernel ABI ends up f16 A/W). Verified
+      GPU-correct: a raw-f32 2-layer MLP lowers (4 truncf) and computes right (W=0
+      control -> 0.5, 0 mismatches).
+      RECIPE ROBUSTNESS: the casts add extra linalg.generic ops, so render_mlp_recipe
+      no longer split_handles ALL generics (that count is now variable). It matches
+      the N matmuls (stable) and finds each layer's epilogue as the matmul's
+      get_consumers_of_result — robust to cast generics AND to how many elementwise
+      ops the epilogue fused into.
+      NOTE: only the MLP path (lower_mlp_to_wg) auto-casts today; the single plain/
+      transpose-B matmul path (lower_linalg_to_wg) still expects f16 in. A standalone
+      f32 GEMM would need the same cast wired there.
+
   - id: lowering_mlp_multilayer_supported
     name: Full multi-layer MLP chains lower to N XeGPU-WG kernels
     severity: info
@@ -106,7 +130,8 @@ constraints:
       through intermediate buffers. Entry point MlirExecutor.lower_mlp_to_wg;
       generator in src/xe_forge/core/mlp_lowering.py. Verified GPU-correct on a
       2-layer relu(x·W^T+bias) chain (0 mismatches); parser + recipe generator
-      handle all 3 real level3 dumps incl. the 17-layer DeepNarrowMLP.
+      handle all 3 real level3 dumps incl. the 17-layer DeepNarrowMLP. Raw-f32 dumps
+      are handled too — see lowering_matmul_f32_operands_cast_to_f16.
       PIPELINE: (1) fold_transpose_into_matmul rewrites each physical
       "linalg.transpose(W); matmul(A,t)" into a transpose-B matmul (indexing_maps
       B=(n,k)) and DROPS the transpose op — this keeps the transpose in-register
