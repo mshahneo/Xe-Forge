@@ -121,7 +121,8 @@ matmul; per-matmul lowering for MLP chains; boundary tiles for irregular shapes)
 
 ---
 
-*Reproduce: dumps in `/tmp/kb/dumps/`, adapter+runner in `/tmp/kb/run_xeforge.py`
-and `/tmp/kb/gpu_time.py`. Env: `source /home/gta/intel/oneapi/setvars.sh` then the
-lighthouse venv at `/home/gta/.venv` (has torch-mlir); Xe-Forge from
-`/home/gta/dev/Xe-Forge/.venv-xf`.*
+*Reproduce: see [docs/mlir_e2e_howto.md](mlir_e2e_howto.md) for the full runnable
+flow (setup, `.env`, the CLI command, GPU verification, and importing raw
+KernelBench kernels). The numbers above were gathered with those steps; the
+throwaway dump/adapter scripts used at capture time lived under `/tmp/kb/` and are
+not committed — the howto reproduces the same path from repo examples.*

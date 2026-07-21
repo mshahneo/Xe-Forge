@@ -4,6 +4,9 @@ What Xe-Forge's MLIR path can and can't lower across the KernelBench suite
 (as shipped in lighthouse `examples/KernelBench`). Date: 2026-07-16 · Target:
 Intel Xe2 "Battlemage".
 
+> To actually run a kernel end-to-end, see
+> [docs/mlir_e2e_howto.md](mlir_e2e_howto.md) (setup, CLI command, GPU verify).
+
 ## What Xe-Forge supports today
 
 Xe-Forge's MLIR path lowers **matmul-family Linalg** to XeGPU workgroup level +
