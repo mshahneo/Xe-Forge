@@ -221,12 +221,16 @@ def render_timing_harness(
     k: int,
     kernel_name: str = "test_kernel",
     template_dir: str | Path = _TEMPLATE_DIR,
+    rezero: bool = True,
 ) -> str:
     """Render the kernel-only rtclock timing harness for *config* at shape MxNxK.
 
     Grid = [M/wg_m, N/wg_n], threads = nb_threads (from the config). The result
     has a ``// KERNEL`` slot (splice the lowered gpu.module) and an ``// ALIASES``
     slot (hoisted affine-map defs), consumed by MlirExecutor._splice_kernel.
+    *rezero* re-zeroes C_gpu before every timed launch (needed only when the loop's
+    own C values matter); correctness is always gated by a fresh single launch
+    before the loop, so rezero=False gives a pure launch time with no per-iter memcpy.
     """
     env = Environment(
         loader=FileSystemLoader(str(template_dir)),
@@ -241,6 +245,48 @@ def render_timing_harness(
         grid_n=n // config.wg_n,
         nb_threads=config.nb_threads,
         kernel_name=kernel_name,
+        rezero=rezero,
+    )
+
+
+def render_timing_harness_explicit(
+    m: int,
+    n: int,
+    k: int,
+    grid_m: int,
+    grid_n: int,
+    nb_threads: int,
+    kernel_name: str = "test_kernel",
+    template_dir: str | Path = _TEMPLATE_DIR,
+    rezero: bool = True,
+) -> str:
+    """Render the rtclock timing harness with grid/threads given directly.
+
+    Same template (and thus the same warmup/timed loops, fresh-launch correctness
+    check, and CPU ``gemmF16F16F32`` reference) as :func:`render_timing_harness`, but
+    the launch geometry is supplied explicitly rather than derived from a
+    LoweringConfig. Used to time a kernel whose tiling Xe-Forge did not choose — e.g.
+    a lighthouse matmul dump that carries its own
+    ``known_grid_size``/``known_block_size`` — through the identical harness, so its
+    ms is directly comparable to a swept config's ms. *rezero* controls the per-launch
+    C re-zero (see :func:`render_timing_harness`); pass rezero=False to time kernels
+    that read C as an external accumulator (correctness is still gated by the fresh
+    single launch before the loop). Kernel ABI: ``@kernel(C:MxNxf32, A:MxKxf16, B:KxNxf16)``.
+    """
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        undefined=StrictUndefined,
+        keep_trailing_newline=True,
+    )
+    return env.get_template("timing_harness.mlir.j2").render(
+        m=m,
+        n=n,
+        k=k,
+        grid_m=grid_m,
+        grid_n=grid_n,
+        nb_threads=nb_threads,
+        kernel_name=kernel_name,
+        rezero=rezero,
     )
 
 

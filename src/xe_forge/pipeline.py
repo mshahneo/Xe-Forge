@@ -332,11 +332,94 @@ class XeForgePipeline:
             best_cfg,
             f"{best_r.execution_time_ms:.4f}ms" if best_r and best_r.execution_time_ms else "correct",
         )
+        # Second opinion: also lower this GEMM via lighthouse and keep it if it beats
+        # Xe-Forge's own best. See _matmul_second_opinion.
+        so = self._matmul_second_opinion(m, n, k, best_cfg, best_wg, best_r, flop)
+        if so is not None:
+            return so
         # Return a runnable, self-contained WG kernel (best config's timing harness).
         from xe_forge.core.mlir_executor import _kernel_name
 
         harness = render_timing_harness(best_cfg, m, n, k, kernel_name=_kernel_name(best_wg))
         return executor._splice_kernel(harness, best_wg, kernel_only=True)
+
+    def _matmul_second_opinion(self, m, n, k, best_cfg, best_wg, best_r, flop):
+        """Lower the same GEMM via lighthouse; return its harness iff it's faster.
+
+        Xe-Forge already has a timed best (best_cfg/best_wg/best_r). We lower the
+        identical (M,N,K) matmul via the lighthouse schedule and time it through the
+        SAME rtclock harness (MlirExecutor.time_wg_matmul), so the two ms values are
+        apples-to-apples. Lighthouse is granted the same GRF mode Xe-Forge's winner
+        used. If lighthouse is correct AND faster by more than the noise band
+        (speedup_tol), return a runnable harness wrapping the lighthouse kernel;
+        otherwise return None so the caller keeps Xe-Forge's own best. Any failure
+        (no lighthouse, dump/geometry/timing error) also returns None — best-effort.
+        """
+        from xe_forge.core.linalg_lowering import (
+            render_timing_harness_explicit,
+        )
+        from xe_forge.core.matmul_lowering import (
+            extract_launch_geometry,
+            lower_matmul_via_lighthouse,
+        )
+        from xe_forge.core.mlir_executor import _kernel_name
+
+        executor = self.executor
+        if not hasattr(executor, "time_wg_matmul"):
+            return None
+
+        lh_wg = lower_matmul_via_lighthouse(m, n, k)
+        if lh_wg is None:
+            return None
+        geom = extract_launch_geometry(lh_wg)
+        if geom is None:
+            logger.info("Second opinion: lighthouse dump lacks known_grid/block; skipping.")
+            return None
+        grid_m, grid_n, nb_threads = geom
+        lr = executor.time_wg_matmul(
+            lh_wg, m, n, k, grid_m, grid_n, nb_threads,
+            flop=flop, large_grf=best_cfg.large_grf,
+        )
+        lh_ms = lr.execution_time_ms if (lr.success and lr.output_correct is not False) else None
+        if lh_ms is None:
+            logger.info(
+                "Second opinion: lighthouse matmul failed/incorrect (%s); keeping Xe-Forge.",
+                (lr.error_message or "")[:120],
+            )
+            return None
+
+        # Re-time Xe-Forge's own best through the SAME rtclock harness so the two ms
+        # are apples-to-apples. best_r came from the IMEX-profiling harness (pure
+        # kernel time, no per-launch C re-zero memcpy), so it isn't comparable to the
+        # lighthouse rtclock time directly. Fall back to best_r only if this re-time
+        # fails for some reason.
+        xr = executor.time_wg_matmul(
+            best_wg, m, n, k,
+            m // best_cfg.wg_m, n // best_cfg.wg_n, best_cfg.nb_threads,
+            flop=flop, large_grf=best_cfg.large_grf,
+        )
+        xe_ms = xr.execution_time_ms if (xr.success and xr.output_correct is not False) else None
+        if xe_ms is None:
+            xe_ms = best_r.execution_time_ms if best_r else None
+        if xe_ms is None:
+            # No comparable Xe-Forge time -> nothing to rank lighthouse against.
+            return None
+        tol = float(getattr(executor, "speedup_tol", 0.03) or 0.03)
+        logger.info(
+            "Second opinion: Xe-Forge %.4fms vs lighthouse %.4fms (tol %.0f%%)",
+            xe_ms, lh_ms, tol * 100,
+        )
+        if lh_ms < xe_ms * (1.0 - tol):
+            logger.info(
+                "LINALG_LOWERING: lighthouse wins (%.4fms < %.4fms) — using lighthouse kernel.",
+                lh_ms, xe_ms,
+            )
+            harness = render_timing_harness_explicit(
+                m, n, k, grid_m, grid_n, nb_threads, kernel_name=_kernel_name(lh_wg)
+            )
+            return executor._splice_kernel(harness, lh_wg, kernel_only=True)
+        logger.info("LINALG_LOWERING: Xe-Forge best stands (lighthouse not faster).")
+        return None
 
     def _maybe_lower_attention(self, kernel_code: str) -> str | None:
         """Lower a fused-attention Linalg graph to a runnable WG kernel.

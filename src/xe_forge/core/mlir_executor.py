@@ -698,6 +698,59 @@ class MlirExecutor:
             return None, None, None, results
         return best[1], best[2], best[3], results
 
+    def time_wg_matmul(
+        self,
+        wg_code: str,
+        m: int,
+        n: int,
+        k: int,
+        grid_m: int,
+        grid_n: int,
+        nb_threads: int,
+        flop=None,
+        large_grf: bool = False,
+    ):
+        """Time an already-lowered WG matmul kernel through the rtclock harness.
+
+        Unlike ``sweep_configs`` (which lowers a Linalg kernel per LoweringConfig),
+        this takes a *ready* XeGPU-WG gpu.module — e.g. a lighthouse matmul dump —
+        whose launch geometry it does not control, and times it through the
+        kernel-only rtclock harness (:func:`render_timing_harness_explicit`) with
+        ``rezero=False``: a fresh single launch validates correctness (CPU
+        gemmF16F16F32 → [ALLCLOSE]), then the warmup/timed loops measure pure launch
+        time with NO per-launch C re-zero memcpy. That last point matters here — the
+        lighthouse matmul kernel reads C as an *external* accumulator (no folded
+        zero-fill), so it would fail the IMEX-profiling harness (which relaunches
+        without re-zeroing and then checks C) and would be unfairly charged a ~4 MB
+        memcpy per launch under rezero=True. rezero=False sidesteps both: the loop's
+        C values drift but its per-launch *time* is exact, and correctness is already
+        gated. Callers get a directly-comparable ms by timing BOTH candidates this way
+        (see pipeline._matmul_second_opinion). Kernel ABI:
+        ``@kernel(C:MxNxf32, A:MxKxf16, B:KxNxf16)``; large_grf toggles the igc option
+        so the comparison can grant lighthouse the same GRF mode Xe-Forge's best used.
+        """
+        from xe_forge.core.linalg_lowering import (
+            LARGE_GRF_IGC_OPTION,
+            render_timing_harness_explicit,
+        )
+
+        kname = _kernel_name(wg_code)
+        harness = render_timing_harness_explicit(
+            m, n, k, grid_m, grid_n, nb_threads, kernel_name=kname, rezero=False
+        )
+        runnable = self._splice_kernel(harness, wg_code, kernel_only=True)
+        # execute() wraps this in "--gpu-lower-to-xevm-pipeline=<opts>", so pass the
+        # options string only (mirrors LoweringConfig.run_pipeline_options()).
+        opts = "xegpu-op-level=workgroup"
+        if large_grf:
+            opts += f" {LARGE_GRF_IGC_OPTION}"
+        return self.execute(
+            kernel_code=runnable,
+            output_name="second_opinion",
+            flop=flop,
+            pipeline_options=opts,
+        )
+
     def autotune_tile(self, linalg_code, dims, candidates, flop=None):
         """Pick the fastest valid tile config for a lowerable kernel by timing each.
 

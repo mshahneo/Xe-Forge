@@ -15,11 +15,16 @@ attention, row-softmax, row layer-norm) are lowered via the **lighthouse backend
 out to the upstream `llvm/lighthouse` XeGPU schedules (`--dump-kernel=xegpu-wg`) as
 a lowering engine and feeds the dumped WG kernel into its own WG stages + GRF sweep
 (dump-only — no run-time lighthouse dependency; see
-`src/xe_forge/core/lighthouse_backend.py`). Concretely, the supported op patterns are:
+`src/xe_forge/core/lighthouse_backend.py`). For **matmul** (which Xe-Forge already
+lowers natively) lighthouse is used as a *second opinion*: the same GEMM is also
+lowered via the lighthouse schedule and timed through the identical rtclock harness
+(pure launch time, `rezero=False`), and the faster correct kernel is kept
+(`pipeline._matmul_second_opinion`; measured a near-tie at 1024³). Concretely, the
+supported op patterns are:
 
 | Pattern | Status | Verified |
 |---|---|---|
-| Plain matmul `C = A·B` | ✅ supported | GPU, multiple shapes |
+| Plain matmul `C = A·B` | ✅ supported | GPU, multiple shapes (+ lighthouse second opinion) |
 | Batched matmul `C = A·B` (3-D, incl. non-square) | ✅ supported | GPU, 0 mismatches |
 | Transpose-B matmul `C = A·Bᵀ` (nn.Linear form) | ✅ supported | GPU, 0 mismatches |
 | Single MLP layer `C = act(A·Bᵀ + bias)` | ✅ supported | GPU, 0 mismatches |

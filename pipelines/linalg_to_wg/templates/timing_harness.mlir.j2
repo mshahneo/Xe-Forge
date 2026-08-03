@@ -64,19 +64,26 @@ module attributes {gpu.container_module} {
     %eq = arith.constant false
     call @printAllcloseF32(%C_cast, %C_ref_cast, %eq) : (memref<*xf32>, memref<*xf32>, i1) -> ()
 
-    // --- Timing: re-zero C_gpu before each launch so the accumulator init is 0.
-    // The re-zero (gpu.memcpy of a zeroed buffer) is constant overhead across configs.
+    // --- Timing. The loops measure launch time only; C's post-loop values are never
+    // checked (correctness was validated by the single fresh launch above), so
+    // accumulation across iterations is harmless to the *timing*. With `rezero` set
+    // we re-zero C_gpu before each launch — a constant gpu.memcpy of overhead. Leave
+    // it OFF for a fair pure-kernel time and to time kernels with differing C-init
+    // semantics on the same footing (a folded zero-fill vs an external accumulator
+    // that reads C: the latter would accumulate under rezero=off, but only its
+    // *values* drift — the per-launch *time* is unchanged, and correctness was
+    // already gated by the fresh single launch above).
     // Warmup.
     scf.for %arg = %c0 to %nwarmup step %c1 {
-      gpu.memcpy %C_gpu, %C_zero : memref<{{ m }}x{{ n }}xf32>, memref<{{ m }}x{{ n }}xf32>
-      gpu.launch_func @{{ kernel_name }}::@{{ kernel_name }} blocks in (%grid_m, %grid_n, %c1) threads in (%threads, %c1, %c1) args(%C_gpu : memref<{{ m }}x{{ n }}xf32>, %A_gpu : memref<{{ m }}x{{ k }}xf16>, %B_gpu : memref<{{ k }}x{{ n }}xf16>)
+{% if rezero %}      gpu.memcpy %C_gpu, %C_zero : memref<{{ m }}x{{ n }}xf32>, memref<{{ m }}x{{ n }}xf32>
+{% endif %}      gpu.launch_func @{{ kernel_name }}::@{{ kernel_name }} blocks in (%grid_m, %grid_n, %c1) threads in (%threads, %c1, %c1) args(%C_gpu : memref<{{ m }}x{{ n }}xf32>, %A_gpu : memref<{{ m }}x{{ k }}xf16>, %B_gpu : memref<{{ k }}x{{ n }}xf16>)
       gpu.wait
     }
     // Timed loop.
     %t0 = func.call @rtclock() : () -> f64
     scf.for %arg = %c0 to %nruns step %c1 {
-      gpu.memcpy %C_gpu, %C_zero : memref<{{ m }}x{{ n }}xf32>, memref<{{ m }}x{{ n }}xf32>
-      gpu.launch_func @{{ kernel_name }}::@{{ kernel_name }} blocks in (%grid_m, %grid_n, %c1) threads in (%threads, %c1, %c1) args(%C_gpu : memref<{{ m }}x{{ n }}xf32>, %A_gpu : memref<{{ m }}x{{ k }}xf16>, %B_gpu : memref<{{ k }}x{{ n }}xf16>)
+{% if rezero %}      gpu.memcpy %C_gpu, %C_zero : memref<{{ m }}x{{ n }}xf32>, memref<{{ m }}x{{ n }}xf32>
+{% endif %}      gpu.launch_func @{{ kernel_name }}::@{{ kernel_name }} blocks in (%grid_m, %grid_n, %c1) threads in (%threads, %c1, %c1) args(%C_gpu : memref<{{ m }}x{{ n }}xf32>, %A_gpu : memref<{{ m }}x{{ k }}xf16>, %B_gpu : memref<{{ k }}x{{ n }}xf16>)
       gpu.wait
     }
     %t1 = func.call @rtclock() : () -> f64

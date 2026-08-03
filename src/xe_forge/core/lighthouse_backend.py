@@ -64,6 +64,7 @@ def dump_wg_kernel(
     lighthouse_root: str | Path = LIGHTHOUSE_ROOT,
     timeout: int = 300,
     require: tuple[str, ...] = ("gpu.container_module", "gpu.func"),
+    prefer_uv: bool = False,
 ) -> str | None:
     """Run a lighthouse schedule to XeGPU-WG level and return the dumped MLIR.
 
@@ -76,6 +77,11 @@ def dump_wg_kernel(
         require: substrings that must all be present in stdout for the dump to be
             considered a valid WG module (guards against a schedule that printed a
             different stage or an error banner on a zero exit).
+        prefer_uv: force ``uv run`` from the lighthouse checkout instead of the
+            (faster) importable interpreter. The matmul schedule needs a
+            ``matmul_params.json`` param DB that ships in the checkout but NOT in the
+            pip-installed site-packages, so the direct interpreter imports lighthouse
+            fine yet fails at run time — such schedules must set this.
 
     Returns the dumped module text, or None if the generator is missing, no
     lighthouse-capable interpreter exists, the run fails/times out, or the output
@@ -87,7 +93,10 @@ def dump_wg_kernel(
     if not gen.exists():
         logger.warning("Lighthouse generator not found at %s; cannot lower.", gen)
         return None
-    py = lighthouse_python()
+    if prefer_uv:
+        py = "uv-run" if shutil.which("uv") else None
+    else:
+        py = lighthouse_python()
     if py is None:
         logger.warning("No lighthouse-capable interpreter found; cannot lower.")
         return None
