@@ -301,6 +301,10 @@ class XeForgePipeline:
             sm = self._maybe_lower_softmax(kernel_code)
             if sm is not None:
                 return sm
+            # Else a standalone row layer-norm — also lighthouse-backed.
+            ln = self._maybe_lower_layernorm(kernel_code)
+            if ln is not None:
+                return ln
             logger.warning("Could not extract matmul dims; skipping Linalg lowering.")
             return None
         m, n, k = dims
@@ -417,6 +421,47 @@ class XeForgePipeline:
             return None
         logger.info("Softmax lowered to WG-level kernel (runnable harness synthesized).")
         # Like attention, the lighthouse softmax kernel hasn't chosen a GRF mode;
+        # let optimize() run the GRF sweep on the lowered kernel.
+        self._grf_sweep_after_lowering = True
+        return harness
+
+    def _maybe_lower_layernorm(self, kernel_code: str) -> str | None:
+        """Lower a standalone row layer-norm Linalg graph to a runnable WG kernel.
+
+        Recognizes the layer-norm structure (math.rsqrt inv-std over a 2-D f32
+        tensor with a matching 1-D gamma/beta), extracts its (M, N) shape, and
+        reuses lighthouse's layer_norm.py --dump-kernel=xegpu-wg as the lowering
+        engine (dump-only — no run-time lighthouse dependency). The dumped
+        gpu.module carries known_grid/block_size, so the attention path's harness
+        synthesis wraps it into a runnable single-launch @main directly. Returns the
+        harness, or None if this isn't a layer-norm / lowering is unavailable.
+        """
+        from xe_forge.core.attention_lowering import synthesize_run_harness
+        from xe_forge.core.layer_norm_lowering import (
+            detect_layernorm_shape,
+            lower_layernorm_to_wg,
+        )
+
+        shape = detect_layernorm_shape(kernel_code)
+        if shape is None:
+            return None
+        m, n = shape
+        logger.info(
+            "STAGE: LINALG_LOWERING — row layer-norm M=%d N=%d (lowering via lighthouse)",
+            m,
+            n,
+        )
+        wg = lower_layernorm_to_wg(m, n)
+        if wg is None:
+            return None
+        harness = synthesize_run_harness(wg)
+        if harness is None:
+            logger.warning(
+                "Layer-norm lowered to WG but harness synthesis failed; keeping input."
+            )
+            return None
+        logger.info("Layer-norm lowered to WG-level kernel (runnable harness synthesized).")
+        # Like attention/softmax, the lighthouse kernel hasn't chosen a GRF mode;
         # let optimize() run the GRF sweep on the lowered kernel.
         self._grf_sweep_after_lowering = True
         return harness
