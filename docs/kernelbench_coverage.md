@@ -10,7 +10,12 @@ Intel Xe2 "Battlemage".
 ## What Xe-Forge supports today
 
 Xe-Forge's MLIR path lowers **matmul-family Linalg** to XeGPU workgroup level +
-runs an autonomous GRF sweep. Concretely, the supported op patterns are:
+runs an autonomous GRF sweep. Op classes outside the matmul family (fused
+attention, row-softmax) are lowered via the **lighthouse backend**: Xe-Forge shells
+out to the upstream `llvm/lighthouse` XeGPU schedules (`--dump-kernel=xegpu-wg`) as
+a lowering engine and feeds the dumped WG kernel into its own WG stages + GRF sweep
+(dump-only — no run-time lighthouse dependency; see
+`src/xe_forge/core/lighthouse_backend.py`). Concretely, the supported op patterns are:
 
 | Pattern | Status | Verified |
 |---|---|---|
@@ -18,6 +23,7 @@ runs an autonomous GRF sweep. Concretely, the supported op patterns are:
 | Batched matmul `C = A·B` (3-D, incl. non-square) | ✅ supported | GPU, 0 mismatches |
 | Transpose-B matmul `C = A·Bᵀ` (nn.Linear form) | ✅ supported | GPU, 0 mismatches |
 | Single MLP layer `C = act(A·Bᵀ + bias)` | ✅ supported | GPU, 0 mismatches |
+| Row-softmax `softmax(x, dim=-1)` (via lighthouse) | ✅ supported | GPU, row-sums = 1 |
 | Transpose-A / transpose-both matmul | ❌ layout WIP | — |
 | Multi-layer MLP chains | ⚠️ per-layer only | single layer only |
 | Everything else (conv, norm, pool, reduce, softmax, loss, elementwise-only, matvec) | ❌ out of scope | — |
@@ -64,7 +70,8 @@ Each needs an op class Xe-Forge's matmul path does not cover.
 | Kernels | Category | Why not |
 |---|---|---|
 | 5, 20 | Scalar/elementwise mul, LeakyReLU | pure elementwise; no matmul to anchor the WG lowering |
-| 19, 21–32 | Activations (ReLU, Sigmoid, Tanh, Softmax, GELU, SELU, ELU, …) | elementwise / row-reduction (softmax); no contraction |
+| 23, 24 | Softmax / LogSoftmax | ✅ **softmax supported** via the lighthouse row-softmax schedule (GPU-verified: constant input → each row sums to 1). LogSoftmax is the same schedule + a log epilogue (not yet wired). |
+| 19, 21, 22, 25–32 | Activations (ReLU, Sigmoid, Tanh, GELU, SELU, ELU, …) | elementwise; no matmul to anchor the WG lowering |
 | 33–40 | Normalizations (Batch/Instance/Group/RMS/Frobenius/L1/L2/Layer) | reductions + rescale; not a matmul |
 | 41–46 | Pooling (Max/Avg 1-D/2-D/3-D) | sliding-window reductions |
 | 47–49, 51–53 | Reductions & arg (Sum/Mean/Max/Min/Argmax/Argmin over a dim) | reductions |

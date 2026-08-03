@@ -297,6 +297,10 @@ class XeForgePipeline:
             attn = self._maybe_lower_attention(kernel_code)
             if attn is not None:
                 return attn
+            # Else a standalone row-softmax (no contraction) — also lighthouse-backed.
+            sm = self._maybe_lower_softmax(kernel_code)
+            if sm is not None:
+                return sm
             logger.warning("Could not extract matmul dims; skipping Linalg lowering.")
             return None
         m, n, k = dims
@@ -373,6 +377,47 @@ class XeForgePipeline:
         # the lighthouse attention kernel has NOT chosen a GRF mode — the GRF sweep
         # is exactly where its ~1.7x win comes from. Flag it so optimize() runs the
         # sweep on the lowered kernel despite a LINALG_LOWERING stage being recorded.
+        self._grf_sweep_after_lowering = True
+        return harness
+
+    def _maybe_lower_softmax(self, kernel_code: str) -> str | None:
+        """Lower a standalone row-softmax Linalg graph to a runnable WG kernel.
+
+        Recognizes `linalg.softmax dimension(1)` over a 2-D f32 tensor, extracts
+        its (M, N) shape, and reuses lighthouse's softmax.py --dump-kernel=xegpu-wg
+        as the lowering engine (we only consume the dumped .mlir — no run-time
+        lighthouse dependency). The dumped gpu.module carries known_grid/block_size,
+        so the attention path's harness synthesis wraps it into a runnable
+        single-launch @main directly. Returns the harness, or None if this isn't a
+        softmax / lowering is unavailable.
+        """
+        from xe_forge.core.attention_lowering import synthesize_run_harness
+        from xe_forge.core.softmax_lowering import (
+            detect_softmax_shape,
+            lower_softmax_to_wg,
+        )
+
+        shape = detect_softmax_shape(kernel_code)
+        if shape is None:
+            return None
+        m, n = shape
+        logger.info(
+            "STAGE: LINALG_LOWERING — row-softmax M=%d N=%d (lowering via lighthouse)",
+            m,
+            n,
+        )
+        wg = lower_softmax_to_wg(m, n)
+        if wg is None:
+            return None
+        harness = synthesize_run_harness(wg)
+        if harness is None:
+            logger.warning(
+                "Softmax lowered to WG but harness synthesis failed; keeping input."
+            )
+            return None
+        logger.info("Softmax lowered to WG-level kernel (runnable harness synthesized).")
+        # Like attention, the lighthouse softmax kernel hasn't chosen a GRF mode;
+        # let optimize() run the GRF sweep on the lowered kernel.
         self._grf_sweep_after_lowering = True
         return harness
 

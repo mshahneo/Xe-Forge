@@ -21,18 +21,28 @@ that can't be satisfied returns None so the pipeline falls back cleanly.
 from __future__ import annotations
 
 import logging
-import os
 import re
-import shutil
-import subprocess
 from pathlib import Path
+
+from xe_forge.core.lighthouse_backend import (
+    LIGHTHOUSE_ROOT,
+    dump_wg_kernel,
+    lighthouse_python as _lighthouse_python,
+)
 
 logger = logging.getLogger(__name__)
 
-# Where the lighthouse fused-attention generator lives (pip-installed there).
-LIGHTHOUSE_ROOT = os.environ.get(
-    "LIGHTHOUSE_ROOT", "/data/gta/upstream/lighthouse"
-)
+# Re-exported for back-compat: LIGHTHOUSE_ROOT and _lighthouse_python now live in
+# lighthouse_backend (the shared subprocess seam). Kept importable from here so
+# existing callers don't break.
+__all__ = [
+    "LIGHTHOUSE_ROOT",
+    "detect_attention_shape",
+    "lower_attention_to_wg",
+    "extract_gpu_module",
+    "synthesize_run_harness",
+]
+
 FUSED_ATTENTION_REL = "examples/xegpu/fused_attention.py"
 
 
@@ -57,32 +67,6 @@ def detect_attention_shape(code: str) -> tuple[int, int, int, int] | None:
     return z, h, n_ctx, n_head
 
 
-def _lighthouse_python() -> str | None:
-    """Pick an interpreter that can run the lighthouse generator.
-
-    Prefers ``uv run`` from the lighthouse root (README-recommended), else a
-    Python that already imports lighthouse. Returns a shell-ready command prefix
-    or None if none is available.
-    """
-    # A direct interpreter with lighthouse importable is fastest (~0.6s).
-    for py in (os.environ.get("LIGHTHOUSE_PYTHON"), "/home/gta/.venv/bin/python"):
-        if py and os.path.exists(py):
-            try:
-                r = subprocess.run(
-                    [py, "-c", "import lighthouse"],
-                    capture_output=True,
-                    timeout=60,
-                )
-                if r.returncode == 0:
-                    return py
-            except Exception:
-                pass
-    # Fall back to `uv run` (resolves the lighthouse venv itself).
-    if shutil.which("uv"):
-        return "uv-run"
-    return None
-
-
 def lower_attention_to_wg(
     z: int,
     h: int,
@@ -97,47 +81,20 @@ def lower_attention_to_wg(
     returns the dumped MLIR module (the @payload_kernel gpu.module + host funcs),
     or None if the generator is unavailable or fails.
     """
-    root = Path(lighthouse_root)
-    gen = root / FUSED_ATTENTION_REL
-    if not gen.exists():
-        logger.warning("Lighthouse generator not found at %s; cannot lower attention.", gen)
-        return None
-    py = _lighthouse_python()
-    if py is None:
-        logger.warning("No lighthouse-capable interpreter found; cannot lower attention.")
-        return None
-
-    dump_args = [
-        str(gen),
-        "--dump-kernel=xegpu-wg",
-        f"--batch-size={z}",
-        f"--num-heads={h}",
-        f"--n-ctx={n_ctx}",
-        f"--n-head={n_head}",
-    ]
-    cmd = (["uv", "run", *dump_args] if py == "uv-run" else [py, *dump_args])
     logger.info(
         "Lowering attention via lighthouse: Z=%d H=%d n_ctx=%d n_head=%d", z, h, n_ctx, n_head
     )
-    try:
-        r = subprocess.run(
-            cmd, cwd=str(root), capture_output=True, timeout=timeout
-        )
-    except subprocess.TimeoutExpired:
-        logger.warning("Lighthouse attention lowering timed out.")
-        return None
-    if r.returncode != 0:
-        logger.warning(
-            "Lighthouse attention lowering failed (rc=%d): %s",
-            r.returncode,
-            r.stderr.decode(errors="replace")[-400:],
-        )
-        return None
-    out = r.stdout.decode(errors="replace")
-    if "gpu.container_module" not in out or "gpu.func" not in out:
-        logger.warning("Lighthouse dump did not contain a WG gpu.module; skipping.")
-        return None
-    return out
+    return dump_wg_kernel(
+        FUSED_ATTENTION_REL,
+        [
+            f"--batch-size={z}",
+            f"--num-heads={h}",
+            f"--n-ctx={n_ctx}",
+            f"--n-head={n_head}",
+        ],
+        lighthouse_root=lighthouse_root,
+        timeout=timeout,
+    )
 
 
 # --- runnable-harness synthesis ------------------------------------------------
