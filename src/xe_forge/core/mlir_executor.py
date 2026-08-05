@@ -595,10 +595,19 @@ class MlirExecutor:
         launches the kernel once (IMEX profiling times it). Returns
         (best_large_grf: bool, results: dict[str,float]).
         """
-        base = "xegpu-op-level=workgroup"
+        from xe_forge.core.linalg_lowering import LARGE_GRF_IGC_OPTION
+
+        # Derive the base options from this executor's configured pipeline (minus any
+        # large-GRF token, which the sweep toggles), so extra flags a caller set —
+        # e.g. enable-vector-to-xegpu=true for a vector-dialect WG kernel — carry
+        # through both variants. Falls back to the plain WG level if unset.
+        base = self.pipeline
+        if base.startswith("--gpu-lower-to-xevm-pipeline="):
+            base = base[len("--gpu-lower-to-xevm-pipeline="):]
+        base = base.replace(LARGE_GRF_IGC_OPTION, "").strip() or "xegpu-op-level=workgroup"
         variants = {
             "default_grf": base,
-            "large_grf": base + " " + "igc-cmd-options=-ze-opt-large-register-file",
+            "large_grf": base + " " + LARGE_GRF_IGC_OPTION,
         }
         results: dict[str, float | None] = {}
         for name, opts in variants.items():
