@@ -87,6 +87,7 @@ class KnowledgeEntry:
     pattern_before: str
     pattern_after: str
     description: str = ""
+    precondition: str = ""
     rationale: str = ""
     expected_speedup: str | None = None
     applies_to: list[str] = field(default_factory=list)
@@ -200,8 +201,10 @@ class KnowledgeBase:
                 "=" * 60,
             ]
             for entry in entries:
+                lines += [f"\n## {entry.name}"]
+                if entry.precondition.strip():
+                    lines.append(f"PRECONDITION (apply ONLY if this holds): {entry.precondition.strip()}")
                 lines += [
-                    f"\n## {entry.name}",
                     f"Description: {entry.description}",
                     f"Rationale: {entry.rationale.strip()}",
                 ]
@@ -438,6 +441,7 @@ def _parse_entry(data: dict, source: str) -> KnowledgeEntry | None:
         pattern_before=data.get("pattern_before", data.get("before", "")),
         pattern_after=data.get("pattern_after", data.get("after", "")),
         description=data.get("description", ""),
+        precondition=data.get("precondition", ""),
         rationale=data.get("rationale", ""),
         expected_speedup=data.get("expected_speedup"),
         applies_to=data.get("applies_to", []),

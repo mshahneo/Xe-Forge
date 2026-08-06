@@ -2,6 +2,25 @@
 # Prefetching, cache hints, and coalesced 2D block loads for WG-level XeGPU.
 
 constraints:
+  - id: xegpu_no_dead_prefetch_reads
+    name: A prefetch whose loaded value is unused is dead code (no-op)
+    severity: critical
+    description: |
+      Every "optimization" must change the code the compiler actually keeps.
+      Adding a vector.transfer_read / xegpu.load whose result feeds nothing is
+      dead code: MLIR's DCE removes it, so the kernel lowers to IR byte-identical
+      to the original and runs at the same speed. Any measured "speedup" is
+      timing noise, and the verifier now rejects such edits (it compares the
+      LOWERED IR of the two variants and fails a no-op).
+
+      A REAL software prefetch must either (a) be a side-effecting op the target
+      supports — NOTE memref.prefetch does NOT legalize on Intel Xe (LLVM ERROR:
+      unable to legalize G_PREFETCH), so it is not an option here — or (b) use
+      xegpu.prefetch_nd on a live xegpu.tensor_desc (only available once the
+      kernel is in load_nd block-load form; see xegpu_add_prefetch_nd). If you
+      cannot express a real prefetch for the kernel in front of you, do not
+      emit one — report no change instead.
+
   - id: xegpu_contiguous_2d_block_load
     name: load_nd tiles should map to contiguous 2D block loads
     severity: high
@@ -15,6 +34,20 @@ patterns:
   - id: xegpu_add_prefetch_nd
     name: Prefetch operand tiles ahead of the K-loop with cache hints
     stage: memory_access
+    precondition: |
+      APPLIES ONLY when the kernel body already contains xegpu.load_nd on an
+      xegpu.tensor_desc created by xegpu.create_nd_tdesc (i.e. the kernel is
+      ALREADY in xegpu block-load form — typically a GEMM/MLP lowered by the
+      matmul path). It does NOT apply to a vector-dialect kernel whose loads are
+      vector.transfer_read: those may lower to xegpu.load GATHERS (index-vector
+      loads), which have no tensor_desc to prefetch, and there is no xegpu.load_nd
+      in the IR to attach a prefetch to. Do NOT fabricate a prefetch by adding a
+      vector.transfer_read whose result is unused — it is dead code that the
+      compiler's DCE deletes, so the lowered IR is byte-identical and the
+      "optimization" is a verified no-op (see constraint
+      xegpu_no_dead_prefetch_reads). If a vector-dialect kernel is memory-bound,
+      the real fix is upstream: make its transfer_reads lower to contiguous
+      load_nd block loads (a layout/contiguity change), THEN this pattern applies.
     description: |
       Insert xegpu.prefetch_nd for the next K-iteration's A/B tiles before the
       load_nd that consumes the current tiles, with

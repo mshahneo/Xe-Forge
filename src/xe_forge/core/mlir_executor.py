@@ -92,6 +92,10 @@ class MlirComparisonResult:
     original_correct: bool = True
     optimized_correct: bool = True
     is_slower: bool = False
+    # True when the optimized source lowers to IR byte-identical to the original's
+    # (e.g. the edit only added dead ops that the compiler eliminates). Such an
+    # edit cannot be a real speedup — any measured delta is timing noise.
+    lowered_identical: bool = False
     feedback_message: str = ""
 
     @property
@@ -264,6 +268,36 @@ class MlirExecutor:
         stdout = run.stdout.decode(errors="replace")
         return self._parse_output(stdout, flop=flop)
 
+    def lower_only(
+        self, kernel_code: str, pipeline_options: str | None = None
+    ) -> str | None:
+        """Lower *kernel_code* through imex-opt and return the resulting IR text.
+
+        Runs only stage 1 (the ``--gpu-lower-to-xevm-pipeline`` pass) — no
+        mlir-runner, no GPU. Returns the lowered IR string, or ``None`` if
+        lowering fails. Used to compare what two source variants actually
+        compile to (see ``compare_kernels``' dead-edit guard).
+        """
+        src_path = Path(self.build_dir) / "lower_only.mlir"
+        src_path.write_text(kernel_code)
+        if pipeline_options is not None:
+            pipeline_args = [f"--gpu-lower-to-xevm-pipeline={pipeline_options}"]
+        elif self.pipeline.startswith("--gpu-lower-to-xevm-pipeline="):
+            pipeline_args = [self.pipeline]
+        else:
+            pipeline_args = self.pipeline.split()
+        try:
+            lowered = subprocess.run(
+                [self.imex_opt, str(src_path), *pipeline_args],
+                capture_output=True,
+                timeout=self.compile_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if lowered.returncode != 0:
+            return None
+        return lowered.stdout.decode(errors="replace")
+
     def _parse_output(self, stdout: str, flop: float | None = None) -> ExecutionResult:
         """Parse correctness marker and rtclock timing from harness stdout."""
         allclose_match = _ALLCLOSE_ANY_RE.search(stdout)
@@ -368,6 +402,19 @@ class MlirExecutor:
             )
 
         opt_correct = bool(opt.output_correct)
+
+        # Dead-edit guard: if the optimized source lowers to IR byte-identical to
+        # the original's, the "optimization" changed nothing the compiler keeps
+        # (e.g. an unused vector.transfer_read that DCE deletes). Any measured
+        # speedup is then pure timing noise, so reject it as a non-improvement.
+        lowered_identical = False
+        if opt_correct and (original_code is not None) and (optimized_code is not None):
+            pipe_opts = self._pipeline_options()
+            orig_ir = self.lower_only(original_code, pipeline_options=pipe_opts)
+            opt_ir = self.lower_only(optimized_code, pipeline_options=pipe_opts)
+            if orig_ir is not None and opt_ir is not None and orig_ir == opt_ir:
+                lowered_identical = True
+
         orig_ms = orig.execution_time_ms or float("inf")
         opt_ms = opt.execution_time_ms or float("inf")
         # When no timing is available, fall back to neutral 1.0x so correctness
@@ -378,6 +425,11 @@ class MlirExecutor:
         else:
             speedup = orig_ms / opt_ms if opt_ms > 0 else 0.0
             timing_note = f" Original: {orig_ms:.4f}ms, Optimized: {opt_ms:.4f}ms."
+
+        # A dead edit lowers to the same IR — force a neutral 1.0x so it can never
+        # be accepted as an improvement, regardless of the noisy measured time.
+        if lowered_identical:
+            speedup = 1.0
         is_slower = speedup < (1.0 - self.speedup_tol)
 
         if not opt_correct:
@@ -385,6 +437,16 @@ class MlirExecutor:
                 "CORRECTNESS FAILURE: Optimized kernel does not match the in-file "
                 f"reference ([ALLCLOSE: FALSE]).{timing_note} "
                 "Fix numerical correctness before optimizing for speed."
+            )
+        elif lowered_identical:
+            msg = (
+                "NO-OP: the optimized kernel lowers to IR identical to the original "
+                "(the edit was dead code the compiler eliminates — e.g. an unused "
+                "load/transfer_read). This is not a real optimization. To actually "
+                "change generated code you must alter ops the pipeline keeps: use the "
+                "op-level idioms for THIS kernel (a vector-dialect kernel prefetches "
+                "by feeding a real value into the loop, not a dangling transfer_read; "
+                "an xegpu-level kernel uses xegpu.prefetch_nd on a live tensor_desc)."
             )
         elif is_slower:
             sd = 1.0 / speedup if speedup > 0 else float("inf")
@@ -404,8 +466,19 @@ class MlirExecutor:
             original_correct=bool(orig.output_correct),
             optimized_correct=opt_correct,
             is_slower=is_slower,
+            lowered_identical=lowered_identical,
             feedback_message=msg,
         )
+
+    def _pipeline_options(self) -> str | None:
+        """Return the bare ``--gpu-lower-to-xevm-pipeline`` options this executor
+        uses (without the flag prefix), or None to let ``lower_only`` fall back to
+        ``self.pipeline``. Keeps the dead-edit guard's lowering identical to the
+        lowering used for execution (incl. any enable-vector-to-xegpu flag)."""
+        p = self.pipeline
+        if p.startswith("--gpu-lower-to-xevm-pipeline="):
+            return p[len("--gpu-lower-to-xevm-pipeline="):]
+        return None
 
     # ------------------------------------------------------------------
     # Two-level flow: lower a bare Linalg kernel to XeGPU WG-level

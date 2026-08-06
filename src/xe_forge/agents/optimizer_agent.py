@@ -103,6 +103,13 @@ def _verify_mlir(code, original_code, executor, flop=None):
             )
             if not comparison.optimized_correct:
                 return comparison.feedback_message or "Optimized kernel failed correctness."
+            if getattr(comparison, "lowered_identical", False):
+                # Dead edit: lowers to identical IR. Don't accept it, and tell the
+                # LLM why so it tries a change the compiler actually keeps.
+                logger.info("MLIR optimization rejected: no-op (lowers to identical IR)")
+                return comparison.feedback_message or (
+                    "NO-OP: optimized kernel lowers to IR identical to the original."
+                )
             if comparison.is_slower:
                 sd = 1.0 / comparison.speedup if comparison.speedup > 0 else float("inf")
                 return (
@@ -1420,6 +1427,11 @@ class OptimizerAgent(Optimizer):
                     )
                 if not c.optimized_correct:
                     return False, None, None, None, "Incorrect results"
+                if getattr(c, "lowered_identical", False):
+                    # No-op edit: lowers to identical IR. Reject regardless of the
+                    # (noisy) measured time so a phantom speedup can't be recorded
+                    # via the baseline_ms path below.
+                    return False, None, None, None, "no-op (lowers to identical IR)"
                 if c.is_slower and not skip_speedup_check:
                     sd = 1.0 / c.speedup if c.speedup > 0 else float("inf")
                     return False, None, None, None, f"{sd:.2f}x slower"
