@@ -103,6 +103,15 @@ class KnowledgeConstraint:
     description: str
     severity: str = "critical"
     stages: list[OptimizationStage] = field(default_factory=list)
+    precondition: str = ""
+    rationale: str = ""
+    fix: str = ""
+    applies_to: list[str] = field(default_factory=list)
+    # True when ``stages`` came from an explicit ``stage:``/``stages:`` key rather
+    # than from id-keyword inference. Distinguishing the two lets the analyzer see
+    # deliberately-scoped constraints without changing how legacy (inferred)
+    # constraints are filtered. See KnowledgeBase.constraints_for_stage.
+    stages_declared: bool = False
 
 
 @dataclass
@@ -146,6 +155,17 @@ class KnowledgeBase:
         return self._by_stage.get(stage, [])
 
     def constraints_for_stage(self, stage: OptimizationStage) -> list[KnowledgeConstraint]:
+        # A constraint that DECLARED its stage is still shown to the analyzer.
+        # The analyzer never sees KB *patterns* — only constraints — so a
+        # constraint is the only way to give it a detection trigger for an
+        # opportunity that a LATER stage acts on. Several MLIR constraints
+        # (xegpu_redundant_exp_quotient, xegpu_softmax_exp_needs_fastmath) exist
+        # purely as such triggers and were worded against a live analyzer;
+        # scoping them to their acting stage would silently stop them firing.
+        # Constraints routed by id-keyword inference are NOT exempted, so every
+        # pre-existing (non-declaring) KB tree keeps its exact previous filtering.
+        if stage is OptimizationStage.ANALYSIS:
+            return [c for c in self._constraints if c.stages_declared or not c.stages]
         return [c for c in self._constraints if not c.stages or stage in c.stages]
 
     def examples_for_stage(self, stage: OptimizationStage) -> list[KnowledgeExample]:
@@ -184,13 +204,21 @@ class KnowledgeBase:
                 "",
             ]
             for c in constraints:
-                lines += [
-                    f"### {c.name}",
-                    f"Severity: {c.severity}",
-                    "",
-                    c.description.strip(),
-                    "",
-                ]
+                lines += [f"### {c.name}", f"Severity: {c.severity}"]
+                if c.applies_to:
+                    lines.append(f"Applies to: {', '.join(c.applies_to)}")
+                lines.append("")
+                if c.precondition.strip():
+                    lines += [
+                        f"PRECONDITION (this rule applies ONLY if this holds): "
+                        f"{c.precondition.strip()}",
+                        "",
+                    ]
+                lines += [c.description.strip(), ""]
+                if c.rationale.strip():
+                    lines += [f"Rationale: {c.rationale.strip()}", ""]
+                if c.fix.strip():
+                    lines += ["The fix:", "```", c.fix.strip(), "```", ""]
             parts.append("\n".join(lines))
 
         # 2. Patterns
@@ -203,7 +231,9 @@ class KnowledgeBase:
             for entry in entries:
                 lines += [f"\n## {entry.name}"]
                 if entry.precondition.strip():
-                    lines.append(f"PRECONDITION (apply ONLY if this holds): {entry.precondition.strip()}")
+                    lines.append(
+                        f"PRECONDITION (apply ONLY if this holds): {entry.precondition.strip()}"
+                    )
                 lines += [
                     f"Description: {entry.description}",
                     f"Rationale: {entry.rationale.strip()}",
@@ -301,7 +331,7 @@ def load_knowledge_base(
         return kb
 
     for yf in yaml_files:
-        _load_yaml_file(kb, yf)
+        _load_yaml_file(kb, yf, dsl=dsl)
 
     for examples_dir in _collect_examples_dirs(kp, dsl, device_type):
         _load_examples(kb, examples_dir)
@@ -359,7 +389,7 @@ def _collect_examples_dirs(kp: Path, dsl: str, device_type: str) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
-def _load_yaml_file(kb: KnowledgeBase, path: Path) -> None:
+def _load_yaml_file(kb: KnowledgeBase, path: Path, dsl: str = "") -> None:
     try:
         with open(path) as f:
             data = yaml.safe_load(f)
@@ -368,6 +398,10 @@ def _load_yaml_file(kb: KnowledgeBase, path: Path) -> None:
         return
 
     if not data or not isinstance(data, dict):
+        return
+
+    if not _file_applies_to_dsl(data, dsl):
+        logger.debug("Skipping %s: not applicable to dsl=%s", path.name, dsl)
         return
 
     fname = path.name
@@ -394,20 +428,94 @@ def _load_yaml_file(kb: KnowledgeBase, path: Path) -> None:
             )
 
 
+def _file_applies_to_dsl(data: dict, dsl: str) -> bool:
+    """Whether a KB file's contents apply to *dsl*.
+
+    A file may scope itself with a top-level ``dsl:`` (a name or list of names) or
+    exclude specific DSLs with ``excludes_dsl:``. Files that declare neither apply
+    everywhere, which is every pre-existing file — so this is opt-in and cannot
+    change what an unannotated file contributes.
+
+    This exists because ``knowledge_base/common/`` is shared by all DSLs but its
+    content is Python-hosted (PyTorch ``.to("xpu")`` device moves, ``nn.Module``
+    wrappers). Those rules are meaningless in an MLIR module and were being
+    injected into every MLIR stage prompt.
+    """
+    if not dsl:
+        return True
+
+    def _names(key: str) -> set[str]:
+        raw = data.get(key)
+        if raw is None:
+            return set()
+        if isinstance(raw, str):
+            raw = [raw]
+        return {str(n).strip().lower() for n in raw}
+
+    excluded = _names("excludes_dsl")
+    if dsl.lower() in excluded:
+        return False
+    allowed = _names("dsl") or _names("language")
+    return not allowed or dsl.lower() in allowed
+
+
 def _parse_constraint(data: dict, source: str) -> KnowledgeConstraint | None:
     try:
         cid = data.get("id", "")
-        stages = _infer_constraint_stages(cid)
+        stages = _declared_constraint_stages(data, cid, source)
+        declared = stages is not None
+        if stages is None:
+            # No usable declaration — fall back to inferring from the id, which is
+            # how every pre-existing constraint (all of which declare nothing) is
+            # routed. Note this yields [] for most ids, meaning "all stages".
+            stages = _infer_constraint_stages(cid)
         return KnowledgeConstraint(
             id=cid,
             name=data.get("name", cid),
             description=data.get("description", ""),
             severity=data.get("severity", "critical"),
             stages=stages,
+            precondition=data.get("precondition", ""),
+            rationale=data.get("rationale", ""),
+            fix=data.get("fix", ""),
+            applies_to=data.get("applies_to", []),
+            stages_declared=declared,
         )
     except Exception as exc:
         logger.debug("Failed to parse constraint in %s: %s", source, exc)
         return None
+
+
+def _declared_constraint_stages(
+    data: dict, cid: str, source: str
+) -> list[OptimizationStage] | None:
+    """Stages a constraint explicitly declares via ``stage:`` / ``stages:``.
+
+    Returns None when nothing is declared, so the caller falls back to inferring
+    from the id. A declaration of ``all`` (or ``[]``) means "every stage", which
+    is also what an empty stage list means downstream.
+    """
+    raw = data.get("stages", data.get("stage"))
+    if raw is None:
+        return None
+    names = [raw] if isinstance(raw, str) else list(raw)
+    stages: list[OptimizationStage] = []
+    for n in names:
+        if not isinstance(n, str):
+            continue
+        if n.strip().lower() in ("all", "any", "*"):
+            return []  # applies everywhere
+        stage = _normalize_stage(n)
+        if stage is None:
+            logger.warning(
+                "Constraint %s in %s declares unknown stage %r — ignoring it", cid, source, n
+            )
+            continue
+        if stage not in stages:
+            stages.append(stage)
+    # An all-unknown declaration is not a deliberate "everywhere"; let the caller
+    # fall back to id inference rather than silently broadcasting.
+    return stages or None
 
 
 def _infer_constraint_stages(cid: str) -> list[OptimizationStage]:

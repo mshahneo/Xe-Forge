@@ -6,6 +6,10 @@
 #
 # Triton-specific algorithmic patterns are in knowledge_base/triton/xpu/algorithmic_patterns.yaml
 
+# NOTE: this file is host-Python (PyTorch / KernelBench wrapper) knowledge. It is
+# shared by the Python-hosted DSLs but is meaningless inside a standalone MLIR
+# module, so it is excluded from the mlir views (see loader._file_applies_to_dsl).
+excludes_dsl: [mlir]
 patterns:
 - id: weight_statistic_precomputation
   name: Precompute weight-derived statistics once in __init__, not every forward()
