@@ -1,0 +1,147 @@
+{
+ "gluon/xpu": {
+  "constraints": 8,
+  "examples": 0,
+  "patterns": 6,
+  "stage_context_sha256": {
+   "algorithmic": "ae7e9f049695b0d3dfc92b9cfe8f2f8b271d31a75c1cdc212c488d1367d0bcef",
+   "analysis": "21273c9d57f47ebc9918079745ed4326701fd7fe58179000deec4efcd03eae82",
+   "autotuning": "72927e56e677acf69b31c441895555592b16f8d0f275b426d18e6ce8fac34610",
+   "block_pointers": "e9c4bab5f5e4bb823c8cee1d029ef1181b26d20b70e7f6f6998626e88a5d9ada",
+   "device_specific": "d86318c3645518801093cd51aa238e0c01b1ec93b4ecbda65371cebaa343eacb",
+   "discovery": "e857e709ab0434d44f70ef595d0afa8d5379219e5ce1a357ad67fc48f4c8d359",
+   "dtype_fix": "eeacb63e2b9e03e87d07a4e7e4db887e789dedf3778d2e8423dbd84e0b1a343e",
+   "fusion": "0bd1b887878b7f87b604f232fc904a9849b6a7c9a9ebe8d735c11d138b0c03e1",
+   "linalg_lowering": "ae60641addffd0184c89bfa62d6b0e3a6f60c156d84b0103c1294ab8ba9cb1a8",
+   "memory_access": "c945d28d798adaf294ff1db6349178328d7819357d06376223e34a748ab95dae",
+   "persistent_kernel": "cf4fe3986fb782ed42d32e6b0d6d3a95404c7249f64845a2cab5b2ac84e7a815"
+  },
+  "stage_pattern_counts": {
+   "algorithmic": 2,
+   "device_specific": 1,
+   "dtype_fix": 1,
+   "fusion": 1,
+   "memory_access": 1
+  }
+ },
+ "mlir/linalg": {
+  "constraints": 22,
+  "examples": 0,
+  "patterns": 8,
+  "stage_context_sha256": {
+   "algorithmic": "4401be84c0ccdb77c39ef5793655892dd020acf2e7d4eaf969a205b9c38b176d",
+   "analysis": "082ce4b7a816ac84ff0b2249359fcd3c509f8f1c7230a87fbeaa83d576f0738c",
+   "autotuning": "7d7cce9e9e7a2f21df7f23ab046dd7f3575f0513d08b53b8d02064d8ea1dc5df",
+   "block_pointers": "6e04c87910ee3bf521b74b1171c330ecd991434a664d54e4217e10452b8bb72f",
+   "device_specific": "07919b7a707fc6aaf1791f948bcf8eadf7972c86ccd3f4feb8893f3ea1ea3567",
+   "discovery": "021fbc9a15cc876794465640e012fc2af19e73aa4c9f6dc7d7e6475704fe7c3f",
+   "dtype_fix": "03ecb27380ec8a0610d3a6284016240890eb5b04092061042bf4cf017170a838",
+   "fusion": "eebce2ca6b89ac4b48944d9be384bc4ab9c9b3138e8f45e180a3d23103480fe7",
+   "linalg_lowering": "370fc679edbff516cdc42e088fe5d71cfe74a69148f29a0853819cefd9196ebc",
+   "memory_access": "41d89c03a698b1c48a060b35af43e67d7b3e1045c367a37a429f55eef9b0de2f",
+   "persistent_kernel": "9634722b92ee6cf0ca69c09d961475ad1588efe7c95d81c0594877fe79da2212"
+  },
+  "stage_pattern_counts": {
+   "algorithmic": 2,
+   "device_specific": 6
+  }
+ },
+ "mlir/xpu": {
+  "constraints": 22,
+  "examples": 0,
+  "patterns": 19,
+  "stage_context_sha256": {
+   "algorithmic": "c8d348f01129143051ab21d5823bd9dbc98b0a41b514ab94c5cfeec9955aa388",
+   "analysis": "818d0052f8d6c5512b622425ba5f1257fb35e4c6f1265e1e7356e665a19966ec",
+   "autotuning": "bf61f1d2f50f0268b4932605958ab95ddd6188e6120a87d7981779359b2c5e48",
+   "block_pointers": "5f187b2925291721c02fada826b81be50e043e6e30f826be04a8e682255a5c65",
+   "device_specific": "e6c3aadf9a2a44519bd6cd01b597572c39bd380b81631650798d5ba9e71d0fbf",
+   "discovery": "085b6bc6f6fe0468aedd7820515de6b51c9be35b5497ddb09321af16a3857c77",
+   "dtype_fix": "aa48a7715caa308013107dc352e38b7b81a3be4c5a0a9a633a5aeecf06f13224",
+   "fusion": "fcf46d54881440449444a50a62dbdcc1c44a6e7f7b4f3c82c335966f8902307b",
+   "linalg_lowering": "22170b0fe9aafadb10d49f663e2166d7e644868450bf21e1153f6d0daae92330",
+   "memory_access": "6329c2285b557da9314f066268138ed384cc765a03d96bafc53a29815e5cc2eb",
+   "persistent_kernel": "4b9ebf9b6ad6838b9a8b8c6b51db79021d0ba60dddefe8eef6627d250b9e14ee"
+  },
+  "stage_pattern_counts": {
+   "algorithmic": 4,
+   "device_specific": 6,
+   "dtype_fix": 2,
+   "memory_access": 7
+  }
+ },
+ "sycl/xpu": {
+  "constraints": 16,
+  "examples": 0,
+  "patterns": 36,
+  "stage_context_sha256": {
+   "algorithmic": "cb04d656986b2a2a8ace669f4d77140c59eac7adf5d3d4b5ae9149543024c9e4",
+   "analysis": "352826a7f129a21790adf1274752df95b64edc7be63121bc16db23ef314f057c",
+   "autotuning": "dd21ea62dbc7fb60f1b1f42cd2b3d621d2d228548b5087a83b4b4ff2b70c0e4d",
+   "block_pointers": "effedfc51a9468687ae864247ad99cb3dd3490b28c15c00a1a22465d921d8958",
+   "device_specific": "b6cd2c26d9323954b8b90f14a9de0f50e0aa8009741ef12be280913ceb52a13f",
+   "discovery": "94ea1f1ebe22e950eb43e2c042ff10e54dc545318ff1d835d9d00062acfe81e6",
+   "dtype_fix": "de28e34de222aa81141fa92c642ac15d2ea5d8bfa5bbc9f8336abb38c001a12b",
+   "fusion": "08c4e4dae594f7c0da5fb5c4169afeb34de884b7db805fa39c05ab05e2152cfd",
+   "linalg_lowering": "0570485c11142a856b9c456eff3311dc42339f6925a8e3c556447eb46508f0c2",
+   "memory_access": "e2aa5e79b2214342202299cb85763a52a1239e100c6af281eabe9fb0de48b133",
+   "persistent_kernel": "27c39aea24012d65c2028be60c3fe1bcd41408fd68e3e5d621378f91a74e0f45"
+  },
+  "stage_pattern_counts": {
+   "algorithmic": 3,
+   "device_specific": 15,
+   "dtype_fix": 1,
+   "fusion": 12,
+   "memory_access": 5
+  }
+ },
+ "triton/cuda": {
+  "constraints": 5,
+  "examples": 0,
+  "patterns": 2,
+  "stage_context_sha256": {
+   "algorithmic": "03e52e2c06ab3e467a5c7e3498eff62ac2fbd9c49c060993972941fc7968dcb2",
+   "analysis": "f494a24a7e26a05628209a5880cac1a8795ea523a89971de4cb700ff398dbc8b",
+   "autotuning": "83c9063d76a8aa0bf5fbcae2317a914781d477f81f4c205fbdca268f255aeebc",
+   "block_pointers": "ad572019e118b3e153fc73b5d4279734809cbf854b62e31f10b249a6a5253556",
+   "device_specific": "ea26d4a168b83bbbce8540d34febecbaf54cae2ad74d3c2c1a6d628526d9140c",
+   "discovery": "cbc9ca75460cdee2406f305c3099b8ee717cc9389974ee6f482382df869595bf",
+   "dtype_fix": "ed4dbb0f49ec994855203b25fe0a23b5413f5e3b0a6478e03981088369cb3a04",
+   "fusion": "1b3474ca73083bf46390cac31eb689315aba62e97202cd72c766a66c08c57f5f",
+   "linalg_lowering": "7303abb55462e4341de67460ab184c85652d67aaac8eba580a587f442c06956d",
+   "memory_access": "ceb7d08e88eb1a00bae2996613c84eab1378229e5c653113ce5b200c34921566",
+   "persistent_kernel": "13434ac061b6e531227a1e2c253960195d583d6db5b5b8f893d76e093e0b0018"
+  },
+  "stage_pattern_counts": {
+   "algorithmic": 2
+  }
+ },
+ "triton/xpu": {
+  "constraints": 35,
+  "examples": 15,
+  "patterns": 88,
+  "stage_context_sha256": {
+   "algorithmic": "71ef22a2ef0b40196ee6abf9232e1a7848a537fe47a8925b4cb24b5d67583cbf",
+   "analysis": "833c7b182006db5f8adc2ac85e1b97782a95450dfacf826549d2894665ff372c",
+   "autotuning": "6c64af1cd25990328424a9e5119b76a64d5bc4d793cfb306220c2c344020e61e",
+   "block_pointers": "504e10483880cf060d321331245fdd50ca5533d2385891b7807bac1793eb88eb",
+   "device_specific": "caa4d3c69f495362fd1f6a05a0e596e38f4a41dab3a4e28464acb55da29b8226",
+   "discovery": "32b6d6ed1e2e69d3673f3b3183960c8ab149f80455aaf76f52a1fcd9860fb62b",
+   "dtype_fix": "69722ed200d462d1fac06488378a25eb6c7c2087ed2fa390e3a61e5905e2a936",
+   "fusion": "37c4d278b3f32c14922aa216e481c6bd6fb961efc01f5bfc915525dd33c183a9",
+   "linalg_lowering": "ad279585483d9cfe21e77089c56935ed317fc6ec053c0d7c4f59028d78054060",
+   "memory_access": "83ebff21bdff21f03bba43a81aa1b54d7590b2421a3ee298b0fff05e0fe7a037",
+   "persistent_kernel": "f3df794bf38bac9d736a752342de79d135706f04c9bc0220c6991fe8702cb0dd"
+  },
+  "stage_pattern_counts": {
+   "algorithmic": 6,
+   "autotuning": 6,
+   "block_pointers": 2,
+   "device_specific": 29,
+   "dtype_fix": 3,
+   "fusion": 12,
+   "memory_access": 24,
+   "persistent_kernel": 6
+  }
+ }
+}
