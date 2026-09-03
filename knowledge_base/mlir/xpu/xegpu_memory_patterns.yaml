@@ -30,6 +30,187 @@ constraints:
       memory and sized to the hardware block-load width. Mismatched sg_data /
       order forces gathered or strided loads that waste bandwidth.
 
+  - id: xegpu_2d_block_alignment
+    name: 2D-block load/prefetch fast path needs stride-1 inner dim + OWord-aligned pitch
+    severity: high
+    stage: device_specific
+    description: |
+      The fast hardware 2D-block read/prefetch behind xegpu.load_nd /
+      xegpu.prefetch_nd is only taken when the descriptor's memory meets
+      alignment/contiguity preconditions. Distilled from Intel's
+      MaterializeBlockPointer (satisfies2DBlockReadAlignment): the fast-changing
+      (inner) dimension must be stride-1 contiguous; the OTHER stride (the pitch)
+      must be a multiple of 128 bits = one OWord (i.e. a multiple of
+      ceil(128/elem_bits) elements); the base pointer must be 4-byte aligned; and
+      the surface pitch 16-byte aligned. Tiling that produces a pitch which breaks
+      16-byte alignment silently falls off the fast path to a slow gather. Also
+      AVOID the 2D-block path for a transposed row-major first (A) dot operand and
+      for column-major fp8 — both are measured regressions on Intel HW.
+      Practical rule for the LLM: keep create_nd_tdesc shapes/strides so the inner
+      dim is unit-stride and the leading (row) stride is a multiple of 16 bytes;
+      do NOT choose sg_data/tile widths that make the row stride non-16B-aligned.
+
+  - id: xegpu_bmg_b580_2d_block_message_limits
+    name: "BMG B580 2D-block message limits: 64-byte max width; load up to 32 rows, prefetch up to 8 rows"
+    severity: high
+    stage: device_specific
+    description: |
+      Hardware limits of the Intel Xe2 BMG B580 2D-block load/prefetch engine that
+      bound the inst_data (per-hardware-message block) of xegpu.load_nd and
+      xegpu.prefetch_nd. Choose inst_data so each message fits these caps; an
+      inst_data larger than a cap is legal but the compiler SPLITS it into multiple
+      hardware messages (more send traffic), so oversizing prefetch rows in
+      particular is wasteful.
+        * WIDTH (inner / fastest dim): max 64 BYTES per row per message. For f16
+          (2 B) that is 32 elements -> inst_data inner dim <= 32; for f32 (4 B) it is
+          16 elements -> inner dim <= 16; for i8 (1 B), 64.
+        * ROWS (outer dim) PER MESSAGE differ by op:
+            - LOAD (xegpu.load_nd):     up to 32 rows per message.
+            - PREFETCH (xegpu.prefetch_nd): up to 8 rows per message.
+      So for f16, inst_data = [16, 32] is a safe, well-formed block for BOTH load and
+      prefetch (16 rows x 32 cols = 64 B wide). load can go up to [32, 32] in one
+      message; a prefetch inst_data with > 8 rows (e.g. [16,32] or [32,16]) is split
+      into ceil(rows/8) messages. Keep the WIDTH <= 64 B for either op — exceeding it
+      falls off the single-message fast path. This caps how wide/tall the per-role
+      layouts (xegpu_distinct_layout_per_access_role) may set inst_data on B580.
+    scope: sku_specific
+
+  - id: xegpu_widen_load_inst_data_in_pairs
+    name: Widening load inst_data pays only when BOTH DPAS operands are widened together — one-sided widening REGRESSES
+    severity: high
+    stage: memory_access
+    description: |
+      xegpu_distinct_layout_per_access_role says the LOAD role wants the widest
+      2D-block message. That is right, but it is NOT a per-load decision you can
+      apply greedily to one operand at a time. inst_data is simultaneously the
+      hardware message shape AND the register block the DPAS consumes. Widen the
+      load feeding operand A but not operand B and the mismatch inserts a relayout
+      that costs MORE than the load messages you saved, so a correct, legal, wider
+      load measures SLOWER in isolation.
+      Measured on BMG B580, 4k flash attention (median-of-100, large-GRF, all
+      ALLCLOSE TRUE), starting from an f16 kernel at 1.4119 ms:
+        * K/V inst_data [16,16] -> [32,32] ALONE      -> 1.5888 ms (0.888x, WORSE)
+        * Q   inst_data [8,16]  -> [16,32] ALONE      -> 1.3957 ms (1.012x, ~noise)
+        * BOTH widened together                       -> 1.1410 ms (1.237x)
+      The pair is worth 1.237x; each half alone is worthless or harmful. So:
+      propose an inst_data widening as ONE atomic edit covering every load that
+      feeds the same DPAS chain, and never accept/reject the direction on a
+      one-sided measurement.
+      SECOND governor — it is not monotone in kernel structure. Applied on top of
+      an f32 accumulator (xegpu_fp32_accumulator_required) the SAME widening turns
+      negative again: 1.0352 -> 1.0759 ms (0.962x), because the f32 acc is
+      ~32 KB/WG and the wider live load blocks now compete for GRF that the
+      accumulator needs (see xegpu_sink_large_load_to_dpas,
+      xegpu_grf_budget_loop_accumulators). Wide loads trade message count against
+      register pressure; re-measure after any dtype or accumulator change rather
+      than carrying a previous verdict forward.
+      Do NOT port a wide layout across layout IDIOMS to get there: a hand-tuned
+      reference whose layouts live in the !xegpu.tensor_desc TYPE can use
+      sg_layout=[1,1] sg_data=[64,64]; transplanting that onto a kernel whose
+      layouts are op ATTRIBUTES measured 1.6488 ms (0.856x) and first failed to
+      lower outright (XeGPUPropagateLayout asserts the DPAS B operand needs an
+      anchor layout carrying inst_data).
+
+  - id: xegpu_prefetch_depth_is_tunable
+    name: Prefetch depth is a tunable, not a free win — suppress it on compute-bound loops
+    severity: warning
+    stage: device_specific
+    description: |
+      A prefetch is NOT always beneficial, and there is no automatic cost model
+      that decides for you. Intel's production software pipeliner
+      (TritonIntelGPU tritonintelgpu-pipeline) exposes prefetch depth ONLY as a
+      manual `num-stages` knob (frontend default 2 = one iteration ahead; pass
+      default 3 = two ahead) and DISABLES prefetch entirely at num-stages<=1. It
+      relies on the autotuner to dial depth down for kernels where prefetch does
+      not pay. Encode that judgement here:
+        * COMPUTE-BOUND loops (DPAS/matmul-dominated, or where DPAS throughput
+          already hides global-load latency — e.g. flash-attention QK/PV) should
+          use depth 0-1. Deeper prefetch just adds live tiles and REGRESSES
+          (observed: prefetch measured SLOWER on the FA_wg kernel; the DPAS array,
+          not memory, is the bottleneck).
+          This holds even AFTER the loop has been optimized, which is the natural
+          objection ("compute got cheaper, so latency must now be exposed").
+          Measured on BMG B580, 4k FA at 1.6679 ms (exp-quotient fold + cached
+          hints + fastmath already applied, i.e. compute already 2.2x cheaper than
+          the naive kernel), K+V prefetch on the live descriptors with the CORRECT
+          cooperative-disjoint layout (sg_layout=[2,4] sg_data=[32,16]):
+            depth 1 -> 1.7317 ms (0.963x)   depth 2 -> 1.7367 ms (0.962x)
+            depth 3 -> 1.7419 ms (0.958x)
+          Flat in depth and uniformly negative. The same kernel with the REPLICATED
+          compute layout on prefetch measures 2.0351 ms (0.819x), so getting the
+          layout right (xegpu_dedicated_prefetch_layout) is worth 1.175x of pure
+          overhead removal — but it only removes overhead, it never turns prefetch
+          into a win here. The K/V tiles are already L2-resident because all 32
+          y-blocks of a head re-read the same K/V; there is no exposed DRAM latency
+          left to hide. DO NOT re-litigate prefetch on flash attention: spend
+          memory_access iterations on cache hints and on shortening live ranges.
+        * MEMORY-LATENCY-BOUND loops that stream large contiguous A/B tiles over
+          many (>=3-4) iterations are where deeper prefetch (see
+          xegpu_multibuffer_prefetch_pipeline) actually helps.
+        * SMALL / SHORT-RUNTIME kernels (total kernel time < ~50us, e.g. a
+          1024x512 softmax at ~30us) are dominated by run-to-run timing noise: a
+          correct prefetch can measure 1.5x on one sample and 0.7x on the next.
+          Do NOT trust a marginal prefetch win here — require a stable median
+          across repeats (the verifier now measures median-of-N), and prefer to
+          leave prefetch off unless the median clears the noise band decisively.
+      Detection trigger: when a memory_access prefetch is proposed on a loop that
+      is compute-bound or whose measured runtime is below the noise floor, surface
+      this as a warning so the optimizer down-weights / skips it.
+
+  - id: xegpu_sink_large_load_to_dpas
+    name: Do not hoist a large (>~32KB) operand load far from its DPAS — keep its live range short
+    severity: warning
+    stage: device_specific
+    description: |
+      Counter-rule to xegpu_hoist_invariant_loads. A large 2-D operand kept live
+      across a long span occupies GRF for that whole span, cutting occupancy and
+      risking spills. Intel's ReduceVariableLiveness moves/clones such a load down
+      next to its DPAS consumer when the block's live-in tensor bytes exceed
+      ~32 KB AND the tensor is large (>= 128x128 x 2B = 32 KB, minor dim >= 128).
+      So: hoisting loop-invariant address math and SMALL descriptors out of the
+      loop is good (xegpu_hoist_invariant_loads), but do NOT hoist a LARGE
+      xegpu.load_nd (>~32 KB of live registers) far above the xegpu.dpas that
+      consumes it — keep or duplicate the load adjacent to the DPAS to shorten its
+      register live range. This GRF-pressure governor bounds how aggressive
+      hoisting and prefetch depth may be (see xegpu_grf_budget_loop_accumulators,
+      xegpu_prefetch_depth_is_tunable).
+
+  - id: xegpu_distinct_layout_per_access_role
+    name: Pick #xegpu.layout independently for compute (DPAS), prefetch, and load — reusing one role's layout for another usually regresses
+    severity: high
+    stage: memory_access
+    description: |
+      Every xegpu access (dpas operand, load_nd, prefetch_nd) carries a
+      #xegpu.layout (sg_layout / sg_data / inst_data) that decides how the 2D tile is
+      distributed across the workgroup's subgroups. The OPTIMAL distribution is
+      DIFFERENT for each access role. Xe-Forge should treat these as THREE separate
+      layout decisions and search a role-specific layout for each, rather than
+      copy-pasting one layout onto all of them (the common, lazy mistake). In most
+      kernels the three want genuinely different layouts:
+        * COMPUTE (xegpu.dpas operands): sg_data / inst_data must match the DPAS
+          register shape (BMG DPAS [8,16]/[16,16]) so operands feed the systolic
+          array with NO relayout. This layout is dictated by the DPAS, not by memory.
+        * LOAD (xegpu.load_nd that feeds a DPAS): wants the WIDEST contiguous 2D-block
+          message that still lands in the DPAS register shape (e.g. inst_data=[16,32]
+          or [32,32]) — fewer, wider load messages, then a cheap in-register reshape.
+        * PREFETCH (xegpu.prefetch_nd): its ONLY job is to pull the tile into
+          L1/L2/L3 once; it never feeds a register. The right layout is a DEDICATED,
+          WIDE, COOPERATIVE-DISJOINT spread where the subgroups TOGETHER cover the
+          tile exactly once, i.e. sg_layout .* sg_data == tile shape.
+      Concrete failure this prevents (measured on BMG, 64x64 f16 K/V tile, median-of-3):
+      reusing the COMPUTE layout sg_layout=[8,1] sg_data=[64,64] on the prefetch makes
+      each of the 8 subgroups prefetch the FULL 64x64 tile -> 8x redundant prefetch
+      traffic + cache thrash -> 0.85x (a 1.17x SLOWDOWN). Switching ONLY that prefetch
+      to a dedicated wide sg_layout=[2,4] sg_data=[32,16] (2*32 x 4*16 == 64x64, every
+      byte fetched exactly once) removes the redundancy -> 1.02x break-even, and 1.20x
+      faster than the compute-layout prefetch. Nothing else in the kernel changed.
+      Detection trigger: when a prefetch_nd or a load_nd carries the SAME
+      #xegpu.layout as a dpas operand (or when all three roles share one layout),
+      surface this so the optimizer proposes a role-specific layout. See
+      xegpu_multibuffer_prefetch_pipeline (dedicated wide prefetch layout) and
+      xegpu_fold_transpose_into_nd_tdesc (load-orientation layout) for the concrete
+      per-role forms; xegpu_dedicated_prefetch_layout below is the direct fix.
+
 patterns:
   - id: xegpu_add_prefetch_nd
     name: Prefetch operand tiles ahead of the K-loop with cache hints
@@ -78,6 +259,44 @@ patterns:
     expected_speedup: "1.3-2x on memory-bound GEMM / attention"
     applies_to: ["gemm", "matmul", "flash_attention"]
 
+  - id: xegpu_dedicated_prefetch_layout
+    name: Give prefetch_nd its own cooperative-disjoint wide layout, not the DPAS/load layout
+    stage: memory_access
+    precondition: |
+      APPLIES when a xegpu.prefetch_nd carries the SAME #xegpu.layout as the DPAS
+      operand or the load_nd it shadows (a common LLM mistake: copy the compute/load
+      layout onto the prefetch). Requires the kernel already in load_nd / prefetch_nd
+      block form. This is the memory_access-stage instance of the general rule
+      xegpu_distinct_layout_per_access_role.
+    description: |
+      Replace the reused compute/load layout on prefetch_nd with a DEDICATED layout
+      whose sg_layout .* sg_data EQUALS the prefetched tile shape, so the workgroup's
+      subgroups partition the tile disjointly and fetch every byte exactly once. A
+      compute layout that assigns each subgroup the FULL tile (sg_data == tile shape)
+      makes every subgroup redundantly prefetch the whole tile — multiplying prefetch
+      traffic by the subgroup count. The prefetch layout is chosen for cache coverage,
+      NOT to match any register/DPAS shape.
+    rationale: |
+      Prefetch only needs the tile resident in cache; the cheapest way is one
+      cooperative pass across the subgroups. Reusing the DPAS/load layout
+      (sg_data == full tile) multiplies prefetch traffic by the subgroup count and
+      thrashes the cache — a measured 1.17x slowdown that a dedicated wide layout
+      turns back into a break-even / positive result.
+    pattern_before: |
+      // WRONG: prefetch reuses the compute/load layout -> each of the 8 SGs fetches the whole 64x64 tile (8x traffic)
+      xegpu.prefetch_nd %k_pf[%off, %c0]
+        <{layout = #xegpu.layout<sg_layout = [8, 1], sg_data = [64, 64], inst_data = [16, 16]>,
+          l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>}>
+        : !xegpu.tensor_desc<64x64xf16, #xegpu.block_tdesc_attr<boundary_check = false>>
+    pattern_after: |
+      // RIGHT: dedicated wide layout -> 8 SGs cover 64x64 disjointly (2*32 x 4*16 == 64x64), each byte once
+      xegpu.prefetch_nd %k_pf[%off, %c0]
+        <{layout = #xegpu.layout<sg_layout = [2, 4], sg_data = [32, 16], inst_data = [32, 16]>,
+          l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>}>
+        : !xegpu.tensor_desc<64x64xf16, #xegpu.block_tdesc_attr<boundary_check = false>>
+    expected_speedup: "removes an 8x-redundant-prefetch regression: ~1.2x vs a compute-layout prefetch (0.85x -> 1.02x on a BMG 64x64 K/V tile)"
+    applies_to: ["flash_attention", "gemm", "matmul", "softmax"]
+
   - id: xegpu_cache_hint_on_load
     name: Add cached l1/l2/l3 hints to load_nd of reused operands
     stage: memory_access
@@ -119,3 +338,71 @@ patterns:
       }
     expected_speedup: "1.05-1.2x"
     applies_to: ["gemm", "matmul", "flash_attention"]
+
+  - id: xegpu_fold_transpose_into_nd_tdesc
+    name: Fold a transpose into the 2D block load (stride/shape swap) instead of materializing it
+    stage: memory_access
+    precondition: |
+      APPLIES when a DPAS operand (typically the B operand, e.g. K in QK^T) is
+      produced by transposing a freshly loaded tile — i.e. the IR does
+      xegpu.load_nd -> vector.transpose -> (feed dpas). Requires the source to be a
+      2-D block tensor_desc (create_nd_tdesc) whose transposed view still satisfies
+      the 2D-block alignment preconditions (see xegpu_2d_block_alignment). Do NOT
+      apply if the tile is already loaded in the orientation DPAS wants, or if the
+      in-register slice-and-transpose form is deliberately used for register
+      budget (that is the DISTINCT xegpu_kslice_transpose_dpas pattern — which
+      slices K for DPAS packing; THIS pattern eliminates a standalone transpose op
+      via a descriptor stride swap).
+    description: |
+      Never materialize dot(a, trans(load(ptr))) as a separate vector.transpose on
+      loaded registers. Bake the transpose into the descriptor: create the
+      xegpu.create_nd_tdesc over the TRANSPOSED view of the operand (swap the two
+      shape entries and the two stride entries) and use xegpu.load_nd's transpose
+      capability so the hardware 2D block read performs the transpose for free. The
+      standalone vector.transpose (and its register traffic) disappears. Distilled
+      from Intel's OptimizeDotOperands / FuseTransWithLoad (it rebuilds
+      make_tensor_ptr with reversed shape/strides and flips row_major<->col_major).
+    rationale: |
+      A transpose materialized in registers costs shuffles/copies and extra live
+      state; the 2D block engine can read the transposed layout directly, so the
+      transpose becomes a descriptor attribute rather than executed arithmetic.
+    pattern_before: |
+      %kt = xegpu.load_nd %k_tile[%off, %c0] : !xegpu.tensor_desc<16x64xf16, #k> -> vector<16x64xf16>
+      %k  = vector.transpose %kt, [1, 0] : vector<16x64xf16> to vector<64x16xf16>
+      %qk = xegpu.dpas %q, %k, %acc : vector<128x64xf16>, vector<64x16xf16>, vector<128x16xf32> -> vector<128x16xf32>
+    pattern_after: |
+      // descriptor over the transposed view: shape/strides swapped, transpose on load_nd
+      %k_tile_t = xegpu.create_nd_tdesc %K_ptr, shape: [%D, %N], strides: [%c1, %N] : i64 -> !xegpu.tensor_desc<64x16xf16, #kt>
+      %k  = xegpu.load_nd %k_tile_t[%c0, %off] <{transpose = array<i64: 1, 0>}> : !xegpu.tensor_desc<64x16xf16, #kt> -> vector<64x16xf16>
+      %qk = xegpu.dpas %q, %k, %acc : vector<128x64xf16>, vector<64x16xf16>, vector<128x16xf32> -> vector<128x16xf32>
+    expected_speedup: "1.1-1.3x when a B-operand transpose is on the hot path"
+    applies_to: ["gemm", "matmul", "flash_attention"]
+
+  - id: xegpu_store_nd_contiguous_128b
+    name: Coalesce store_nd so each lane writes a contiguous <=128-bit chunk on the stride-1 axis
+    stage: memory_access
+    precondition: |
+      APPLIES to the epilogue xegpu.store_nd (or any global store) of a WG kernel.
+      Do NOT apply to reshape the compute layout of DPAS operands — this is about
+      the STORE's per-lane access width and axis only.
+    description: |
+      Derive the store's access order from pointer contiguity and place the
+      contiguous (stride-1) dimension as the vectorized per-thread dimension, so
+      the warp-level write has no gaps. Cap each lane's store at 128 bits (the
+      widest vector store) along that contiguous axis. Distilled from Intel's
+      Coalesce pass, which enforces a 128-bit / no-gap rule specifically for
+      non-load (store) ops (loads tolerate wider strided access because L1 hides
+      the gaps; stores do not). Align sg_data to the contiguous axis so the store
+      tile is dense.
+    rationale: |
+      A strided/gapped store issues multiple partial-cacheline writes per warp,
+      wasting write bandwidth; a contiguous <=128-bit-per-lane store fills whole
+      cachelines with one message.
+    pattern_before: |
+      // sg_data / layout puts the strided (non-unit) dim as the per-lane vector dim -> gapped store
+      xegpu.store_nd %out, %o_tile[%row, %col] <{layout = #xegpu.layout<sg_layout=[1,8], sg_data=[64,2]>}> : vector<64x16xf32>, !xegpu.tensor_desc<64x16xf32, #o>
+    pattern_after: |
+      // contiguous inner dim (stride 1) is the per-lane vector dim, <=128-bit chunk
+      xegpu.store_nd %out, %o_tile[%row, %col] <{layout = #xegpu.layout<sg_layout=[8,1], sg_data=[8,16]>}> : vector<64x16xf32>, !xegpu.tensor_desc<64x16xf32, #o>
+    expected_speedup: "1.05-1.3x on store-bandwidth-bound kernels (elementwise / softmax epilogues)"
+    applies_to: ["softmax", "elementwise", "gemm", "flash_attention"]

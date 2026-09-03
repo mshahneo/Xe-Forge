@@ -36,7 +36,7 @@ constraints:
       fails to lower.
 
   - id: xegpu_fp32_accumulator_required
-    name: Use f32 accumulator for f16/bf16 DPAS
+    name: Use f32 accumulator for f16/bf16 DPAS — it is a large PERFORMANCE win, not only a precision rule
     severity: critical
     description: |
       xegpu.dpas with f16/bf16 operands must accumulate into an f32 vector
@@ -44,12 +44,66 @@ constraints:
       and typically breaks the [ALLCLOSE] check. Only down-cast to f16/bf16 in
       the epilogue store if the reference allows it.
 
+      DO NOT treat this as a correctness-only rule that can be skipped when
+      [ALLCLOSE] happens to pass. A harness that fills inputs with a uniform
+      magic constant makes softmax exact, so an f16 accumulator can pass ALLCLOSE
+      while still being much SLOWER. f16xf16->f32 is the NATIVE DPAS form: an f16
+      C/D operand forces conversion traffic around every DPAS in the loop, and
+      f16 `vector.multi_reduction` / `math.exp` on a vector<128x64xf16> lower
+      worse than their f32 forms.
+      Measured on BMG B580, 4k flash attention (median-of-100, large-GRF, both
+      ALLCLOSE TRUE): all-f16 loop 1.4119 ms -> f32 acc + f32 softmax with
+      `arith.truncf` of P to f16 only for the PV DPAS **1.0352 ms = 1.364x
+      faster** (4 runs, 0.8% spread), which also BEAT a hand-tuned reference
+      kernel at 1.0948 ms. So the f32 accumulator was simultaneously the single
+      largest perf lever and the more accurate choice.
+      Apply it as: acc / running-max / running-sum iter_args in f32, the softmax
+      chain (scale, max-reduce, sub, exp, sum) in f32, one `arith.truncf` of P to
+      f16 immediately before the PV DPAS, and one `arith.truncf` in the epilogue
+      before the store.
+      Note the f32 accumulator is ~32 KB/WG, so it REQUIRES large-GRF (default GRF
+      measured 4.2 ms, 4.1x worse) and it consumes the register budget: adding a
+      K/V prefetch on top of it costs 13% (1.0352 -> 1.1883). See
+      xegpu_grf_budget_loop_accumulators and xegpu_prefetch_depth_is_tunable.
+
   - id: xegpu_dtype_no_f64
     name: Avoid f64 anywhere in the kernel
     severity: critical
     description: |
       f64 is dramatically slower on Intel XPU and is not a DPAS input type.
       Use f16/bf16 inputs with f32 accumulation.
+
+  - id: xegpu_dpas_operand_dtype_promote
+    name: Promote DPAS-unsupported operand dtypes to f16/bf16 before the dpas
+    severity: high
+    stage: dtype_fix
+    description: |
+      xegpu.dpas does not natively support every dtype combination on BMG (e.g.
+      fp8 on non-FP8-capable HW). If the operands are not a natively supported
+      pair, insert an explicit up-cast (arith.extf / fptofp) to f16 (or bf16) on
+      the operands BEFORE the dpas, rather than letting lowering fail or emit a
+      slow FMA fallback. Distilled from Intel's AccelerateMatmul mixed-mode
+      handling (decomposeMixedModeDotOp promotes fp8->f16; opsPerChannel upcasts).
+      Keep the accumulator f32 (see xegpu_fp32_accumulator_required). Contrast with
+      xegpu_cast_inputs_to_bf16 (which fixes an all-f64/f32 kernel); this rule
+      specifically covers exotic/mixed operand dtypes DPAS can't take directly.
+
+  - id: xegpu_propagate_dpas_layout_epilogue
+    name: Keep the DPAS accumulator layout through the elementwise/softmax epilogue — no intermediate relayouts
+    severity: warning
+    stage: device_specific
+    description: |
+      Redundant layout conversions cost cross-lane shuffles/copies. Anchor the
+      #xegpu.layout at the ops that MUST fix it (xegpu.dpas, xegpu.load_nd) and
+      propagate that single layout through the elementwise / softmax epilogue
+      chain (scale, sub, math.exp, mul, truncf) to the store, inserting a relayout
+      ONLY where a consumer genuinely demands a different layout. Do NOT emit a
+      convert_layout / transpose between the DPAS accumulator and its epilogue
+      users just to make an op "fit" — reuse the accumulator's layout downstream.
+      Distilled from Intel's RemoveLayoutConversions (anchor -> propagate ->
+      resolve-conflicts). The full propagation engine is a compiler pass, but the
+      actionable rule for the kernel author/LLM is: one layout from DPAS output
+      through the whole epilogue to store.
 
 patterns:
   - id: xegpu_tune_sg_data_for_dpas
@@ -106,4 +160,77 @@ patterns:
       %acc = arith.constant dense<0.0> : vector<128x16xf32>
       %c = xegpu.dpas %a, %b, %acc : vector<128x64xf16>, vector<64x16xf16>, vector<128x16xf32> -> vector<128x16xf32>
     expected_speedup: "many-x vs f64; correctness-critical"
+    applies_to: ["gemm", "matmul", "flash_attention"]
+
+  - id: xegpu_softmax_reduction_split_intra_lane
+    name: Split a row reduction into a register-local partial reduce, THEN one cross-lane reduce
+    stage: algorithmic
+    precondition: |
+      APPLIES to a row-wise reduction (vector.multi_reduction <maximumf>/<add>, or
+      an scf.for reduction) over a tile whose layout gives each lane MORE THAN ONE
+      element along the reduction axis — i.e. sg_data / inst_data on the reduced
+      dim is > 1, so a lane privately owns several of the values being combined.
+      This is exactly the softmax max/sum over a vector<64x16xf32> tile. Do NOT
+      apply when each lane owns a single element on the reduce axis (nothing to
+      pre-reduce) or when the reduction is already two-stage.
+    description: |
+      A monolithic within-subgroup reduction along an axis is expensive because it
+      is all cross-lane shuffles. When a lane owns k>1 elements along the reduce
+      axis, FIRST reduce the k elements the lane holds privately in registers (free
+      — no cross-lane communication), producing one partial per lane, THEN do a
+      SINGLE size-16 cross-lane (and, if needed, cross-warp) reduction over the
+      partials. Distilled from Intel's OptimizeReductionLocality 3-step scheme
+      (reduce-owned-elements -> relayout-for-locality -> final reduce); the
+      enabling condition there is executionSize == threadsPerWarp with the reduce
+      axis lane-multi-valued. Translate ONLY the two-stage principle, NOT the
+      Triton blocked-encoding reshape mechanics. Optionally choose the softmax
+      layout so the reduction axis is lane-local (transpose-for-locality) to make
+      the private partial as large as possible.
+    rationale: |
+      Cross-lane shuffles dominate a naive subgroup reduction. Doing the
+      lane-private part in registers first cuts the amount of data that has to go
+      through the (expensive) cross-lane tree to one value per lane, so the shuffle
+      network runs once over 16 partials instead of over the full tile width.
+    pattern_before: |
+      // one full-width cross-lane reduction over the whole 64x16 tile
+      %m = vector.multi_reduction <maximumf>, %tile, %init [1] : vector<64x16xf32> to vector<64xf32>
+    pattern_after: |
+      // (conceptual) each lane first folds the elements it owns along dim 1 in
+      // registers, then a single cross-lane reduction finishes the row:
+      %partial = vector.multi_reduction <maximumf>, %lane_owned, %init [1] : vector<64xNxf32> to vector<64xf32>  // register-local, no shuffle
+      %m       = <cross-lane reduce of %partial over the subgroup>            // one size-16 shuffle tree
+    expected_speedup: "1.1-1.4x on reduction-bound softmax / row-normalization"
+    applies_to: ["softmax", "layernorm", "reduction", "flash_attention"]
+
+  - id: xegpu_sg_tiling_min_duplication
+    name: Choose sg_layout to minimize A/B operand duplication; size register block to the 2D-load max
+    stage: device_specific
+    description: |
+      When splitting the DPAS output across subgroups, double subgroups along the
+      dimension with the LARGER remaining tile (driven by the DPAS
+      repeatCount:executionSize ratio) so that operands A and B are re-loaded /
+      broadcast across as few subgroups as possible. Separately, grow the per-lane
+      register block (sg_data / inst_data) toward the hardware 2D-load maximum — on
+      PVC/BMG that is 32 rows and 64 bytes of columns — to amortize load-message
+      overhead by pulling one full 2D block per load. Distilled from Intel's
+      AccelerateMatmul (getWarpsPerTile "minimize duplication of A and B";
+      repCluster clamped to PVC_2D_LOAD_MAXIMUM 32 rows / 64 bytes). Complements
+      xegpu_balance_sg_layout (square tiles for reuse) with a concrete
+      duplication-minimizing split rule and the 32-row/64-byte register-block cap.
+      The register-block growth half of this rule applies to attention loops too,
+      but see xegpu_widen_load_inst_data_in_pairs first: it must be widened on ALL
+      loads feeding the same DPAS chain at once (one-sided = 0.888x, the pair =
+      1.237x), and it reverses sign once the accumulator is f32.
+    rationale: |
+      Every subgroup that redundantly holds the same A or B panel wastes both
+      global bandwidth and GRF; splitting along the larger-tile axis cuts that
+      replication, and filling the 2D-load maximum per message minimizes the number
+      of load instructions issued.
+    pattern_before: |
+      // sg_data smaller than the 2D-load max -> many narrow loads; split axis replicates B
+      #c = #xegpu.layout<sg_layout = [1, 8], sg_data = [8, 16], inst_data = [8, 16]>
+    pattern_after: |
+      // register block toward 32 rows / 64B cols; split along the larger tile dim to cut A/B duplication
+      #c = #xegpu.layout<sg_layout = [4, 2], sg_data = [32, 32], inst_data = [8, 16]>
+    expected_speedup: "1.1-1.4x on GEMM by cutting redundant operand loads"
     applies_to: ["gemm", "matmul", "flash_attention"]
