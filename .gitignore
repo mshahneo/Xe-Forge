@@ -24,3 +24,6 @@ sycl_build/
 # Xe-Forge run artifacts and scratch kernels
 /outputs/
 /mlir_kernels/
+
+# Run logs
+/logs/
