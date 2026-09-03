@@ -196,60 +196,101 @@ that DCE removed (kernel lowered byte-identical). See the KB anti-pattern
 
 ## 6. Knowledge Base — shared vs MLIR-specific
 
-The KB loader ([knowledge/loader.py:286-354](../src/xe_forge/knowledge/loader.py)) collects
-YAML in priority order: `common/` → `<dsl>/common/` → `<dsl>/<device_type>/`. This means
-**every DSL always picks up `common/` first**, then diverges by directory. Content is
-scoped by directory; the *framework* (dataclasses, `format_for_stage`, stage indexing,
-issue→stage resolution) is shared by all DSLs.
+The KB loader ([knowledge/loader.py](../src/xe_forge/knowledge/loader.py),
+`_collect_yaml_files`) collects YAML in priority order: `common/` → `<dsl>/common/` →
+`<dsl>/<device_type>/`. Content is scoped by directory (plus per-file `dsl` /
+`excludes_dsl` scoping, §6.4); the *framework* (dataclasses, `format_for_stage`, stage
+indexing, issue→stage resolution) is shared by all DSLs.
 
-### 6.1 Reusable across DSLs (structurally shared — the only truly common files)
+### 6.1 The repo-root `common/` tier is NOT loaded for MLIR
 
-Loaded for **every** DSL, MLIR included:
+`common/algorithmic_patterns.yaml` (FLOP-reduction reordering, precompute-in-`__init__`)
+and `common/correctness.yaml` (outputs-must-match, device placement) are host-Python
+knowledge: they talk about a PyTorch `Model` wrapper, `__init__`, and `.to(device)`.
+None of that exists inside a self-contained MLIR module, so both files now declare
+`excludes_dsl: [mlir]` and the loader skips them for the MLIR views
+(`loader._file_applies_to_dsl`). The Python-hosted DSLs (Triton, Gluon, SYCL) still
+load them unchanged.
 
-- [`knowledge_base/common/algorithmic_patterns.yaml`](../knowledge_base/common/algorithmic_patterns.yaml)
-  — FLOP-reduction reordering, precompute-in-`__init__`. Framed at the algorithm level,
-  DSL-neutral.
-- [`knowledge_base/common/correctness.yaml`](../knowledge_base/common/correctness.yaml)
-  — outputs-must-match, device-placement correctness.
+What MLIR reuses from the Triton KB is therefore the **framework**, not the content:
+the dataclasses, `format_for_stage`, stage indexing, issue→stage resolution, and the
+`precondition` / `fix` / `applies_to` fields.
 
-These are the parts of the Triton KB that **directly benefit MLIR today** with zero
-porting.
+### 6.2 MLIR-specific KB (two device scopes, three tiers)
 
-### 6.2 MLIR-specific KB (two device_type scopes)
+MLIR is the one DSL with **two** device scopes, loaded separately and never together
+([pipeline.py:250](../src/xe_forge/pipeline.py)):
 
-MLIR uniquely loads **two** KB scopes for its two levels:
-
-- **WG-level** (`device_type="xpu"`, used by analyzer/optimizer):
-  [`mlir/xpu/xegpu_wg_patterns.yaml`](../knowledge_base/mlir/xpu/xegpu_wg_patterns.yaml)
-  (DPAS/SIMD16/f32-accum constraints; `sg_data`/`sg_layout` tuning patterns) +
-  [`mlir/xpu/xegpu_memory_patterns.yaml`](../knowledge_base/mlir/xpu/xegpu_memory_patterns.yaml)
-  (prefetch_nd, cache hints, coalesced block loads; plus the `xegpu_no_dead_prefetch_reads`
-  anti-pattern and the precondition-gated `xegpu_add_prefetch_nd`).
-- **Lowering-config** (`device_type="linalg"`, used by `LinalgLoweringAgent`, loaded via a
-  separate cached KB at [pipeline.py:240-255](../src/xe_forge/pipeline.py)):
+- **`mlir/common/`** — loaded for **both** scopes. Holds only what is a property of
+  the hardware / the XeGPU contract and is therefore true in both:
+  [`xegpu_hardware_contract.yaml`](../knowledge_base/mlir/common/xegpu_hardware_contract.yaml)
+  — the DPAS dtype contract (f16/bf16 in, f32 accumulate, no f64), subgroups =
+  threads/16 with the large-GRF cap of 32, DPAS tile alignment `A=[8,16]`/`B=[16,16]`,
+  and exact WG↔SG tiling. Each invariant is stated **once** here; the per-view files
+  cross-reference it instead of restating it.
+- **WG-level** (`device_type="xpu"`, analyzer + WG optimizer) — XeGPU IR edits,
+  organized by **concern, not by kernel**:
+  [`xegpu_dtype.yaml`](../knowledge_base/mlir/xpu/xegpu_dtype.yaml) (which dtype each
+  value carries, where a cast must go),
+  [`xegpu_layout_and_tiling.yaml`](../knowledge_base/mlir/xpu/xegpu_layout_and_tiling.yaml)
+  (`sg_layout`/`sg_data`/`inst_data`, layout propagation, the register budget for
+  loop-carried state),
+  [`xegpu_memory_patterns.yaml`](../knowledge_base/mlir/xpu/xegpu_memory_patterns.yaml)
+  (block loads/stores, prefetch pipelines, cache hints, 2D-block message limits),
+  [`xegpu_reductions.yaml`](../knowledge_base/mlir/xpu/xegpu_reductions.yaml)
+  (cross-lane softmax/layernorm reductions), and
+  [`xegpu_transcendental_patterns.yaml`](../knowledge_base/mlir/xpu/xegpu_transcendental_patterns.yaml)
+  (`math.exp`/`exp2`, fastmath, algebraic folds).
+- **Lowering-config** (`device_type="linalg"`, used by `LinalgLoweringAgent`, loaded via
+  a separate cached KB at [pipeline.py:240-255](../src/xe_forge/pipeline.py)):
   [`mlir/linalg/lowering_config_patterns.yaml`](../knowledge_base/mlir/linalg/lowering_config_patterns.yaml)
-  (the 5-tuple seed configs + divisibility/DPAS-alignment/thread-cap constraints) +
+  (the 5-tuple seed configs + the timed autotuner) +
   [`mlir/linalg/lowering_scope_and_findings.yaml`](../knowledge_base/mlir/linalg/lowering_scope_and_findings.yaml)
   (engineering scope/findings — what lowers, what routes to lighthouse).
 
-### 6.3 Conceptual overlap (NOT shared files — re-expressed per DSL)
+A file named after a kernel makes generic rules look kernel-specific, which is why
+the former `xegpu_flash_attention_patterns.yaml` and `xegpu_wg_patterns.yaml` were
+dissolved into the concern files above: the register-budget, prefetch-pipeline and
+K-slicing rules apply to any loop streaming large tiles. Every entry carries its own
+`precondition` stating when it fires.
+[`knowledge_base/mlir/README.md`](../knowledge_base/mlir/README.md) is the map,
+including where a new rule belongs.
+
+### 6.3 Conceptual overlap with the other DSLs (re-expressed per DSL)
 
 The same **hardware truths** recur across DSLs but live in separate files because the
-syntax differs: SIMD16 subgroups, f32 accumulation for f16/bf16, no-f64, DPAS tile shapes
-`[8,16]`/`[16,16]`, large-GRF tradeoffs, tile/occupancy tuning, prefetch/cache-hints,
-epilogue fusion. Compare `mlir/xpu/xegpu_wg_patterns.yaml` (`mlir_dpas_tile_shape_alignment`,
-`xegpu_f32_accumulator_softmax_recipe`) with `sycl/xpu/xetla_patterns.yaml`
-(`sycl_dpas_requires_simd16`, `sycl_fp32_accumulator_required`). **Opportunity:** these
-could be refactored into a shared `common/hardware_xe.yaml` of device facts with
-per-DSL pattern files carrying only the syntax — see §8.
+syntax differs: SIMD16 subgroups, f32 accumulation for f16/bf16, no-f64, DPAS tile
+shapes, large-GRF tradeoffs, tile/occupancy tuning, prefetch/cache hints, epilogue
+fusion. Compare `mlir/common/xegpu_hardware_contract.yaml`
+(`mlir_dpas_operand_dtype_contract`, `mlir_dpas_tile_shape_alignment`) with
+`sycl/xpu/xetla_patterns.yaml` (`sycl_dpas_requires_simd16`,
+`sycl_fp32_accumulator_required`).
 
-### 6.4 KB feature added for MLIR: `precondition`
+Within MLIR this de-duplication is **done** — `mlir/common/` is exactly the
+"device facts stated once" tier, and it is what makes the two MLIR views agree. Doing
+the same across DSLs would mean a shared `common/hardware_xe.yaml`; the blocker is
+that each DSL's wording has been tuned against its own analyzer, so the merge has to
+be re-measured per DSL rather than assumed safe (see §8).
 
-`KnowledgeEntry` gained a `precondition` field ([loader.py:87](../src/xe_forge/knowledge/loader.py),
-parsed at ~441, formatted as `PRECONDITION (apply ONLY if this holds): …` at ~201). This
-lets a pattern like `xegpu_add_prefetch_nd` declare it applies **only** to kernels already
-in `load_nd` block-load form — preventing the LLM from fabricating dead prefetch reads on
-vector-dialect gather kernels. This is a generic KB improvement usable by any DSL.
+### 6.4 KB features added for MLIR (generic, usable by any DSL)
+
+- **`precondition`** — lets an entry declare when it applies, e.g.
+  `xegpu_add_prefetch_nd` fires **only** on kernels already in `load_nd` block-load
+  form, which stops the LLM fabricating dead prefetch reads on vector-dialect gather
+  kernels. Formatted as `PRECONDITION (this rule applies ONLY if this holds): …`.
+- **`fix`** — a code block showing the corrected form, rendered after the rationale,
+  so a constraint can teach the fix rather than only forbid the mistake.
+- **Declared constraint stages** — a constraint that spells out `stage:`/`stages:` is
+  scoped to those stages *and* stays visible to the ANALYSIS stage
+  (`loader.constraints_for_stage` + `KnowledgeConstraint.stages_declared`). This
+  matters because the analyzer sees **only** `critical`/`warning` constraints and
+  never patterns (`analyzer_agent._get_kb_context`), so a detection trigger has to be
+  encoded as a constraint. Constraints routed by id-keyword *inference* are not
+  exempted, which is what keeps every pre-existing DSL's prompts byte-identical —
+  pinned by [`tests/test_kb_loader_regression.py`](../tests/test_kb_loader_regression.py).
+- **`excludes_dsl` / `dsl` / `language` file scoping** — a KB file can state which
+  DSLs it applies to, which is how the host-Python `common/` tier is kept out of the
+  MLIR views (§6.1).
 
 ---
 

@@ -1,0 +1,57 @@
+kb_schema_version: 1
+# CONCERN: cross-lane / cross-subgroup reductions.
+#
+# Row reductions (softmax max and sum, layernorm statistics, any
+# vector.multi_reduction) are shuffle-bound rather than compute-bound, so they are
+# their own concern: the question is always how much of the reduction can be done
+# in registers before data has to cross lanes.
+#
+# The transcendental half of a softmax (exp, fastmath, exp2) is in
+# xegpu_transcendental_patterns.yaml; the layout that decides what each lane owns
+# is in xegpu_layout_and_tiling.yaml.
+#
+# Hardware: Intel Xe2 (BMG B580/B570/Pro B) and Xe-HPC (PVC), SIMD16 subgroups.
+language: mlir
+device: xpu
+category: optimization
+
+patterns:
+  - id: xegpu_softmax_reduction_split_intra_lane
+    name: Split a row reduction into a register-local partial reduce, THEN one cross-lane reduce
+    stage: algorithmic
+    precondition: |
+      APPLIES to a row-wise reduction (vector.multi_reduction <maximumf>/<add>, or
+      an scf.for reduction) over a tile whose layout gives each lane MORE THAN ONE
+      element along the reduction axis — i.e. sg_data / inst_data on the reduced
+      dim is > 1, so a lane privately owns several of the values being combined.
+      This is exactly the softmax max/sum over a vector<64x16xf32> tile. Do NOT
+      apply when each lane owns a single element on the reduce axis (nothing to
+      pre-reduce) or when the reduction is already two-stage.
+    description: |
+      A monolithic within-subgroup reduction along an axis is expensive because it
+      is all cross-lane shuffles. When a lane owns k>1 elements along the reduce
+      axis, FIRST reduce the k elements the lane holds privately in registers (free
+      — no cross-lane communication), producing one partial per lane, THEN do a
+      SINGLE size-16 cross-lane (and, if needed, cross-warp) reduction over the
+      partials. Distilled from Intel's OptimizeReductionLocality 3-step scheme
+      (reduce-owned-elements -> relayout-for-locality -> final reduce); the
+      enabling condition there is executionSize == threadsPerWarp with the reduce
+      axis lane-multi-valued. Translate ONLY the two-stage principle, NOT the
+      Triton blocked-encoding reshape mechanics. Optionally choose the softmax
+      layout so the reduction axis is lane-local (transpose-for-locality) to make
+      the private partial as large as possible.
+    rationale: |
+      Cross-lane shuffles dominate a naive subgroup reduction. Doing the
+      lane-private part in registers first cuts the amount of data that has to go
+      through the (expensive) cross-lane tree to one value per lane, so the shuffle
+      network runs once over 16 partials instead of over the full tile width.
+    pattern_before: |
+      // one full-width cross-lane reduction over the whole 64x16 tile
+      %m = vector.multi_reduction <maximumf>, %tile, %init [1] : vector<64x16xf32> to vector<64xf32>
+    pattern_after: |
+      // (conceptual) each lane first folds the elements it owns along dim 1 in
+      // registers, then a single cross-lane reduction finishes the row:
+      %partial = vector.multi_reduction <maximumf>, %lane_owned, %init [1] : vector<64xNxf32> to vector<64xf32>  // register-local, no shuffle
+      %m       = <cross-lane reduce of %partial over the subgroup>            // one size-16 shuffle tree
+    expected_speedup: "1.1-1.4x on reduction-bound softmax / row-normalization"
+    applies_to: ["softmax", "layernorm", "reduction", "flash_attention"]

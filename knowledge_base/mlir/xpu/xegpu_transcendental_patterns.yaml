@@ -126,6 +126,50 @@ patterns:
       AND one fewer exp). Complementary to xegpu_exp2_not_exp_softmax. Fold ONLY when
       both source exps feed nothing but the divf.
 
+  - id: xegpu_softmax_reduction_fastmath
+    name: "Attach fastmath<fast> to softmax max-reductions and exp on the attention hot path"
+    stage: device_specific
+    scope: sku_specific
+    skus: [bmg, pvc, arc_a770]
+    tags: [fastmath, softmax, attention, reduction, exp, device_specific]
+    expected_speedup: "1.05-1.2x on the softmax-bound inner loop"
+    precondition: |
+      APPLIES to the online-softmax reductions and exp inside an attention K-loop:
+      the arith.maximumf tree that folds the QK partials, the running-max update, and
+      the math.exp of centered scores and of the (m_old - m_new) alpha correction.
+      Verify [ALLCLOSE: TRUE] survives -- fastmath<fast> permits reassociation and the
+      fast (approximate) exp expansion; on attention with ~1e-2..1e-3 tolerance this
+      passes. Do NOT apply where the oracle demands bit-accurate exp/reductions.
+    description: |
+      Add fastmath<fast> to every arith.maximumf used in the softmax max reduction
+      (both the pairwise tree over the 4 QK partials and the running-max update
+      m_ij = max(scaled_max, m_i)) and to every math.exp (the exp of centered scores
+      and the exp of the alpha = m_old - m_new correction). This is the VERIFIED,
+      in-production spelling used by the tuned WG kernel: it keeps math.exp (does not
+      hand-rewrite to exp2) and lets IGC route to the fast native exp expansion while
+      relaxing reduction ordering.
+    rationale: |
+      Without fastmath, arith.maximumf keeps strict NaN/ordering semantics and
+      math.exp may select a higher-precision software path. fastmath<fast> lets IGC
+      reassociate the reductions (cheaper tree) and pick the fast exp2-based exp
+      expansion. On a long K-loop the softmax runs every iteration, so this compounds.
+    pattern_before: |
+      %m_t0 = arith.maximumf %qk0, %qk1 : vector<128x16xf32>
+      %m_ij = arith.maximumf %m_scaled, %m_i : vector<128xf32>
+      %p    = math.exp %centered : vector<128x16xf32>
+      %alpha = math.exp %m_diff : vector<128xf32>
+    pattern_after: |
+      %m_t0 = arith.maximumf %qk0, %qk1 fastmath<fast> : vector<128x16xf32>
+      %m_ij = arith.maximumf %m_scaled, %m_i fastmath<fast> : vector<128xf32>
+      %p    = math.exp %centered fastmath<fast> : vector<128x16xf32>
+      %alpha = math.exp %m_diff fastmath<fast> : vector<128xf32>
+    notes: |
+      Complementary to xegpu_exp2_not_exp_softmax: that pattern folds log2(e) into the
+      score scale and calls math.exp2 (the explicit route, and what the CPU reference
+      emulates); THIS pattern is the lighter-touch route the tuned kernel actually
+      ships -- keep math.exp, just tag fastmath<fast>. Try fastmath first; reach for
+      the explicit exp2 rewrite only if timing shows IGC didn't take the native path.
+
 constraints:
   - id: xegpu_redundant_exp_quotient
     name: "A quotient of two math.exp (exp(a)/exp(b)) is a redundant transcendental — fold to exp(a-b)"

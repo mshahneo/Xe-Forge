@@ -406,3 +406,80 @@ patterns:
       xegpu.store_nd %out, %o_tile[%row, %col] <{layout = #xegpu.layout<sg_layout=[8,1], sg_data=[8,16]>}> : vector<64x16xf32>, !xegpu.tensor_desc<64x16xf32, #o>
     expected_speedup: "1.05-1.3x on store-bandwidth-bound kernels (elementwise / softmax epilogues)"
     applies_to: ["softmax", "elementwise", "gemm", "flash_attention"]
+
+  - id: xegpu_multibuffer_prefetch_pipeline
+    name: "Software-pipelined multi-buffered xegpu.prefetch_nd (prefetch N tiles ahead, dedicated layout, no branch)"
+    stage: memory_access
+    scope: sku_specific
+    skus: [bmg, pvc, arc_a770]
+    tags: [prefetch, multibuffer, software-pipeline, attention, memory_access, latency-hiding]
+    expected_speedup: "1.2-1.7x on the memory-bound K/V stream of an attention K-loop"
+    precondition: |
+      APPLIES ONLY to a streaming inner loop that walks a large operand tile-by-tile
+      (attention K/V over N_CTX; GEMM K-loop over a long contraction). The win comes
+      from hiding global-load latency, so it applies when the loop is memory-latency
+      bound and there are enough iterations (>= ~3-4) to fill the pipeline.
+
+      Do NOT convert a single per-iteration prefetch guarded by scf.if into this form
+      naively: an scf.if-guarded, one-iteration-ahead prefetch on this hardware has
+      REGRESSED in practice (branch overhead + too-short lead distance to hide L3/HBM
+      latency). The correct form is branch-free with a lead distance of 3 tiles.
+      Requires the tensor_desc / hardware to tolerate out-of-bounds prefetch of the
+      trailing tiles (prefetch is a hint and must not fault); verify [ALLCLOSE: TRUE]
+      is unchanged (prefetch is side-effect-free on results).
+    description: |
+      Build a depth-3 (triple-buffered) prefetch pipeline for each streamed operand:
+        1. PROLOGUE, before the loop: issue 3 prefetch_nd at tile offsets
+           base, base+BLOCK_N, base+2*BLOCK_N (fills the pipe 3 tiles deep).
+        2. IN-LOOP, at the top of iteration k: issue ONE prefetch_nd at
+           base + 3*BLOCK_N + k -- i.e. 3 tiles ahead of the tile being consumed
+           this iteration. No scf.if guard.
+      Use a SEPARATE prefetch layout that spreads the prefetch across subgroups
+      differently from the compute-load layout: e.g. compute load #k = sg_layout=[8,1]
+      sg_data=[16,64], but prefetch #k_prefetch = sg_layout=[4,2] sg_data=[16,32]. The
+      prefetch layout's job is broad L1/L2/L3 coverage of the 64x64 tile, not feeding
+      DPAS, so a 4x2 spread pulls the whole tile with fewer, wider messages. All
+      prefetch_nd carry l1/l2/l3 = cached.
+    rationale: |
+      A one-iteration-ahead prefetch only hides ~1 tile of latency; global-load
+      latency on Xe2 spans several tiles, so the load still stalls. Prefetching 3
+      tiles ahead keeps 3 outstanding cache-fills in flight, so by the time load_nd
+      consumes tile k the line is already resident. Dropping the scf.if removes a
+      per-iteration branch on the hot path. A dedicated wide prefetch layout decouples
+      "how we cover the tile in cache" from "how DPAS wants the data laid out."
+    pattern_before: |
+      scf.for %k = %c0 to %N_CTX step %BLOCK_N iter_args(...) {
+        // one-iteration-ahead, guarded -- REGRESSES on Xe2
+        %next = arith.addi %k, %BLOCK_N : index
+        %ok = arith.cmpi slt, %next, %N_CTX : index
+        scf.if %ok {
+          xegpu.prefetch_nd %k_pf[%wg_x_offset_plus_next, %c0]
+            {l1_hint=#xegpu.cache_hint<cached>, ...} : !xegpu.tensor_desc<64x64xf16, #k>
+        }
+        %kv = xegpu.load_nd %k_tile[%wg_x_offset_plus_k, %c0] ...
+        ...
+      }
+    pattern_after: |
+      // dedicated wide prefetch layout
+      #k_prefetch = #xegpu.layout<sg_layout=[4,2], sg_data=[16,32], inst_data=[16,16]>
+      %k_pf = xegpu.create_nd_tdesc %K, shape:[...], strides:[...]
+        : memref<?x?xf16> -> !xegpu.tensor_desc<64x64xf16, #k_prefetch>
+      // PROLOGUE: fill the pipe 3 tiles deep
+      xegpu.prefetch_nd %k_pf[%base, %c0]              {l1_hint=#xegpu.cache_hint<cached>, ...}
+      xegpu.prefetch_nd %k_pf[%base_plus_BLOCK_N, %c0] {l1_hint=#xegpu.cache_hint<cached>, ...}
+      xegpu.prefetch_nd %k_pf[%base_plus_2BLOCK_N,%c0] {l1_hint=#xegpu.cache_hint<cached>, ...}
+      %BLOCK_N_3 = arith.muli %BLOCK_N, %c3 : index
+      scf.for %k = %c0 to %N_CTX step %BLOCK_N iter_args(...) {
+        // IN-LOOP: branch-free, 3 tiles ahead
+        %ahead = arith.addi %BLOCK_N_3, %k : index
+        %off   = arith.addi %base, %ahead : index
+        xegpu.prefetch_nd %k_pf[%off, %c0] {l1_hint=#xegpu.cache_hint<cached>, ...}
+        %kv = xegpu.load_nd %k_tile[%wg_x_offset_plus_k, %c0] ...
+        ...
+      }
+    notes: |
+      Lead distance is a tunable: 3 is the validated value on BMG for a 64-wide K
+      block; deeper pipes cost more register/cache residency for marginal latency
+      gain. Issue the K prefetch AND the V prefetch at the same running offset (both
+      streams advance together in attention). See xegpu_add_prefetch_nd for the base
+      "add a prefetch at all" pattern; this is its production-grade multi-buffer form.

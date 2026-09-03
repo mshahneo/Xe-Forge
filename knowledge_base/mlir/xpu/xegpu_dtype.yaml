@@ -1,0 +1,119 @@
+kb_schema_version: 1
+# CONCERN: dtype / precision choices in a WG-level XeGPU kernel.
+#
+# Which dtype each value carries: what DPAS accepts, where a cast has to go, and
+# what the loop-carried softmax state should be. The hardware contract itself is
+# stated once in mlir/common/xegpu_hardware_contract.yaml
+# (mlir_dpas_operand_dtype_contract); this file is how to satisfy it in XeGPU IR.
+#
+# Grouped by concern rather than by kernel: these rules were split across a
+# "wg_patterns" and a "flash_attention_patterns" file, which made generic dtype
+# rules look attention-specific. Each entry states its own precondition.
+#
+# Hardware: Intel Xe2 (BMG B580/B570/Pro B) and Xe-HPC (PVC), SIMD16 subgroups.
+language: mlir
+device: xpu
+category: optimization
+
+constraints:
+  - id: xegpu_f32_accumulator_softmax_recipe
+    name: How to apply the f32 accumulator in a WG attention loop — measured 1.364x, the single largest lever
+    severity: critical
+    stages: [dtype_fix, algorithmic, device_specific]
+    precondition: |
+      APPLIES to a WG kernel with an scf.for carrying a DPAS accumulator, especially
+      a fused chain where the first DPAS's output feeds a softmax and then a second
+      DPAS (attention: QK^T -> softmax -> PV). If the loop-carried accumulator or the
+      softmax statistics are 16-bit, this rule applies.
+    description: |
+      mlir_dpas_operand_dtype_contract says the accumulator must be f32. This is the
+      concrete WG recipe, and the measurement that shows it is a PERF lever:
+
+      Measured on BMG B580, 4k flash attention (median-of-100, large-GRF, both
+      ALLCLOSE TRUE): all-f16 loop 1.4119 ms -> f32 acc + f32 softmax with
+      `arith.truncf` of P to f16 only for the PV DPAS **1.0352 ms = 1.364x faster**
+      (4 runs, 0.8% spread), which also BEAT a hand-tuned reference kernel at
+      1.0948 ms. Note the f16 version PASSED its ALLCLOSE check — the harness fills
+      inputs with a uniform constant, which makes softmax exact — so the correctness
+      gate gave no signal at all here. Check the dtypes structurally.
+
+      Apply it as:
+        * acc / running-max (m_i) / running-sum (l_i) iter_args in f32
+        * the whole softmax chain (scale, max-reduce, sub, exp, sum) in f32
+        * ONE `arith.truncf` of P to f16 immediately before the PV DPAS — that
+          second DPAS still needs a 16-bit A operand (see the contract)
+        * ONE `arith.truncf` in the epilogue before the store
+      i.e. exactly two down-casts, both where the hardware forces one.
+
+      Register cost: the f32 accumulator is ~32 KB/WG, so it REQUIRES large-GRF
+      (default GRF measured 4.2 ms, 4.1x worse) and it consumes the budget — adding a
+      K/V prefetch on top of it costs 13% (1.0352 -> 1.1883). See
+      xegpu_grf_budget_loop_accumulators and xegpu_prefetch_depth_is_tunable.
+
+  - id: xegpu_dpas_operand_dtype_promote
+    name: Promote DPAS-unsupported operand dtypes to f16/bf16 before the dpas
+    severity: high
+    stage: dtype_fix
+    description: |
+      xegpu.dpas does not natively support every dtype combination on BMG (e.g.
+      fp8 on non-FP8-capable HW). If the operands are not a natively supported
+      pair, insert an explicit up-cast (arith.extf / fptofp) to f16 (or bf16) on
+      the operands BEFORE the dpas, rather than letting lowering fail or emit a
+      slow FMA fallback. Distilled from Intel's AccelerateMatmul mixed-mode
+      handling (decomposeMixedModeDotOp promotes fp8->f16; opsPerChannel upcasts).
+      Keep the accumulator f32 (see mlir_dpas_operand_dtype_contract). Contrast with
+      xegpu_cast_inputs_to_bf16 (which fixes an all-f64/f32 kernel); this rule
+      specifically covers exotic/mixed operand dtypes DPAS can't take directly.
+
+patterns:
+  - id: xegpu_cast_inputs_to_bf16
+    name: Use bf16/f16 DPAS inputs with f32 accumulation
+    stage: dtype_fix
+    description: |
+      Ensure the load_nd tiles feeding xegpu.dpas are f16/bf16 and the
+      accumulator vector is f32. Never compute in f64.
+    rationale: |
+      bf16/f16 are the native DPAS input types; f32 accumulation preserves
+      correctness while keeping the matmul on the XMX path.
+    pattern_before: |
+      %acc = arith.constant dense<0.0> : vector<128x16xf64>
+      %c = xegpu.dpas %a, %b, %acc : vector<128x64xf64>, vector<64x16xf64>, vector<128x16xf64> -> vector<128x16xf64>
+    pattern_after: |
+      %acc = arith.constant dense<0.0> : vector<128x16xf32>
+      %c = xegpu.dpas %a, %b, %acc : vector<128x64xf16>, vector<64x16xf16>, vector<128x16xf32> -> vector<128x16xf32>
+    expected_speedup: "many-x vs f64; correctness-critical"
+    applies_to: ["gemm", "matmul", "flash_attention"]
+
+  - id: xegpu_truncf_scores_to_f16_for_pv
+    name: "Truncate exp'd softmax scores f32->f16 before the P*V DPAS; keep the accumulator f32"
+    stage: dtype_fix
+    scope: sku_specific
+    skus: [bmg, pvc, arc_a770]
+    tags: [dpas, dtype, truncf, attention, mixed-precision, dtype_fix]
+    expected_speedup: "enables the P*V DPAS at full f16 throughput; correctness-preserving"
+    precondition: |
+      APPLIES to the second matmul of attention, P*V, where P = exp(scores) is
+      computed in f32 (softmax must run in f32 for numerical range) but DPAS-A wants
+      an f16/bf16 input. Do NOT truncate the accumulator or the running softmax
+      statistics (m_i, l_i) -- only the P operand fed to DPAS.
+    description: |
+      After computing the exp'd, centered scores in f32 (vector<128x16xf32> per
+      slice), arith.truncf each to vector<128x16xf16>, then feed those as the A
+      operand of xegpu.dpas against the f16 V slices, accumulating into the f32
+      128x64 output. The softmax max/sum/alpha arithmetic stays entirely in f32.
+    rationale: |
+      DPAS runs at peak throughput with f16/bf16 inputs and an f32 accumulator.
+      Softmax needs f32 dynamic range (exp of centered scores), but once P is
+      exponentiated its values are in [0,1] and lose little to f16, so truncating
+      only the DPAS-A input keeps peak matmul throughput without hurting [ALLCLOSE].
+    pattern_before: |
+      %p0 = math.exp %centered0 fastmath<fast> : vector<128x16xf32>
+      // f32 P fed to DPAS -> slow / illegal DPAS-A dtype
+      %pv = xegpu.dpas %p0, %v0, %acc : vector<128x16xf32>, vector<16x64xf16>, vector<128x64xf32> -> vector<128x64xf32>
+    pattern_after: |
+      %p0    = math.exp %centered0 fastmath<fast> : vector<128x16xf32>
+      %p0_f16 = arith.truncf %p0 : vector<128x16xf32> to vector<128x16xf16>
+      %pv = xegpu.dpas %p0_f16, %v0, %acc {layout_a=#qk, layout_b=#v, layout_cd=#out} : vector<128x16xf16>, vector<16x64xf16>, vector<128x64xf32> -> vector<128x64xf32>
+    notes: |
+      Reinforces mlir_dpas_operand_dtype_contract: the rule is f16/bf16 DPAS *inputs*,
+      f32 *accumulator*. The truncf sits between the softmax exp and the P*V DPAS.
