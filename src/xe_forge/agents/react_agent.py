@@ -32,6 +32,57 @@ logger = logging.getLogger(__name__)
 SUCCESS_MESSAGE = "Success! Optimization verified and kernel is faster."
 
 
+class _BestCandidate:
+    """Remembers the best kernel the verify tool actually proved on the GPU.
+
+    A stage's verify tool is called once per ReAct iteration, and each call
+    compiles, runs and TIMES a candidate against the stage's input kernel. Only
+    the agent's FINAL answer used to be kept, so a stage that verified a correct,
+    faster kernel at iteration k and then returned a broken answer at iteration
+    k+1 was recorded as a total failure and fell back to its input — throwing away
+    a result that was already measured on hardware. Observed cost: an FA
+    memory_access stage proved 0.9586 ms, then regressed to its 0.9931 ms input.
+
+    Speedups from different iterations of one stage are comparable because every
+    verify call compares against the same original_code, so keeping the max is
+    well-defined.
+    """
+
+    def __init__(self) -> None:
+        self.code: str | None = None
+        self.speedup: float = 1.0
+        self.comparison = None
+
+    def offer(self, code: str, speedup: float | None, comparison=None) -> None:
+        """Record *code* if it beats the best seen so far (and the input kernel)."""
+        if not code or speedup is None or speedup <= self.speedup:
+            return
+        self.code = code
+        self.speedup = speedup
+        self.comparison = comparison
+
+
+def _metrics_from_comparison(comparison) -> tuple[dict | None, dict | None]:
+    """(metrics_before, metrics_after) for a comparison, or Nones when unavailable.
+
+    All three comparison types (Triton/SYCL/MLIR) expose time_us + tflops, but the
+    tflops half is optional (it needs a FLOP count), so each side is emitted only
+    when complete.
+    """
+
+    def _side(time_us, tflops) -> dict | None:
+        if time_us is None or tflops is None:
+            return None
+        return {"time_us": time_us, "tflops": tflops}
+
+    if comparison is None:
+        return None, None
+    return (
+        _side(getattr(comparison, "original_time_us", None), comparison.original_tflops),
+        _side(getattr(comparison, "optimized_time_us", None), comparison.optimized_tflops),
+    )
+
+
 def _extract_gemm_dims(
     input_shapes: list[tuple[int, ...]] | None,
 ) -> tuple[int, int, int]:
@@ -43,7 +94,7 @@ def _extract_gemm_dims(
     return 1024, 1024, 1024
 
 
-def _verify_sycl(code, original_code, executor, input_shapes, spec_dims=None):
+def _verify_sycl(code, original_code, executor, input_shapes, spec_dims=None, best=None):
     """Verify a SYCL C++ kernel: basic structure check + runtime comparison."""
     if "#include" not in code:
         return "MISSING: C++ code must contain #include directives."
@@ -73,6 +124,8 @@ def _verify_sycl(code, original_code, executor, input_shapes, spec_dims=None):
                 f"SYCL optimization verified: {comparison.speedup:.2f}x speedup "
                 f"({comparison.original_tflops or 0:.3f} -> {comparison.optimized_tflops or 0:.3f} TFlop/s)"
             )
+            if best is not None:
+                best.offer(code, comparison.speedup, comparison)
             return SUCCESS_MESSAGE
         except Exception as e:
             return f"RUNTIME ERROR: {e!s}"
@@ -81,7 +134,7 @@ def _verify_sycl(code, original_code, executor, input_shapes, spec_dims=None):
     return SUCCESS_MESSAGE
 
 
-def _verify_mlir(code, original_code, executor, flop=None):
+def _verify_mlir(code, original_code, executor, flop=None, best=None):
     """Verify an XeGPU WG-level MLIR kernel: structure check + runtime compare.
 
     The kernel file is self-contained (host @main + embedded CPU reference), so
@@ -124,6 +177,8 @@ def _verify_mlir(code, original_code, executor, flop=None):
                     f"Optimized: {comparison.optimized_time_ms:.4f}ms"
                 )
             logger.info("MLIR optimization verified: %.2fx speedup", comparison.speedup)
+            if best is not None:
+                best.offer(code, comparison.speedup, comparison)
             return SUCCESS_MESSAGE
         except Exception as e:
             return f"RUNTIME ERROR: {e!s}"
@@ -323,10 +378,15 @@ class OptimizerReActAgent(Optimizer):
         dtype=None,
         spec_dims: dict[str, int] | None = None,
         input_dtypes: list | None = None,
+        best: _BestCandidate | None = None,
     ) -> Callable:
         """Create a verification tool for ReAct.
 
         Returns SUCCESS_MESSAGE if valid and faster, detailed error otherwise.
+
+        When *best* is given, every candidate this tool proves correct-and-faster on
+        the GPU is offered to it, so the stage can fall back to a measured winner if
+        the agent's final answer turns out to be worse (see _BestCandidate).
         """
         executor = self.executor
         dsl = self.dsl
@@ -344,10 +404,11 @@ class OptimizerReActAgent(Optimizer):
                     executor,
                     input_shapes,
                     spec_dims,
+                    best=best,
                 )
 
             if dsl == DSL.MLIR:
-                return _verify_mlir(code, original_code, executor, flop)
+                return _verify_mlir(code, original_code, executor, flop, best=best)
 
             # --- Triton path (unchanged) ---
             try:
@@ -427,6 +488,8 @@ class OptimizerReActAgent(Optimizer):
                         f"Optimization verified: {comparison.speedup:.2f}x speedup "
                         f"({comparison.original_tflops or 0:.2f} -> {comparison.optimized_tflops or 0:.2f} TFLOPS)"
                     )
+                    if best is not None:
+                        best.offer(code, comparison.speedup, comparison)
                     return SUCCESS_MESSAGE
 
                 except Exception as e:
@@ -503,7 +566,10 @@ class OptimizerReActAgent(Optimizer):
         _cfg = get_config()
         xpu_config_text = format_device_config_for_llm(xpu_config, _cfg.device_config.device)
 
-        # Create verification tool
+        # Create verification tool. `best` collects every candidate the tool proves
+        # on hardware, so a stage that verifies a winner mid-loop and then answers
+        # with something worse still returns the winner instead of its input.
+        best = _BestCandidate()
         verify_tool = self._create_verify_tool(
             original_code=original_code,
             kernel_name=kernel_name,
@@ -512,6 +578,7 @@ class OptimizerReActAgent(Optimizer):
             dtype=dtype,
             spec_dims=spec_dims,
             input_dtypes=input_dtypes,
+            best=best,
         )
 
         # Create ReAct agent for this optimization
@@ -542,12 +609,8 @@ class OptimizerReActAgent(Optimizer):
             # Extract optimized code from result
             if not hasattr(result, "optimized_code") or result.optimized_code is None:
                 logger.error("Agent didn't return code")
-                return StageResult(
-                    stage=stage,
-                    success=False,
-                    input_code=original_code,
-                    output_code=original_code,
-                    error_message="Agent failed to produce optimized code",
+                return self._keep_best_or_fail(
+                    stage, original_code, best, "Agent failed to produce optimized code"
                 )
 
             optimized_code: str = result.optimized_code.code
@@ -637,6 +700,51 @@ class OptimizerReActAgent(Optimizer):
                 success = True
                 logger.warning("No executor available - accepting based on syntax check only")
 
+            # The agent's final answer is only one of the candidates this stage
+            # measured. If some earlier iteration proved a FASTER kernel on the GPU,
+            # keep that instead of the answer (or instead of the untouched input when
+            # the answer failed) — it is a hardware-verified result either way.
+            if best.code is not None and (not success or (speedup or 1.0) < best.speedup):
+                if success:
+                    logger.info(
+                        "Stage %s: final answer %.3fx is worse than an earlier verified "
+                        "candidate %.3fx — keeping the earlier one",
+                        stage.value,
+                        speedup or 1.0,
+                        best.speedup,
+                    )
+                    note = (
+                        f"Kept a GPU-verified intermediate candidate ({best.speedup:.3f}x) "
+                        f"because the agent's final answer was slower "
+                        f"({(speedup or 1.0):.3f}x)."
+                    )
+                else:
+                    logger.info(
+                        "Stage %s: final answer rejected (%s), but an earlier iteration "
+                        "verified %.3fx — keeping that candidate",
+                        stage.value,
+                        last_error,
+                        best.speedup,
+                    )
+                    note = (
+                        f"Kept a GPU-verified intermediate candidate ({best.speedup:.3f}x) "
+                        f"because the agent's final answer was rejected: {last_error}"
+                    )
+                    self._dump_kernel(stage, optimized_code)
+
+                metrics_before, metrics_after = _metrics_from_comparison(best.comparison)
+                return StageResult(
+                    stage=stage,
+                    success=True,
+                    input_code=original_code,
+                    output_code=best.code,
+                    changes_made=[*self._extract_changes_from_trajectory(trajectory), note],
+                    reasoning=self._extract_reasoning_from_trajectory(trajectory),
+                    speedup=best.speedup,
+                    metrics_before=metrics_before,
+                    metrics_after=metrics_after,
+                )
+
             if success:
                 logger.info(f"Stage {stage.value} completed successfully")
                 if speedup:
@@ -675,13 +783,50 @@ class OptimizerReActAgent(Optimizer):
 
             logger.debug(traceback.format_exc())
 
+            return self._keep_best_or_fail(stage, original_code, best, str(e))
+
+    def _keep_best_or_fail(
+        self,
+        stage: OptimizationStage,
+        original_code: str,
+        best: _BestCandidate,
+        error: str,
+    ) -> StageResult:
+        """Fall back to a GPU-verified candidate, or report failure if there is none.
+
+        Used on the paths where there is no final answer to check at all (the agent
+        returned nothing, or the ReAct call raised) — an earlier iteration may still
+        have proved a faster kernel on hardware, and that result is worth keeping.
+        """
+        if best.code is None:
             return StageResult(
                 stage=stage,
                 success=False,
                 input_code=original_code,
                 output_code=original_code,
-                error_message=str(e),
+                error_message=error,
             )
+
+        logger.info(
+            "Stage %s: no usable final answer (%s), keeping a GPU-verified candidate (%.3fx)",
+            stage.value,
+            error,
+            best.speedup,
+        )
+        metrics_before, metrics_after = _metrics_from_comparison(best.comparison)
+        return StageResult(
+            stage=stage,
+            success=True,
+            input_code=original_code,
+            output_code=best.code,
+            changes_made=[
+                f"Kept a GPU-verified intermediate candidate ({best.speedup:.3f}x); "
+                f"the agent produced no usable final answer: {error}"
+            ],
+            speedup=best.speedup,
+            metrics_before=metrics_before,
+            metrics_after=metrics_after,
+        )
 
     def _dump_kernel(self, stage: OptimizationStage, code: str) -> None:
         """Dump failed kernel code to file for debugging."""
