@@ -365,6 +365,13 @@ class OptimizerReActAgent(Optimizer):
         self.validator = validator
         self.max_iterations = max_iterations
         self.dsl = DSL(dsl) if isinstance(dsl, str) else dsl
+        # The stage-in-progress's collector of GPU-verified candidates, exposed so
+        # that a tool added to the ReAct loop from OUTSIDE this class (e.g. an
+        # anchored-patch tool that verifies its own patched module) can register what
+        # it proved: `agent.current_best.offer(code, speedup)`. Without this such a
+        # tool's measured candidates are invisible to the stage and get discarded the
+        # same way the final answer used to be. See _BestCandidate.
+        self.current_best: _BestCandidate | None = None
 
         if not executor:
             logger.warning("No executor provided - kernels will NOT be verified at runtime!")
@@ -569,7 +576,7 @@ class OptimizerReActAgent(Optimizer):
         # Create verification tool. `best` collects every candidate the tool proves
         # on hardware, so a stage that verifies a winner mid-loop and then answers
         # with something worse still returns the winner instead of its input.
-        best = _BestCandidate()
+        best = self.current_best = _BestCandidate()
         verify_tool = self._create_verify_tool(
             original_code=original_code,
             kernel_name=kernel_name,
