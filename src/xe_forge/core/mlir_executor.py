@@ -96,6 +96,12 @@ class MlirComparisonResult:
     # (e.g. the edit only added dead ops that the compiler eliminates). Such an
     # edit cannot be a real speedup — any measured delta is timing noise.
     lowered_identical: bool = False
+    # True when at least one kernel's median runtime is below the noise floor
+    # (min_reliable_ms). Sub-floor kernels (e.g. a ~30us softmax) have run-to-run
+    # variance that can swamp a real speedup, so a marginal delta here is not to
+    # be trusted even after median-of-N (the same code has measured 1.5x then
+    # 0.7x). The regression band is widened when this is set.
+    low_confidence: bool = False
     feedback_message: str = ""
 
     @property
@@ -123,6 +129,8 @@ class MlirExecutor:
         imex_warmups: int = 10,
         imex_runs: int = 10,
         large_grf: bool | None = None,
+        compare_repeats: int | None = None,
+        min_reliable_ms: float | None = None,
     ):
         self.bin_dir = bin_dir
         self.lib_dir = lib_dir
@@ -149,6 +157,30 @@ class MlirExecutor:
         self.use_imex_profiling = use_imex_profiling
         self.imex_warmups = imex_warmups
         self.imex_runs = imex_runs
+        # Cross-process timing robustness. IMEX profiling already medians over
+        # imex_runs launches WITHIN one process, but the dominant variance for
+        # sub-100us kernels is BETWEEN processes (JIT, cache state, DVFS): the same
+        # code has measured 1.53x in one process and 0.73x in the next. So we run
+        # each kernel in `compare_repeats` independent processes and compare the
+        # MEDIAN of their per-process medians — one slow outlier can no longer flip
+        # an accept into a reject on re-verify. Default 3 (median of 3 rejects a
+        # single outlier); env MLIR_COMPARE_REPEATS overrides.
+        if compare_repeats is None:
+            try:
+                compare_repeats = int(os.environ.get("MLIR_COMPARE_REPEATS", "3"))
+            except ValueError:
+                compare_repeats = 3
+        self.compare_repeats = max(1, compare_repeats)
+        # Minimum-runtime floor: a kernel whose median runtime is below this is too
+        # fast to time reliably, so any marginal speedup is flagged low_confidence
+        # and the regression band is widened (below-floor noise must not read as a
+        # regression). Default 50us; env MLIR_MIN_RELIABLE_MS overrides.
+        if min_reliable_ms is None:
+            try:
+                min_reliable_ms = float(os.environ.get("MLIR_MIN_RELIABLE_MS", "0.05"))
+            except ValueError:
+                min_reliable_ms = 0.05
+        self.min_reliable_ms = min_reliable_ms
         # A candidate is only flagged "slower" when it regresses by more than
         # this fraction. Timing is measured across separate processes, so
         # run-to-run noise of a few percent is expected; without a band,
@@ -344,6 +376,49 @@ class MlirExecutor:
             tflops=tflops,
         )
 
+    def _measure_median(
+        self,
+        *,
+        kernel_code: str | None,
+        kernel_path: str | None,
+        output_name: str,
+        flop: float | None,
+        profile: bool,
+    ) -> tuple[ExecutionResult, list[float]]:
+        """Run one kernel in ``compare_repeats`` independent processes and return
+        the median-timed result plus the list of per-process times (ms).
+
+        Cross-process run-to-run variance — not the intra-process median IMEX
+        already computes — is what makes sub-100us kernels measure e.g. 1.5x then
+        0.7x on the SAME code. Taking the median over several processes removes a
+        single outlier so an accept can't flip to a reject on re-verify.
+        """
+        reps = self.compare_repeats
+        results: list[ExecutionResult] = []
+        for _ in range(reps):
+            r = self.execute(
+                kernel_code=kernel_code,
+                kernel_path=kernel_path,
+                output_name=output_name,
+                flop=flop,
+                profile=profile,
+            )
+            # A hard failure (lowering/runtime) is deterministic for fixed code —
+            # no point spending the rest of the repeat budget on a broken kernel.
+            if not r.success:
+                return r, []
+            results.append(r)
+
+        timed = [r for r in results if r.execution_time_ms is not None]
+        if not timed:
+            # No timing available (e.g. harness printed no clock) — return the last
+            # (correctness still parsed); caller falls back to neutral 1.0x.
+            return results[-1], []
+
+        timed.sort(key=lambda r: r.execution_time_ms)  # type: ignore[arg-type]
+        median = timed[len(timed) // 2]
+        return median, [r.execution_time_ms for r in timed]  # type: ignore[misc]
+
     # ------------------------------------------------------------------
     # CoVeR contract: compare original vs optimized
     # ------------------------------------------------------------------
@@ -366,14 +441,14 @@ class MlirExecutor:
         back to any rtclock "Average time (ms)" the harness prints otherwise.
         """
         prof = self.use_imex_profiling
-        orig = self.execute(
+        orig, orig_times = self._measure_median(
             kernel_code=original_code,
             kernel_path=original_path,
             output_name="original_mlir",
             flop=flop,
             profile=prof,
         )
-        opt = self.execute(
+        opt, opt_times = self._measure_median(
             kernel_code=optimized_code,
             kernel_path=optimized_path,
             output_name="optimized_mlir",
@@ -419,18 +494,42 @@ class MlirExecutor:
         opt_ms = opt.execution_time_ms or float("inf")
         # When no timing is available, fall back to neutral 1.0x so correctness
         # alone gates acceptance.
+        low_confidence = False
         if orig.execution_time_ms is None or opt.execution_time_ms is None:
             speedup = 1.0
             timing_note = " (no rtclock timing; speedup not measured)"
         else:
             speedup = orig_ms / opt_ms if opt_ms > 0 else 0.0
-            timing_note = f" Original: {orig_ms:.4f}ms, Optimized: {opt_ms:.4f}ms."
+            reps_note = ""
+            if self.compare_repeats > 1 and orig_times and opt_times:
+                reps_note = (
+                    f" [median of {len(orig_times)}/{len(opt_times)} runs;"
+                    f" orig {min(orig_times):.4f}-{max(orig_times):.4f}ms,"
+                    f" opt {min(opt_times):.4f}-{max(opt_times):.4f}ms]"
+                )
+            timing_note = (
+                f" Original: {orig_ms:.4f}ms, Optimized: {opt_ms:.4f}ms.{reps_note}"
+            )
+            # Minimum-runtime floor: if the faster of the two medians is below the
+            # noise floor, the kernel is too quick to time reliably and a marginal
+            # delta is untrustworthy even after median-of-N.
+            if min(orig_ms, opt_ms) < self.min_reliable_ms:
+                low_confidence = True
 
         # A dead edit lowers to the same IR — force a neutral 1.0x so it can never
         # be accepted as an improvement, regardless of the noisy measured time.
         if lowered_identical:
             speedup = 1.0
-        is_slower = speedup < (1.0 - self.speedup_tol)
+        # Below the noise floor a regression cannot be distinguished from noise
+        # (unchanged code has read as 0.7x here), so do NOT flag is_slower for
+        # sub-floor kernels — the low_confidence flag + feedback carry the caveat.
+        is_slower = (not low_confidence) and speedup < (1.0 - self.speedup_tol)
+        if low_confidence and not lowered_identical:
+            timing_note += (
+                " (LOW CONFIDENCE: runtime below the ~"
+                f"{self.min_reliable_ms * 1000:.0f}us noise floor — do not trust a "
+                "marginal speedup; only decisive, repeatable wins are meaningful.)"
+            )
 
         if not opt_correct:
             msg = (
@@ -467,6 +566,7 @@ class MlirExecutor:
             optimized_correct=opt_correct,
             is_slower=is_slower,
             lowered_identical=lowered_identical,
+            low_confidence=low_confidence,
             feedback_message=msg,
         )
 
@@ -699,12 +799,9 @@ class MlirExecutor:
                 "OK" if ok else f"FAIL ({_tail(r.error_message or '', 2)})",
                 f" {r.execution_time_ms:.4f}ms" if ok and r.execution_time_ms else "",
             )
-        d, l = results["default_grf"], results["large_grf"]
+        d, lg = results["default_grf"], results["large_grf"]
         # Prefer large-GRF only if it is measurably faster (tolerance band).
-        best_large = (
-            l is not None
-            and (d is None or l < d * (1.0 - self.speedup_tol))
-        )
+        best_large = lg is not None and (d is None or lg < d * (1.0 - self.speedup_tol))
         return best_large, results
 
     def sweep_configs(

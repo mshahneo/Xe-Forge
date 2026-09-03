@@ -630,18 +630,18 @@ class XeForgePipeline:
         except Exception as e:
             logger.warning("GRF sweep failed (%s); skipping.", e)
             return None
-        d, l = res.get("default_grf"), res.get("large_grf")
-        if d is None and l is None:
+        d, lg = res.get("default_grf"), res.get("large_grf")
+        if d is None and lg is None:
             logger.info("GRF sweep: kernel not runnable as-is; skipping.")
             return None
-        speedup = (d / l) if (best_large and d and l) else 1.0
+        speedup = (d / lg) if (best_large and d and lg) else 1.0
         if best_large:
             # Persist the choice: subsequent executor runs use large-GRF.
             if hasattr(executor, "large_grf"):
                 executor.large_grf = True
                 if "large-register-file" not in executor.pipeline:
-                    executor.pipeline = executor.pipeline + " igc-cmd-options=-ze-opt-large-register-file"
-            logger.info("GRF sweep: large-GRF chosen (%.2fx: %.4f -> %.4f ms)", speedup, d, l)
+                    executor.pipeline += " igc-cmd-options=-ze-opt-large-register-file"
+            logger.info("GRF sweep: large-GRF chosen (%.2fx: %.4f -> %.4f ms)", speedup, d, lg)
             return StageResult(
                 stage=OptimizationStage.DEVICE_SPECIFIC,
                 success=True,
@@ -907,6 +907,31 @@ class XeForgePipeline:
                     input_shapes=input_shapes,
                     flop=flop,
                 )
+
+            # Post-structural prefetch retry (MLIR/XeGPU): prefetch only pays off
+            # once the kernel is in its compute-pipelined form. Measured against a
+            # pre-structural kernel it reads as a regression (nothing to overlap) and
+            # gets dropped. If a structural stage runs *after* the first memory_access,
+            # schedule a second memory_access LAST so prefetch is re-evaluated against
+            # the tiled/DPAS-pipelined kernel. See the FA_wg known-issue.
+            _STRUCTURAL_STAGES = {
+                OptimizationStage.FUSION,
+                OptimizationStage.BLOCK_POINTERS,
+                OptimizationStage.PERSISTENT_KERNEL,
+                OptimizationStage.DEVICE_SPECIFIC,
+            }
+            if (
+                _is_mlir
+                and OptimizationStage.MEMORY_ACCESS in stages_to_apply
+                and stages_to_apply[-1] != OptimizationStage.MEMORY_ACCESS
+            ):
+                _ma_idx = stages_to_apply.index(OptimizationStage.MEMORY_ACCESS)
+                if any(s in _STRUCTURAL_STAGES for s in stages_to_apply[_ma_idx + 1 :]):
+                    stages_to_apply = [*stages_to_apply, OptimizationStage.MEMORY_ACCESS]
+                    logger.info(
+                        "Scheduling post-structural memory_access retry "
+                        "(prefetch re-evaluated against the optimized kernel)"
+                    )
 
             logger.info("Optimization plan:")
             for s in PLANNER_DEFAULT_STAGE_ORDER:
