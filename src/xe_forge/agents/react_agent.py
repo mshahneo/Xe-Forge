@@ -81,6 +81,57 @@ def _verify_sycl(code, original_code, executor, input_shapes, spec_dims=None):
     return SUCCESS_MESSAGE
 
 
+def _verify_mlir(code, original_code, executor, flop=None):
+    """Verify an XeGPU WG-level MLIR kernel: structure check + runtime compare.
+
+    The kernel file is self-contained (host @main + embedded CPU reference), so
+    correctness is the optimized kernel's own [ALLCLOSE: TRUE]; speedup uses
+    rtclock timing when the harness prints it. Mirrors optimizer_agent._verify_mlir
+    so the ReAct and CoVeR strategies verify MLIR identically.
+    """
+    # Cheap structural pre-checks before paying for lowering+execution.
+    if "gpu.launch_func" not in code:
+        return "MISSING: module must keep the gpu.launch_func kernel launch."
+    if "func.func @main" not in code:
+        return "MISSING: module must keep the @main host harness (correctness oracle)."
+    if "printAllclose" not in code and "[ALLCLOSE" not in code:
+        return (
+            "MISSING: keep the in-file correctness check (printAllclose / "
+            "[ALLCLOSE]) — it is the verification oracle."
+        )
+
+    if executor:
+        try:
+            comparison = executor.compare_kernels(
+                original_code=original_code,
+                optimized_code=code,
+                flop=flop,
+            )
+            if not comparison.optimized_correct:
+                return comparison.feedback_message or "Optimized kernel failed correctness."
+            if getattr(comparison, "lowered_identical", False):
+                # Dead edit: lowers to identical IR. Don't accept it, and tell the
+                # LLM why so it tries a change the compiler actually keeps.
+                logger.info("MLIR optimization rejected: no-op (lowers to identical IR)")
+                return comparison.feedback_message or (
+                    "NO-OP: optimized kernel lowers to IR identical to the original."
+                )
+            if comparison.is_slower:
+                sd = 1.0 / comparison.speedup if comparison.speedup > 0 else float("inf")
+                return (
+                    f"PERFORMANCE REGRESSION: {sd:.2f}x SLOWER.\n"
+                    f"Original: {comparison.original_time_ms:.4f}ms, "
+                    f"Optimized: {comparison.optimized_time_ms:.4f}ms"
+                )
+            logger.info("MLIR optimization verified: %.2fx speedup", comparison.speedup)
+            return SUCCESS_MESSAGE
+        except Exception as e:
+            return f"RUNTIME ERROR: {e!s}"
+
+    logger.warning("No executor - accepting MLIR code based on static checks only")
+    return SUCCESS_MESSAGE
+
+
 class OptimizationReActSignature(dspy.Signature):
     """Apply optimization transformation to Triton kernel.
 
@@ -156,17 +207,86 @@ class SyclOptimizationReActSignature(dspy.Signature):
     - Keep the Cutlass GEMM Performance output format
     """
 
-    original_code: dspy.Code[cpp] = dspy.InputField(
+    original_code: dspy.Code["cpp"] = dspy.InputField(  # noqa: UP037
         desc="Original SYCL C++ kernel code for reference"
     )
-    current_code: dspy.Code[cpp] = dspy.InputField(desc="Current SYCL C++ kernel code to optimize")
+    current_code: dspy.Code["cpp"] = dspy.InputField(  # noqa: UP037
+        desc="Current SYCL C++ kernel code to optimize"
+    )
     stage: str = dspy.InputField(desc="Optimization stage to apply")
     issues: list[DetectedIssue] = dspy.InputField(desc="Specific issues to fix in this stage")
     knowledge_patterns: str = dspy.InputField(desc="Optimization patterns and examples to follow")
     xpu_config: str = dspy.InputField(desc="Intel XPU configuration parameters")
 
-    optimized_code: dspy.Code[cpp] = dspy.OutputField(
+    optimized_code: dspy.Code["cpp"] = dspy.OutputField(  # noqa: UP037
         desc="Complete optimized SYCL C++ kernel with all #includes, templates, ExampleRunner, and main()."
+    )
+
+
+class MlirOptimizationReActSignature(dspy.Signature):
+    """Optimize an XeGPU workgroup-level MLIR kernel for Intel XPU.
+
+    You are an expert in MLIR, the XeGPU dialect, Intel Xe GPU architecture
+    (Xe-cores, subgroups, DPAS systolic array, 2D block loads), and
+    high-performance kernel tuning.
+
+    The input is a self-contained MLIR module: a host `func.func @main` that
+    allocates inputs, launches a `gpu.module` kernel via `gpu.launch_func`, and
+    verifies the result against an embedded CPU reference (printing
+    `[ALLCLOSE: TRUE]`). Optimize for maximum performance while keeping the
+    result numerically equivalent. Call the verification tool on each candidate;
+    it lowers and runs the kernel and tells you correctness + speedup (or why it
+    was rejected as incorrect, a no-op, or slower). Iterate until it succeeds.
+
+    === HARD CONSTRAINTS (do not break these) ===
+    - Edit ONLY the `gpu.module` kernel body, the `#xegpu.layout` attributes,
+      and the `gpu.launch_func` grid/block geometry.
+    - DO NOT modify the `@main` harness, the CPU reference function, the input
+      fill values, or the `[ALLCLOSE]` check — they are the correctness oracle.
+    - Re-emit the ENTIRE module verbatim except your intended edit. Do not
+      reflow, retype, or "clean up" untouched lines (memref/strided types,
+      attributes) — a single dropped character makes it fail to parse.
+    - Keep the kernel entry symbol name and its `gpu.launch_func` reference
+      consistent, and keep the module valid MLIR that lowers cleanly through
+      `--gpu-lower-to-xevm-pipeline=xegpu-op-level=workgroup`.
+    - The `sg_layout` product (number of subgroups) must remain consistent with
+      the threads-per-workgroup in `gpu.launch_func`.
+
+    === XeGPU WG-LEVEL OPTIMIZATION KNOBS ===
+    - `#xegpu.layout<sg_layout=[..], sg_data=[..], inst_data=[..]>`: distribute
+      the workgroup tile across subgroups; match sg_data / inst_data to
+      DPAS-friendly shapes (e.g. [8,16], [16,16]).
+    - Prefetch: insert `xegpu.prefetch_nd` with `l1_hint/l2_hint/l3_hint =
+      #xegpu.cache_hint<cached>` ahead of `load_nd` to hide memory latency.
+    - K-loop tiling: adjust the `scf.for` step / accumulator tile to trade
+      register pressure against reuse.
+
+    === STAGE-SPECIFIC GUIDANCE ===
+    ALGORITHMIC: reduce FLOPs / memory traffic via algebraic rewrites that stay
+      numerically equivalent — e.g. fold a quotient of exponentials
+      exp(a)/exp(b) → exp(a-b) (carry any fastmath flag onto the surviving exp),
+      hoist loop-invariant work, eliminate redundant loads/recomputation. APPLY
+      the specific rewrites in knowledge_patterns.
+    MEMORY_ACCESS: add/strengthen prefetch and cache hints; coalesce loads; pick
+      sg_data tiles that map to contiguous 2D block loads.
+    DEVICE_SPECIFIC: tune sg_layout / sg_data / inst_data and launch geometry for
+      the Xe-core (DPAS shape, subgroup size 16).
+    DTYPE_FIX: f16/bf16 inputs with f32 DPAS accumulators; avoid f64.
+    FUSION: fold the elementwise epilogue into the kernel after the dpas loop.
+    """
+
+    original_code: str = dspy.InputField(desc="Original MLIR module for reference")
+    current_code: str = dspy.InputField(desc="Current MLIR module to optimize")
+    stage: str = dspy.InputField(desc="Optimization stage to apply")
+    issues: list[DetectedIssue] = dspy.InputField(desc="Specific issues to fix in this stage")
+    knowledge_patterns: str = dspy.InputField(
+        desc="Optimization patterns and examples to follow - APPLY THESE"
+    )
+    xpu_config: str = dspy.InputField(desc="Intel XPU configuration parameters")
+
+    optimized_code: dspy.Code["mlir"] = dspy.OutputField(  # noqa: UP037
+        desc="Complete optimized MLIR module. Keep the @main harness and CPU reference "
+        "unchanged; edit only the gpu.module kernel, #xegpu.layout attrs, and launch geometry."
     )
 
 
@@ -225,6 +345,9 @@ class OptimizerReActAgent(Optimizer):
                     input_shapes,
                     spec_dims,
                 )
+
+            if dsl == DSL.MLIR:
+                return _verify_mlir(code, original_code, executor, flop)
 
             # --- Triton path (unchanged) ---
             try:
@@ -392,7 +515,12 @@ class OptimizerReActAgent(Optimizer):
         )
 
         # Create ReAct agent for this optimization
-        sig = SyclOptimizationReActSignature if self.dsl == DSL.SYCL else OptimizationReActSignature
+        if self.dsl == DSL.SYCL:
+            sig = SyclOptimizationReActSignature
+        elif self.dsl == DSL.MLIR:
+            sig = MlirOptimizationReActSignature
+        else:
+            sig = OptimizationReActSignature
         react_agent = dspy.ReAct(
             signature=sig,
             tools=[verify_tool],
@@ -435,11 +563,11 @@ class OptimizerReActAgent(Optimizer):
             last_error = None
 
             # Check syntax first
-            if self.dsl != DSL.SYCL and not self._is_valid_python(optimized_code):
+            if self.dsl not in (DSL.SYCL, DSL.MLIR) and not self._is_valid_python(optimized_code):
                 last_error = "Final code has invalid Python syntax"
             elif not self._is_valid_kernel(optimized_code):
                 last_error = "Final code is not a valid kernel"
-            elif self.executor and (self.dsl == DSL.SYCL or input_shapes):
+            elif self.executor and (self.dsl in (DSL.SYCL, DSL.MLIR) or input_shapes):
                 # Runtime verification
                 try:
                     if self.dsl == DSL.SYCL:
@@ -450,6 +578,12 @@ class OptimizerReActAgent(Optimizer):
                             original_code=original_code,
                             optimized_code=optimized_code,
                             dims=_dims,
+                        )
+                    elif self.dsl == DSL.MLIR:
+                        comparison = self.executor.compare_kernels(
+                            original_code=original_code,
+                            optimized_code=optimized_code,
+                            flop=flop,
                         )
                     else:
                         comparison = self.executor.compare_kernels(
@@ -583,6 +717,8 @@ class OptimizerReActAgent(Optimizer):
         """Check if code looks like a valid kernel for the current DSL."""
         if self.dsl == DSL.SYCL:
             return "#include" in code and ("sycl" in code.lower() or "cutlass" in code.lower())
+        if self.dsl == DSL.MLIR:
+            return "gpu.launch_func" in code and "func.func @main" in code
         has_triton_import = "import triton" in code or "from triton" in code
         has_kernel = "@triton.jit" in code or "class Model" in code
         return has_triton_import and has_kernel
