@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import math
 import re
 from collections.abc import Callable
 
@@ -134,6 +135,54 @@ def _verify_sycl(code, original_code, executor, input_shapes, spec_dims=None, be
     return SUCCESS_MESSAGE
 
 
+def _mlir_timing_trustworthy(comparison, executor) -> bool:
+    """True when this comparison produced a number worth holding to a threshold."""
+    if getattr(comparison, "low_confidence", False):
+        return False  # below the noise floor: the executor already says don't trust it
+    o = getattr(comparison, "original_time_ms", None)
+    p = getattr(comparison, "optimized_time_ms", None)
+    return o is not None and p is not None and math.isfinite(o) and math.isfinite(p) and p > 0
+
+
+def _mlir_min_gain(executor) -> float:
+    """Smallest speedup an MLIR candidate must show to count as an improvement."""
+    return 1.0 + (getattr(executor, "speedup_tol", 0.03) or 0.0)
+
+
+def _confirm_marginal_mlir(comparison, code, original_code, executor, flop=None):
+    """Re-time a candidate whose claimed gain is small enough to be noise.
+
+    ``MlirExecutor`` only flags ``is_slower`` below ``1 - speedup_tol``, so a candidate
+    anywhere in the noise band used to be accepted on a single process pair (FA runs
+    with ``MLIR_COMPARE_REPEATS=1``). Re-measure with median-of-3 only inside the band
+    where the extra repeats can actually change the verdict — a claimed *gain* too
+    small to trust. A clear win or a clear regression is not re-run, so the cost is
+    paid only on the candidates that were being decided by noise.
+    """
+    reps = getattr(executor, "compare_repeats", 1)
+    if reps >= 3 or not _mlir_timing_trustworthy(comparison, executor):
+        return comparison
+    tol = getattr(executor, "speedup_tol", 0.03) or 0.0
+    if not 1.0 - tol <= comparison.speedup < 1.0 + 2 * tol:
+        return comparison
+    logger.info(
+        "MLIR speedup %.3fx is inside the noise band — re-timing with median-of-3",
+        comparison.speedup,
+    )
+    try:
+        executor.compare_repeats = 3
+        confirmed = executor.compare_kernels(
+            original_code=original_code, optimized_code=code, flop=flop
+        )
+    except Exception as e:  # keep the first measurement on any failure
+        logger.warning("MLIR re-timing failed (%s); keeping the first measurement", e)
+        return comparison
+    finally:
+        executor.compare_repeats = reps
+    logger.info("MLIR re-timed: %.3fx -> %.3fx", comparison.speedup, confirmed.speedup)
+    return confirmed
+
+
 def _verify_mlir(code, original_code, executor, flop=None, best=None):
     """Verify an XeGPU WG-level MLIR kernel: structure check + runtime compare.
 
@@ -169,12 +218,27 @@ def _verify_mlir(code, original_code, executor, flop=None, best=None):
                 return comparison.feedback_message or (
                     "NO-OP: optimized kernel lowers to IR identical to the original."
                 )
+            comparison = _confirm_marginal_mlir(comparison, code, original_code, executor, flop)
             if comparison.is_slower:
                 sd = 1.0 / comparison.speedup if comparison.speedup > 0 else float("inf")
                 return (
                     f"PERFORMANCE REGRESSION: {sd:.2f}x SLOWER.\n"
                     f"Original: {comparison.original_time_ms:.4f}ms, "
                     f"Optimized: {comparison.optimized_time_ms:.4f}ms"
+                )
+            # "Not slower" is not the same as faster. Everything inside the +-tol noise
+            # band used to pass as a stage win, so the pipeline carried forward kernels
+            # like the FA memory_access candidate recorded as `0.98x ✓`. Demand the same
+            # margin in the direction the change claims.
+            min_gain = _mlir_min_gain(executor)
+            if _mlir_timing_trustworthy(comparison, executor) and comparison.speedup < min_gain:
+                return (
+                    f"NO MEASURABLE GAIN: {comparison.speedup:.3f}x is inside the "
+                    f"+-{min_gain - 1.0:.0%} timing noise band, so it is not a real "
+                    f"improvement.\nOriginal: {comparison.original_time_ms:.4f}ms, "
+                    f"Optimized: {comparison.optimized_time_ms:.4f}ms\n"
+                    "Correctness passed — keep the idea only if you can make it "
+                    "decisively faster, otherwise try a different lever."
                 )
             logger.info("MLIR optimization verified: %.2fx speedup", comparison.speedup)
             if best is not None:
@@ -666,6 +730,14 @@ class OptimizerReActAgent(Optimizer):
                             input_dtypes=input_dtypes,
                         )
 
+                    if self.dsl == DSL.MLIR:
+                        # Same noise-band rules the in-loop verify tool applies, so the
+                        # final answer is judged exactly like the candidates it competes
+                        # with in `best`.
+                        comparison = _confirm_marginal_mlir(
+                            comparison, optimized_code, original_code, self.executor, flop
+                        )
+
                     if not comparison.optimized_correct:
                         last_error = "Optimized kernel produces incorrect results"
                     elif comparison.is_slower:
@@ -673,6 +745,15 @@ class OptimizerReActAgent(Optimizer):
                             1.0 / comparison.speedup if comparison.speedup > 0 else float("inf")
                         )
                         last_error = f"Optimized kernel is {slowdown:.2f}x slower"
+                    elif (
+                        self.dsl == DSL.MLIR
+                        and _mlir_timing_trustworthy(comparison, self.executor)
+                        and comparison.speedup < _mlir_min_gain(self.executor)
+                    ):
+                        last_error = (
+                            f"Optimized kernel is only {comparison.speedup:.3f}x — inside "
+                            "the timing noise band, not a measurable gain"
+                        )
                     else:
                         # Success!
                         success = True

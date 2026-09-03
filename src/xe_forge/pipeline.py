@@ -13,6 +13,7 @@ from xe_forge.core.device_query import get_device_config_for_pipeline
 from xe_forge.knowledge.loader import KnowledgeBase, load_knowledge_base
 from xe_forge.models import (
     DSL,
+    DetectedIssue,
     IssueType,
     OptimizationResult,
     OptimizationStage,
@@ -653,6 +654,35 @@ class XeForgePipeline:
         logger.info("GRF sweep: default GRF kept (large-GRF not faster).")
         return None
 
+    @staticmethod
+    def _analysis_with_planned_issues(analysis, planned: list[DetectedIssue], stage):
+        """Ensure *analysis* still lists at least the issues *stage* was planned for.
+
+        The plan is built once, from the first analysis, but the analysis is redone
+        after every stage — and ``optimize_stage`` re-derives its own issue list from
+        whatever analysis it is handed, returning "No changes needed" when that list is
+        empty. So a stage the planner scheduled could bail out without trying: on
+        flash-attention the pipeline logged ``Issues: dtype_precision`` and the stage
+        answered ``No issues for stage dtype_fix, skipping`` five lines later, dropping
+        the f32-accumulator recipe worth 1.64x. Re-analysis is still trusted for
+        everything it *does* report; this only puts back the planned reason.
+        """
+        from xe_forge.knowledge.patterns import get_stage_for_issue
+
+        if not planned or any(
+            get_stage_for_issue(i.issue_type) == stage for i in analysis.detected_issues
+        ):
+            return analysis
+        logger.info(
+            "Re-analysis no longer reports %s for %s; restoring the planned issue(s): %s",
+            "an issue" if len(planned) == 1 else "issues",
+            stage.value,
+            ", ".join(i.issue_type.value for i in planned),
+        )
+        return analysis.model_copy(
+            update={"detected_issues": [*analysis.detected_issues, *planned]}
+        )
+
     def optimize(
         self,
         kernel_code=None,
@@ -953,6 +983,14 @@ class XeForgePipeline:
                 candidates.append(result)
                 continue
 
+            # The plan is fixed here, from THIS analysis, but `analysis` is replaced by
+            # the re-analysis after every stage. Keep the issues each planned stage was
+            # scheduled for so a stage can never be handed an analysis that no longer
+            # mentions its own reason for existing (see _analysis_with_planned_issues).
+            planned_issues: dict[OptimizationStage, list[DetectedIssue]] = {}
+            for iss in analysis.detected_issues:
+                planned_issues.setdefault(get_stage_for_issue(iss.issue_type), []).append(iss)
+
             current_code = kernel_code
             current_ms: float | None = val_orig_ms
             vtune_report = ""
@@ -965,7 +1003,9 @@ class XeForgePipeline:
                 stage_result = self.optimizer.optimize_stage(
                     code=current_code,
                     stage=stage,
-                    analysis=analysis,
+                    analysis=self._analysis_with_planned_issues(
+                        analysis, planned_issues.get(stage, []), stage
+                    ),
                     xpu_config=xpu_config,
                     kernel_name=kernel_name,
                     input_shapes=input_shapes,
@@ -995,8 +1035,14 @@ class XeForgePipeline:
                     and stage_result.output_code != current_code
                 ):
                     current_code = stage_result.output_code
-                    if stage_result.speedup and val_orig_ms:
-                        current_ms = val_orig_ms / stage_result.speedup
+                    # A stage's speedup is measured against the code that stage was
+                    # HANDED (optimize_stage compares against its own `code` arg), not
+                    # against the pipeline baseline, so the stage factors compose
+                    # multiplicatively. Dividing val_orig_ms by a single stage's factor
+                    # reported the kernel as 1.4x when it was 3.3x, and fed that wrong
+                    # "speedup_so_far" to the next stage's prompt.
+                    if stage_result.speedup and current_ms:
+                        current_ms = current_ms / stage_result.speedup
                     elif (
                         stage_result.metrics_after
                         and "execution_time_ms" in stage_result.metrics_after
