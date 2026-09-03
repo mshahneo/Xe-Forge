@@ -237,8 +237,8 @@ MLIR uniquely loads **two** KB scopes for its two levels:
 The same **hardware truths** recur across DSLs but live in separate files because the
 syntax differs: SIMD16 subgroups, f32 accumulation for f16/bf16, no-f64, DPAS tile shapes
 `[8,16]`/`[16,16]`, large-GRF tradeoffs, tile/occupancy tuning, prefetch/cache-hints,
-epilogue fusion. Compare `mlir/xpu/xegpu_wg_patterns.yaml` (`xegpu_dpas_requires_simd16`,
-`xegpu_fp32_accumulator_required`) with `sycl/xpu/xetla_patterns.yaml`
+epilogue fusion. Compare `mlir/xpu/xegpu_wg_patterns.yaml` (`mlir_dpas_tile_shape_alignment`,
+`xegpu_f32_accumulator_softmax_recipe`) with `sycl/xpu/xetla_patterns.yaml`
 (`sycl_dpas_requires_simd16`, `sycl_fp32_accumulator_required`). **Opportunity:** these
 could be refactored into a shared `common/hardware_xe.yaml` of device facts with
 per-DSL pattern files carrying only the syntax — see §8.

@@ -179,7 +179,7 @@ class LoweringConfig:
         f32->f16 by a truncf producer (cast_matmul_operands_to_f16); emit the extra
         fuse-into-k-loop steps so the cast rides in-register. Set it whenever the
         input matmul had f32 A/B (XeGPU requires f16 A/B — see the
-        lowering_matmul_ab_must_be_16bit_float KB constraint).
+        mlir_dpas_operand_dtype_contract KB constraint).
         """
         errs = self.validate()
         if errs:

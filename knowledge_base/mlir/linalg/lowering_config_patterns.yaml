@@ -7,68 +7,16 @@
 #
 # Target: Intel Xe2 (Battlemage) — SIMD16 subgroups, XMX/DPAS tiles A=[8,16]
 # B=[16,16] C=[8,16]. Max 1024 work-items per workgroup.
+#
+# The hardware invariants a config must satisfy — the DPAS dtype contract, the
+# subgroup-count / large-GRF budget, DPAS tile alignment, and tile divisibility —
+# are stated once in mlir/common/xegpu_hardware_contract.yaml, which loads for this
+# view too. This file holds only what is specific to the LOWERING path.
 
-constraints:
-  - id: lowering_matmul_ab_must_be_16bit_float
-    name: Matmul A/B operands MUST be a 16-bit float (f16 or bf16); C/accumulator may be f32
-    severity: critical
-    description: |
-      REQUIREMENT — a matmul (matmul / batch_matmul / transpose-B / MLP layer) that
-      reaches XeGPU-WG lowering MUST have its INPUT operands A and B in a 16-bit
-      float type: f16 OR bf16. Both are accepted (the DPAS/XMX unit takes either as
-      inputs); nothing wider (f32/f64) is. The accumulator/output C may (and should)
-      be f32 — XeGPU accumulates in f32. An f32 (or other non-16-bit) A or B either
-      falls off the XMX path or fails to lower.
-      Torch-MLIR imports KernelBench in ALL-f32 (A, B, AND C f32), so any imported
-      matmul VIOLATES this and must be fixed before lowering. FIX (required, applied
-      automatically): mlp_lowering.cast_matmul_operands_to_f16 truncates each
-      matmul's A/B from f32 to a 16-bit float (f16 today) via truncf casts, keeping
-      C f32; the lowering fuses the cast into the tile (in-register truncf). Every
-      lowering entry point runs this on f32-operand matmuls: lower_mlp_to_wg AND
-      lower_linalg_to_wg (plain / transpose-B / batch_matmul). A/B that are ALREADY
-      16-bit (f16 or bf16) satisfy the requirement and are passed through unchanged
-      (no cast). Do NOT feed a wider-than-16-bit A/B matmul to the WG pipeline
-      without the cast.
-
-  - id: lowering_wg_divisible_by_sg
-    name: Workgroup tile must be divisible by subgroup tile
-    severity: critical
-    description: |
-      wg_m % sg_m == 0 and wg_n % sg_n == 0. The subgroup grid is
-      [wg_m/sg_m, wg_n/sg_n]; non-divisible tiles fail to lower.
-
-  - id: lowering_sg_dpas_aligned
-    name: Subgroup + k tiles must be multiples of the DPAS shape
-    severity: critical
-    description: |
-      sg_m % 8 == 0, sg_n % 16 == 0, k_tile % 16 == 0 (DPAS A=[8,16], B=[16,16]).
-      Misaligned tiles either fail to lower or fall off the XMX path.
-
-  - id: lowering_threads_le_1024
-    name: Threads per workgroup must not exceed 1024
-    severity: critical
-    description: |
-      nb_threads = (wg_m/sg_m) * (wg_n/sg_n) * 16 must be <= 1024. Equivalently,
-      the number of subgroups per workgroup must be <= 64. Larger tiles need
-      larger sg tiles to stay within budget.
-
-  - id: lowering_shape_divisible
-    name: Problem dims should be divisible by the tile sizes
-    severity: high
-    description: |
-      For a GEMM MxNxK: M % wg_m == 0, N % wg_n == 0, K % k_tile == 0. If not,
-      choose smaller tiles (boundary handling is not yet generated).
-
-  - id: lowering_large_grf_max_32_subgroups
-    name: Large register file requires <=32 subgroups per workgroup
-    severity: critical
-    description: |
-      Intel Xe (BMG) large-GRF mode doubles per-thread registers but halves the
-      subgroup budget: with large_grf=true, (wg_m/sg_m)*(wg_n/sg_n) must be <= 32
-      (vs 64 default). It is applied at lowering time via the igc option
-      igc-cmd-options=-ze-opt-large-register-file. Pair it with larger subgroup
-      tiles (fewer, heavier subgroups) — that is exactly the register-pressure
-      regime where the extra GRF pays off.
+# The lowering-path consequence of the dtype contract — Torch-MLIR imports
+# KernelBench ALL-f32, so every imported matmul needs the automatic A/B cast — is
+# recorded in lowering_scope_and_findings.yaml
+# (lowering_matmul_f32_operands_cast_to_f16).
 
 patterns:
   - id: lowering_config_balanced_256

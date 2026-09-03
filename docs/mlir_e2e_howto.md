@@ -158,7 +158,7 @@ python examples/KernelBench/test-kernel-bench.py --kernel level1/1_ --print-orig
 
 The dump is **all-f32** (A, B, and C). That's fine — the CLI auto-casts A/B to
 f16 (XeGPU requires 16-bit-float inputs; C stays f32). See the KB constraint
-`lowering_matmul_ab_must_be_16bit_float`.
+`mlir_dpas_operand_dtype_contract`.
 
 ---
 

@@ -131,7 +131,7 @@ patterns:
       The four 128x16 partials are the natural inputs to the online-softmax max/sum
       tree-reductions (arith.maximumf over the 4 partials, then vector.multi_reduction
       along dim 1). Pairs with xegpu_truncf_scores_to_f16_for_pv and
-      xegpu_fp32_accumulator_required.
+      xegpu_f32_accumulator_softmax_recipe.
 
   - id: xegpu_truncf_scores_to_f16_for_pv
     name: "Truncate exp'd softmax scores f32->f16 before the P*V DPAS; keep the accumulator f32"
@@ -164,7 +164,7 @@ patterns:
       %p0_f16 = arith.truncf %p0 : vector<128x16xf32> to vector<128x16xf16>
       %pv = xegpu.dpas %p0_f16, %v0, %acc {layout_a=#qk, layout_b=#v, layout_cd=#out} : vector<128x16xf16>, vector<16x64xf16>, vector<128x64xf32> -> vector<128x64xf32>
     notes: |
-      Reinforces xegpu_fp32_accumulator_required: the rule is f16/bf16 DPAS *inputs*,
+      Reinforces mlir_dpas_operand_dtype_contract: the rule is f16/bf16 DPAS *inputs*,
       f32 *accumulator*. The truncf sits between the softmax exp and the P*V DPAS.
 
   - id: xegpu_softmax_reduction_fastmath

@@ -15,63 +15,51 @@ constraints:
   - id: xegpu_sg_layout_matches_launch_threads
     name: sg_layout product must match subgroups-per-workgroup in gpu.launch_func
     severity: critical
+    stages: [device_specific, autotuning]
     description: |
-      In #xegpu.layout<sg_layout=[a, b], ...>, the product a*b is the number of
-      subgroups per workgroup. It MUST equal (threads-per-workgroup / 16),
-      because each subgroup is one SIMD16 hardware thread.
+      The XeGPU spelling of mlir_subgroup_count_and_grf_budget: in
+      #xegpu.layout<sg_layout=[a, b], ...> the product a*b IS the number of
+      subgroups per workgroup, so it must equal threads-per-workgroup / 16.
 
       If gpu.launch_func declares `threads in (%c128, %c1, %c1)` that is
       128 / 16 = 8 subgroups, so sg_layout must satisfy a*b == 8
       (e.g. [8, 1], [4, 2], [2, 4], [1, 8]). A mismatch causes a lowering
-      failure or wrong results.
+      failure or wrong results. Remember the large-GRF cap of 32 subgroups
+      applies to this same product.
 
-  - id: xegpu_dpas_requires_simd16
-    name: DPAS operations require SIMD16 subgroups on Arc / Xe2
+  - id: xegpu_f32_accumulator_softmax_recipe
+    name: How to apply the f32 accumulator in a WG attention loop — measured 1.364x, the single largest lever
     severity: critical
+    stages: [dtype_fix, algorithmic, device_specific]
+    precondition: |
+      APPLIES to a WG kernel with an scf.for carrying a DPAS accumulator, especially
+      a fused chain where the first DPAS's output feeds a softmax and then a second
+      DPAS (attention: QK^T -> softmax -> PV). If the loop-carried accumulator or the
+      softmax statistics are 16-bit, this rule applies.
     description: |
-      The XMX (DPAS) hardware on Intel Arc (Xe-HPG) and Xe2 expects a SIMD16
-      subgroup width. inst_data should match a supported DPAS tile shape
-      (e.g. [8, 16] for the A/C operand, [16, 16] for B). Picking inst_data
-      that does not map to a DPAS shape forces a fall back to slower code or
-      fails to lower.
+      mlir_dpas_operand_dtype_contract says the accumulator must be f32. This is the
+      concrete WG recipe, and the measurement that shows it is a PERF lever:
 
-  - id: xegpu_fp32_accumulator_required
-    name: Use f32 accumulator for f16/bf16 DPAS — it is a large PERFORMANCE win, not only a precision rule
-    severity: critical
-    description: |
-      xegpu.dpas with f16/bf16 operands must accumulate into an f32 vector
-      (vector<MxNxf32>). Accumulating in f16 loses precision across the K-loop
-      and typically breaks the [ALLCLOSE] check. Only down-cast to f16/bf16 in
-      the epilogue store if the reference allows it.
-
-      DO NOT treat this as a correctness-only rule that can be skipped when
-      [ALLCLOSE] happens to pass. A harness that fills inputs with a uniform
-      magic constant makes softmax exact, so an f16 accumulator can pass ALLCLOSE
-      while still being much SLOWER. f16xf16->f32 is the NATIVE DPAS form: an f16
-      C/D operand forces conversion traffic around every DPAS in the loop, and
-      f16 `vector.multi_reduction` / `math.exp` on a vector<128x64xf16> lower
-      worse than their f32 forms.
       Measured on BMG B580, 4k flash attention (median-of-100, large-GRF, both
       ALLCLOSE TRUE): all-f16 loop 1.4119 ms -> f32 acc + f32 softmax with
-      `arith.truncf` of P to f16 only for the PV DPAS **1.0352 ms = 1.364x
-      faster** (4 runs, 0.8% spread), which also BEAT a hand-tuned reference
-      kernel at 1.0948 ms. So the f32 accumulator was simultaneously the single
-      largest perf lever and the more accurate choice.
-      Apply it as: acc / running-max / running-sum iter_args in f32, the softmax
-      chain (scale, max-reduce, sub, exp, sum) in f32, one `arith.truncf` of P to
-      f16 immediately before the PV DPAS, and one `arith.truncf` in the epilogue
-      before the store.
-      Note the f32 accumulator is ~32 KB/WG, so it REQUIRES large-GRF (default GRF
-      measured 4.2 ms, 4.1x worse) and it consumes the register budget: adding a
+      `arith.truncf` of P to f16 only for the PV DPAS **1.0352 ms = 1.364x faster**
+      (4 runs, 0.8% spread), which also BEAT a hand-tuned reference kernel at
+      1.0948 ms. Note the f16 version PASSED its ALLCLOSE check — the harness fills
+      inputs with a uniform constant, which makes softmax exact — so the correctness
+      gate gave no signal at all here. Check the dtypes structurally.
+
+      Apply it as:
+        * acc / running-max (m_i) / running-sum (l_i) iter_args in f32
+        * the whole softmax chain (scale, max-reduce, sub, exp, sum) in f32
+        * ONE `arith.truncf` of P to f16 immediately before the PV DPAS — that
+          second DPAS still needs a 16-bit A operand (see the contract)
+        * ONE `arith.truncf` in the epilogue before the store
+      i.e. exactly two down-casts, both where the hardware forces one.
+
+      Register cost: the f32 accumulator is ~32 KB/WG, so it REQUIRES large-GRF
+      (default GRF measured 4.2 ms, 4.1x worse) and it consumes the budget — adding a
       K/V prefetch on top of it costs 13% (1.0352 -> 1.1883). See
       xegpu_grf_budget_loop_accumulators and xegpu_prefetch_depth_is_tunable.
-
-  - id: xegpu_dtype_no_f64
-    name: Avoid f64 anywhere in the kernel
-    severity: critical
-    description: |
-      f64 is dramatically slower on Intel XPU and is not a DPAS input type.
-      Use f16/bf16 inputs with f32 accumulation.
 
   - id: xegpu_dpas_operand_dtype_promote
     name: Promote DPAS-unsupported operand dtypes to f16/bf16 before the dpas
@@ -84,7 +72,7 @@ constraints:
       the operands BEFORE the dpas, rather than letting lowering fail or emit a
       slow FMA fallback. Distilled from Intel's AccelerateMatmul mixed-mode
       handling (decomposeMixedModeDotOp promotes fp8->f16; opsPerChannel upcasts).
-      Keep the accumulator f32 (see xegpu_fp32_accumulator_required). Contrast with
+      Keep the accumulator f32 (see mlir_dpas_operand_dtype_contract). Contrast with
       xegpu_cast_inputs_to_bf16 (which fixes an all-f64/f32 kernel); this rule
       specifically covers exotic/mixed operand dtypes DPAS can't take directly.
 

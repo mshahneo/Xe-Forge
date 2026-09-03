@@ -97,7 +97,7 @@ constraints:
       feeds the same DPAS chain, and never accept/reject the direction on a
       one-sided measurement.
       SECOND governor — it is not monotone in kernel structure. Applied on top of
-      an f32 accumulator (xegpu_fp32_accumulator_required) the SAME widening turns
+      an f32 accumulator (xegpu_f32_accumulator_softmax_recipe) the SAME widening turns
       negative again: 1.0352 -> 1.0759 ms (0.962x), because the f32 acc is
       ~32 KB/WG and the wider live load blocks now compete for GRF that the
       accumulator needs (see xegpu_sink_large_load_to_dpas,

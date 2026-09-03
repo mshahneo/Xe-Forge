@@ -1,0 +1,137 @@
+# XeGPU / DPAS hardware contract — shared by EVERY MLIR view
+#
+# knowledge_base/mlir/common/ is loaded for BOTH mlir views:
+#   * dsl=mlir device=linalg — the Linalg->WG lowering agent, which chooses a tile
+#     config (wg_m/wg_n/sg_m/sg_n/k_tile, large_grf) but does not write XeGPU IR
+#   * dsl=mlir device=xpu    — the WG optimizer, which edits #xegpu.layout attrs
+#     and the kernel body directly
+# (see loader._collect_yaml_files: common -> <dsl>/common -> <dsl>/<device>)
+#
+# Put a rule here ONLY if it is a property of the hardware / the XeGPU contract
+# and is therefore true in both views. Anything about *how* to express it in one
+# view — a lowering-config knob, or a concrete IR edit — belongs in
+# mlir/linalg/ or mlir/xpu/ respectively, and should cross-reference the rule
+# here instead of restating it. These invariants were previously stated twice,
+# once per view, with divergent wording and the measured evidence in only one copy.
+#
+# Hardware: Intel Xe2 (Battlemage B580/B570/Pro B) and Xe-HPC (PVC). Subgroup
+# (SIMD) width is 16; the DPAS/XMX systolic array consumes 2D tiles.
+
+language: mlir
+
+constraints:
+  - id: mlir_dpas_operand_dtype_contract
+    name: DPAS takes 16-bit float A/B and accumulates in f32 — this is a PERFORMANCE contract, not only a precision rule
+    severity: critical
+    stages: [dtype_fix, linalg_lowering, device_specific]
+    precondition: |
+      APPLIES to any matmul that reaches XeGPU — linalg.matmul / batch_matmul /
+      transpose-B / an MLP layer on the lowering path, or xegpu.dpas in a WG kernel.
+    description: |
+      The DPAS/XMX unit has ONE native form: 16-bit float inputs, f32 accumulate.
+        * A and B (the multiplied operands) MUST be a 16-bit float — f16 OR bf16.
+          Both are accepted; nothing wider (f32, f64) is.
+        * C / D (the accumulator and result) MUST be f32.
+        * f64 must not appear anywhere in the kernel. It is dramatically slower on
+          Intel XPU and is not a DPAS input type at all.
+      Anything else either falls off the XMX path or fails to lower.
+
+      DO NOT treat the f32 accumulator as a correctness-only rule that may be
+      skipped when the numerics happen to pass. It is simultaneously the single
+      largest performance lever measured on this class of kernel AND the more
+      accurate choice. An f16 C/D operand forces conversion traffic around every
+      DPAS in the loop, and f16 `vector.multi_reduction` / `math.exp` lower worse
+      than their f32 forms. A harness that fills inputs with a uniform constant can
+      make an f16 accumulator pass its tolerance check while still being much
+      SLOWER — so a passing correctness gate is NOT evidence that the dtypes are
+      right. Check the dtypes structurally instead.
+
+      Cost to budget for: an f32 accumulator is large (a 128x64xf32 tile is 32 KB
+      per workgroup) and therefore depends on large-GRF — see
+      mlir_subgroup_count_and_grf_budget, which measures 4.1x WORSE at the default
+      GRF. Down-cast to 16-bit only where the hardware demands it (the second DPAS
+      of a fused chain) and once more in the epilogue before the store.
+    rationale: |
+      f16/bf16-in, f32-out is the shape of the systolic array itself. Every
+      departure either inserts per-DPAS conversion in the hot loop or drops the
+      matmul off XMX onto a much slower FMA path.
+    fix: |
+      // A/B 16-bit, accumulator f32:
+      %acc = arith.constant dense<0.0> : vector<128x64xf32>
+      %c = xegpu.dpas %a, %b, %acc : vector<128x64xf16>, vector<64x64xf16>, vector<128x64xf32> -> vector<128x64xf32>
+      // and one arith.truncf in the epilogue before the store, if the output is 16-bit.
+
+  - id: mlir_subgroup_count_and_grf_budget
+    name: Subgroups = threads/16, <=64 per workgroup (<=32 with large-GRF); large-GRF is a free compile flag worth measuring first
+    severity: critical
+    stages: [device_specific, linalg_lowering, autotuning]
+    description: |
+      One subgroup is one SIMD16 hardware thread, so the subgroup count and the
+      launch geometry are the same number expressed twice:
+        subgroups_per_wg = threads_per_wg / 16
+      and threads_per_wg <= 1024, i.e. subgroups_per_wg <= 64.
+
+      LARGE-GRF HALVES THAT BUDGET. Large register file mode doubles per-thread
+      registers (128 -> 256 GRF) but halves the subgroup budget: with large_grf,
+      subgroups_per_wg must be <= 32. Pair it with larger per-subgroup tiles —
+      fewer, heavier subgroups is exactly the register-pressure regime where the
+      extra GRF pays off.
+
+      Large-GRF is a COMPILE FLAG, not an IR edit, so it is correctness-neutral:
+      identical results, just fewer spills. That makes it the cheapest thing to try
+      on any kernel carrying large loop-carried f32 state, and it should be measured
+      BEFORE spending effort on IR changes. Measured on BMG B580: 1.43x on a
+      Linalg-lowered 4k flash-attention kernel (5.3254 -> 3.7132 ms) and 1.73x on a
+      lighthouse-lowered fused-attention WG kernel. Conversely, at the default 128
+      GRF an FA-class accumulator does not fit and IGC spills (~8.9 KB, ~282
+      spill/fill accesses per loop body) — measured 4.1x worse than large-GRF.
+
+      Because it interacts with everything else, its verdict goes STALE: re-run the
+      sweep after the kernel's register pressure has changed.
+    rationale: |
+      Spills turn register accesses into memory traffic in the innermost loop, which
+      dominates runtime; 256 GRF removes them for a standard 128x64 f32 accumulator.
+      The flag is free correctness-wise, so not setting it on an accumulator-heavy
+      kernel is pure lost performance.
+    fix: |
+      // lowering pipeline options:
+      --gpu-lower-to-xevm-pipeline="xegpu-op-level=workgroup igc-cmd-options=-ze-opt-large-register-file"
+      // and keep subgroups_per_wg <= 32 when it is set.
+
+  - id: mlir_dpas_tile_shape_alignment
+    name: Per-instruction tiles must be multiples of the DPAS shape (A=[8,16], B=[16,16]) on SIMD16
+    severity: critical
+    stages: [device_specific, linalg_lowering]
+    description: |
+      The XMX/DPAS hardware on Xe-HPG (Arc), Xe2 (BMG) and Xe-HPC (PVC) expects a
+      SIMD16 subgroup and consumes fixed 2D tiles: A = [8, 16], B = [16, 16],
+      C = [8, 16]. Every tile shape must be a multiple of these:
+        sg_m % 8 == 0,  sg_n % 16 == 0,  k_tile % 16 == 0
+      In a WG kernel the same rule applies to inst_data, which must itself BE a
+      supported DPAS shape. Misaligned tiles either fail to lower or fall off the
+      XMX path onto a much slower fallback — and a partial/under-utilized MMA issue
+      wastes the whole systolic pass.
+
+      Choosing a legal shape is the floor, not the goal: see the per-view rules on
+      growing the tile to amortize load overhead (mlir/xpu
+      xegpu_sg_tiling_min_duplication, xegpu_widen_load_inst_data_in_pairs) — note
+      those must be applied to ALL loads feeding one DPAS chain together.
+
+  - id: mlir_wg_tile_divisible_by_sg_tile
+    name: Workgroup tile must be exactly partitioned by the subgroup tiles, and the problem by the workgroup tile
+    severity: critical
+    stages: [device_specific, linalg_lowering]
+    description: |
+      The subgroup grid is [wg_m/sg_m, wg_n/sg_n], so the division must be exact:
+        wg_m % sg_m == 0  and  wg_n % sg_n == 0
+      In a WG kernel the equivalent statement is that the layout must tile the
+      operand exactly: sg_layout .* sg_data == the tile shape, elementwise. A
+      prefetch layout must satisfy this in its own right — reusing a replicated
+      compute layout for prefetch multiplies global traffic by the replication
+      factor (a [8,1]/[64,64] compute layout used to prefetch a 64x64 tile fetches
+      it 8 times; the cooperative form is [2,4]/[32,16]).
+
+      One level up, the problem should be divisible by the workgroup tile:
+      M % wg_m == 0, N % wg_n == 0, K % k_tile == 0. Boundary handling is not
+      generated, so if a dimension does not divide, choose smaller tiles rather
+      than relying on masking.

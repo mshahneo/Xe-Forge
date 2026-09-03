@@ -101,7 +101,7 @@ constraints:
     name: f32 matmul A/B operands are auto-cast to f16 on ALL paths (XeGPU needs f16 in)
     severity: info
     description: |
-      Implements the lowering_matmul_ab_must_be_16bit_float requirement. XeGPU/DPAS
+      Implements the mlir_dpas_operand_dtype_contract requirement. XeGPU/DPAS
       needs a 16-bit float A/B (f16 or bf16); C stays f32. Torch-MLIR imports
       KernelBench ALL-f32, so the cast is applied AUTOMATICALLY on EVERY lowering
       entry point:
