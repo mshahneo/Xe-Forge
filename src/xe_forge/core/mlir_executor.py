@@ -69,6 +69,14 @@ _FLOAT = r"([-+]?\d+\.\d+(?:[eE][-+]?\d+)?)"
 # IMEX level-zero profiling (mgpuLaunchKernel when IMEX_ENABLE_PROFILING is set)
 # prints "Median: <ms>" among Min/Max/Avg/Median/Std Dev. This is pure kernel
 # time (warmup + timed loops + cache flush inside the runtime), not host time.
+#
+# The runtime emits this block on **stderr**, not stdout: the IMEX integration
+# tests pipe the runner's stdout into FileCheck, which swallows it, so the
+# perf-tracking CI could not read a median printed there. Which stream it lands
+# on is therefore a property of the LevelZeroRuntimeWrappers build in use, and
+# a build that flips it silently zeroes out every speedup in this file (timing
+# becomes None -> inf -> speedup 1.00 -> every candidate rejected as noise).
+# _extract_time_ms is applied to stdout first and then stderr for that reason.
 _IMEX_MEDIAN_RE = re.compile(r"^\s*Median:\s*" + _FLOAT, re.IGNORECASE | re.MULTILINE)
 # Preferred: an explicitly labeled timing line, e.g.
 #   "Average time (ms): 8.76411"  or  "GPU time: 1.23 ms"
@@ -78,6 +86,33 @@ _TIME_LABELED_RE = re.compile(r"\btime\b[^:\n]*:\s*" + _FLOAT, re.IGNORECASE)
 # Fallback: a bare standalone float on its own line (older rtclock harnesses
 # that print raw seconds). Only used when no labeled line is found.
 _FLOAT_LINE_RE = re.compile(r"^\s*" + _FLOAT + r"\s*$")
+
+
+def _extract_time_ms(text: str, allow_lone_float: bool = True) -> float | None:
+    """Kernel time in ms from one output stream, or None if it holds no timing.
+
+    Precedence: the IMEX profiling "Median:" (pure kernel time), then an
+    explicitly labeled "... time (ms): X", then any labeled "time: X" (the WG
+    harness convention is milliseconds), then — only when *allow_lone_float* —
+    a bare float line from an older raw-seconds rtclock harness.
+    """
+    mi = _IMEX_MEDIAN_RE.search(text)
+    if mi:
+        return float(mi.group(1))
+    m = _TIME_MS_RE.search(text)
+    if m:
+        return float(m.group(1))
+    m = _TIME_LABELED_RE.search(text)
+    if m:
+        return float(m.group(1))
+    if not allow_lone_float:
+        return None
+    seconds: float | None = None
+    for line in text.splitlines():
+        fm = _FLOAT_LINE_RE.match(line)
+        if fm:
+            seconds = float(fm.group(1))
+    return seconds * 1000.0 if seconds is not None else None
 
 
 @dataclass
@@ -298,7 +333,8 @@ class MlirExecutor:
             )
 
         stdout = run.stdout.decode(errors="replace")
-        return self._parse_output(stdout, flop=flop)
+        stderr = run.stderr.decode(errors="replace")
+        return self._parse_output(stdout, flop=flop, stderr=stderr)
 
     def lower_only(
         self, kernel_code: str, pipeline_options: str | None = None
@@ -330,8 +366,16 @@ class MlirExecutor:
             return None
         return lowered.stdout.decode(errors="replace")
 
-    def _parse_output(self, stdout: str, flop: float | None = None) -> ExecutionResult:
-        """Parse correctness marker and rtclock timing from harness stdout."""
+    def _parse_output(
+        self, stdout: str, flop: float | None = None, stderr: str = ""
+    ) -> ExecutionResult:
+        """Parse the correctness marker and the kernel timing from harness output.
+
+        Correctness comes from *stdout* only — ``[ALLCLOSE: ...]`` is the marker
+        the in-file FileCheck harness prints there. Timing is looked for in
+        stdout first and then in *stderr*, because the level-zero runtime's
+        profiling block is emitted on stderr (see _IMEX_MEDIAN_RE).
+        """
         allclose_match = _ALLCLOSE_ANY_RE.search(stdout)
         # If the harness emits an ALLCLOSE marker, trust it; otherwise we treat
         # a clean run as correct (some kernels only print timing).
@@ -340,30 +384,11 @@ class MlirExecutor:
         else:
             correct = True
 
-        # Timing: prefer IMEX profiling "Median:" (pure kernel time) when present,
-        # then an explicitly labeled "Average time (ms): X" (rtclock harness),
-        # then a lone float line (raw-seconds rtclock).
-        time_ms: float | None = None
-        mi = _IMEX_MEDIAN_RE.search(stdout)
-        m = _TIME_MS_RE.search(stdout)
-        if mi:
-            time_ms = float(mi.group(1))
-        elif m:
-            time_ms = float(m.group(1))
-        else:
-            m = _TIME_LABELED_RE.search(stdout)
-            if m:
-                # Labeled but no explicit (ms); assume the harness already
-                # reports milliseconds (the WG convention).
-                time_ms = float(m.group(1))
-            else:
-                # Fallback: a lone float line from a raw-seconds rtclock harness.
-                seconds: float | None = None
-                for line in stdout.splitlines():
-                    fm = _FLOAT_LINE_RE.match(line)
-                    if fm:
-                        seconds = float(fm.group(1))
-                time_ms = seconds * 1000.0 if seconds is not None else None
+        time_ms = _extract_time_ms(stdout)
+        if time_ms is None and stderr:
+            # Only the LABELED forms are accepted from stderr: the lone-float
+            # fallback would happily match any float a runtime warning prints.
+            time_ms = _extract_time_ms(stderr, allow_lone_float=False)
 
         tflops = None
         if flop and time_ms and time_ms > 0:
