@@ -88,6 +88,12 @@ patterns:
       the measured win came from the lighter fastmath route instead (1.92x on the
       small compute-bound softmax, see xegpu_softmax_exp_needs_fastmath), because
       IGC had already selected an exp2 expansion.
+      COUNTER-MEASUREMENT, same kernel: with fastmath<fast> ALREADY on the two hot
+      math.exp ops, rewriting both to explicit math.exp2 with a log2(e)-folded scale
+      measured 0.787x — i.e. 27% SLOWER, not neutral. Once IGC is already on the
+      native path, the explicit rewrite only adds IR for it to re-canonicalize. So the
+      order is not negotiable: apply fastmath first, time it, and reach for this
+      rewrite ONLY if the timing shows the native path was not taken.
 
   - id: xegpu_exp_quotient_fold
     name: "Fold a quotient of exponentials into a single exp of a difference: exp(a)/exp(b) -> exp(a-b)"
