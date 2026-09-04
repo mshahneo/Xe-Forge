@@ -14,6 +14,7 @@ from xe_forge.agents.react_agent import (
     OptimizerReActAgent,
     _BestCandidate,
     _metrics_from_comparison,
+    _verify_mlir,
 )
 from xe_forge.models import DSL, OptimizationStage
 
@@ -101,7 +102,7 @@ def test_verify_tool_records_verified_candidates():
     )
 
     candidate = MLIR_KERNEL + "// tuned\n"
-    assert verify(FakeCode(candidate)) == SUCCESS_MESSAGE
+    assert verify(FakeCode(candidate)).startswith(SUCCESS_MESSAGE)
     assert best.code == candidate
     assert best.speedup == 1.30
 
@@ -121,7 +122,7 @@ def test_verify_tool_does_not_record_rejected_candidates():
             flop=None,
             best=best,
         )
-        assert verify(FakeCode(MLIR_KERNEL + "// x\n")) != SUCCESS_MESSAGE
+        assert not verify(FakeCode(MLIR_KERNEL + "// x\n")).startswith(SUCCESS_MESSAGE)
         assert best.code is None
 
 
@@ -142,6 +143,43 @@ def test_keep_best_or_fail_prefers_a_verified_candidate():
     assert kept.speedup == 1.25
     assert kept.metrics_after == {"time_us": 500.0, "tflops": 20.0}
     assert "GPU-verified" in kept.changes_made[0]
+
+
+def test_success_verdict_reports_the_best_and_the_remaining_budget():
+    """A bare "Success!" is the agent's cue to finish, so say what is banked and left."""
+    executor = FakeMlirExecutor([FakeComparison(speedup=1.20, optimized_time_ms=0.83)])
+    agent = OptimizerReActAgent(executor=executor, dsl=DSL.MLIR)
+    best = _BestCandidate(max_attempts=5)
+    verify = agent._create_verify_tool(
+        original_code=MLIR_KERNEL,
+        kernel_name=None,
+        input_shapes=None,
+        flop=None,
+        best=best,
+    )
+
+    verdict = verify(FakeCode(MLIR_KERNEL + "// tuned\n"))
+    assert verdict.startswith(SUCCESS_MESSAGE)
+    assert "1.200x" in verdict and "0.8300ms" in verdict
+    assert "4 attempt(s) left" in verdict
+    assert "cannot lose it" in verdict, "continuing must read as free, not risky"
+    assert best.attempts == 1
+
+    # Out of budget: stop asking for more and ask for the answer.
+    best.attempts = 5
+    assert "No attempts left" in best.keep_pushing_note()
+
+
+def test_attempts_are_counted_even_when_the_candidate_is_rejected():
+    """The budget is spent by reaching hardware, not by succeeding."""
+    executor = FakeMlirExecutor([FakeComparison(speedup=0.5, is_slower=True)])
+    best = _BestCandidate(max_attempts=3)
+    _verify_mlir(MLIR_KERNEL + "// slow\n", MLIR_KERNEL, executor, best=best)
+    assert (best.attempts, best.attempts_left()) == (1, 2)
+
+    unbounded = _BestCandidate()
+    unbounded.note_attempt()
+    assert unbounded.attempts_left() is None, "no declared budget -> nothing to report"
 
 
 def test_metrics_from_comparison_omits_incomplete_sides():

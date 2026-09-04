@@ -49,10 +49,12 @@ class _BestCandidate:
     well-defined.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_attempts: int | None = None) -> None:
         self.code: str | None = None
         self.speedup: float = 1.0
         self.comparison = None
+        self.attempts = 0
+        self.max_attempts = max_attempts
 
     def offer(self, code: str, speedup: float | None, comparison=None) -> None:
         """Record *code* if it beats the best seen so far (and the input kernel)."""
@@ -61,6 +63,43 @@ class _BestCandidate:
         self.code = code
         self.speedup = speedup
         self.comparison = comparison
+
+    def note_attempt(self) -> None:
+        """Count a candidate that reached the hardware (correct or not)."""
+        self.attempts += 1
+
+    def attempts_left(self) -> int | None:
+        if self.max_attempts is None:
+            return None
+        return max(0, self.max_attempts - self.attempts)
+
+    def keep_pushing_note(self) -> str:
+        """Text appended to a success verdict so the stage doesn't stop at "faster".
+
+        A bare "Success!" is the agent's cue to call finish, so a stage banked its
+        FIRST improvement and quit with iterations unspent: one FA run landed a
+        partial f32 accumulator at 1.13x and stopped, where the full recipe measured
+        1.64x on the same kernel. Now that every verified candidate is kept
+        (see offer), another attempt cannot lose the result already in hand — say so,
+        so continuing reads as free rather than risky.
+        """
+        opt_ms = getattr(self.comparison, "optimized_time_ms", None)
+        where = f" ({opt_ms:.4f}ms)" if isinstance(opt_ms, float) and math.isfinite(opt_ms) else ""
+        note = (
+            f"\nBEST SO FAR THIS STAGE: {self.speedup:.3f}x{where}. It is already saved — this "
+            "stage returns it even if every later attempt fails or errors, so trying again "
+            "cannot lose it."
+        )
+        left = self.attempts_left()
+        if left == 0:
+            return note + "\nNo attempts left: answer now with your best verified kernel."
+        budget = f" You have {left} attempt(s) left." if left is not None else ""
+        return note + (
+            f"{budget} Do NOT finish while you still have a plausible, independent "
+            "improvement: KEEP the change you just verified, add the next optimization on top "
+            "of it, and verify again. Finish only when you are out of ideas or attempts, and "
+            "then answer with your best verified kernel."
+        )
 
 
 def _metrics_from_comparison(comparison) -> tuple[dict | None, dict | None]:
@@ -204,6 +243,8 @@ def _verify_mlir(code, original_code, executor, flop=None, best=None):
 
     if executor:
         try:
+            if best is not None:
+                best.note_attempt()
             comparison = executor.compare_kernels(
                 original_code=original_code,
                 optimized_code=code,
@@ -243,6 +284,9 @@ def _verify_mlir(code, original_code, executor, flop=None, best=None):
             logger.info("MLIR optimization verified: %.2fx speedup", comparison.speedup)
             if best is not None:
                 best.offer(code, comparison.speedup, comparison)
+                # Report the standing best and the remaining budget, so banking one
+                # improvement is not read as "done" (see keep_pushing_note).
+                return SUCCESS_MESSAGE + best.keep_pushing_note()
             return SUCCESS_MESSAGE
         except Exception as e:
             return f"RUNTIME ERROR: {e!s}"
@@ -464,7 +508,13 @@ class OptimizerReActAgent(Optimizer):
 
         def compile_and_verify(optimized_code: dspy.Code["python"]) -> str:  # noqa: UP037
             """Compile and verify the optimized kernel.
-            Returns SUCCESS_MESSAGE on success, or detailed error message.
+
+            Every verified improvement is kept automatically, so calling this again
+            after a success can only find something better — it can never lose the
+            result you already banked.
+
+            Returns SUCCESS_MESSAGE (plus the best result so far and how many
+            attempts remain) on success, or a detailed error message.
             """
             code: str = optimized_code.code
 
@@ -640,7 +690,7 @@ class OptimizerReActAgent(Optimizer):
         # Create verification tool. `best` collects every candidate the tool proves
         # on hardware, so a stage that verifies a winner mid-loop and then answers
         # with something worse still returns the winner instead of its input.
-        best = self.current_best = _BestCandidate()
+        best = self.current_best = _BestCandidate(max_attempts=self.max_iterations)
         verify_tool = self._create_verify_tool(
             original_code=original_code,
             kernel_name=kernel_name,

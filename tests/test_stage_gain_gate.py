@@ -87,7 +87,7 @@ def test_noise_band_gain_is_not_a_win():
 
     best = _BestCandidate()
     executor = FakeMlirExecutor([timed(1.30)])
-    assert _verify_mlir(CANDIDATE, MLIR_KERNEL, executor, best=best) == SUCCESS_MESSAGE
+    assert _verify_mlir(CANDIDATE, MLIR_KERNEL, executor, best=best).startswith(SUCCESS_MESSAGE)
     assert best.code == CANDIDATE
 
 
@@ -96,7 +96,7 @@ def test_marginal_gain_is_retimed_before_the_verdict():
     # record the *confirmed* number, not the first noisy one.
     executor = FakeMlirExecutor([timed(1.02), timed(1.20)])
     best = _BestCandidate()
-    assert _verify_mlir(CANDIDATE, MLIR_KERNEL, executor, best=best) == SUCCESS_MESSAGE
+    assert _verify_mlir(CANDIDATE, MLIR_KERNEL, executor, best=best).startswith(SUCCESS_MESSAGE)
     assert executor.repeats_per_call == [1, 3]
     assert best.speedup == 1.20
 
@@ -127,11 +127,11 @@ def test_untrustworthy_timing_keeps_correctness_only_acceptance():
         speedup=1.0, original_time_ms=float("inf"), optimized_time_ms=float("inf")
     )
     executor = FakeMlirExecutor([no_timing])
-    assert _verify_mlir(CANDIDATE, MLIR_KERNEL, executor) == SUCCESS_MESSAGE
+    assert _verify_mlir(CANDIDATE, MLIR_KERNEL, executor).startswith(SUCCESS_MESSAGE)
     assert executor.repeats_per_call == [1], "an untimed comparison must not be re-timed"
 
     executor = FakeMlirExecutor([timed(1.01, low_confidence=True)])
-    assert _verify_mlir(CANDIDATE, MLIR_KERNEL, executor) == SUCCESS_MESSAGE
+    assert _verify_mlir(CANDIDATE, MLIR_KERNEL, executor).startswith(SUCCESS_MESSAGE)
     assert executor.repeats_per_call == [1]
 
 
