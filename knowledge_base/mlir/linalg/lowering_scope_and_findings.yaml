@@ -289,7 +289,9 @@ constraints:
       bound (128x64 accumulators). Adding the igc pipeline option
       igc-cmd-options=-ze-opt-large-register-file drops it from 4.46ms -> 2.58ms
       (1.73x, IMEX profiling). This is exactly the device-specific lever Xe-Forge
-      should auto-apply to attention kernels. Note: the kernel uses inst_data
+      should auto-apply to ANY register-pressure-bound kernel — the general rule and
+      its budget consequences are mlir_subgroup_count_and_grf_budget; this entry is
+      just the measured instance for the lighthouse attention kernel. Note: the kernel uses inst_data
       [8,16]/[16,16] (NOT array_length [32,32]) despite the filename, so there may
       be further headroom via array_length loads.
 

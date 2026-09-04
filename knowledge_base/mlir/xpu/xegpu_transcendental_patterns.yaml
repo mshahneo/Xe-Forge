@@ -1,6 +1,10 @@
 kb_schema_version: 1
 # XeGPU / XeVM transcendental-function patterns for WG-level MLIR.
-# Covers math.exp / math.exp2 lowering on the softmax / attention hot path.
+# Covers math.exp / math.exp2 lowering wherever a transcendental is evaluated
+# repeatedly (any hot loop or large elementwise tensor). Softmax/attention is the
+# instance these were MEASURED on, not a precondition — every rule triggers on IR
+# features (which ops, which operands, which flags), so it fires on layernorm,
+# GELU, logsumexp, RBF kernels or any other exp-bearing loop too.
 # Hardware focus: Intel Xe2 (Battlemage) and Xe-HPC (PVC) — the native
 # transcendental unit implements exp2/log2; natural exp/log are synthesized.
 language: mlir
@@ -9,30 +13,37 @@ category: optimization
 
 patterns:
   - id: xegpu_exp2_not_exp_softmax
-    name: "Softmax/attention: use math.exp2 with a log2(e) score scale instead of natural math.exp"
+    name: "Use math.exp2 with a log2(e)-folded scale instead of natural math.exp"
     stage: device_specific
     scope: sku_specific
     skus: [bmg, pvc, arc_a770]
-    tags: [exp2, attention, softmax, transcendental, device_specific]
-    expected_speedup: "1.05-1.2x on softmax/attention exp-bound inner loops (maps exp to the native exp2 unit)"
+    tags: [exp2, transcendental, device_specific, softmax, attention]
+    applies_to: [any_kernel_evaluating_math_exp, exp_in_a_loop, prescaled_exp_operand, softmax, attention, layernorm, logsumexp]
+    expected_speedup: "1.05-1.2x on any exp-bound inner loop (maps exp to the native exp2 unit)"
     precondition: |
-      APPLIES ONLY when the kernel evaluates math.exp on the softmax / attention
-      hot path (an online-softmax K-loop: exp of QK^T scores and/or the running-max
-      correction factor). The Intel GPU transcendental unit implements exp2/log2
-      natively; natural math.exp lowers to exp2 PLUS an extra multiply by log2(e)
-      (and IGC may take a slower, more accurate path). Folding the log2(e) factor
-      into the pre-existing softmax score scale makes the exp free of that multiply
-      and routes it straight to the native instruction.
+      DECISION PROCEDURE — apply when ALL of these hold in the IR:
+        1. There is a `math.exp` op (any element type, scalar or vector).
+        2. It is evaluated repeatedly: inside an scf.for / gpu loop, or applied to a
+           tile/tensor large enough that its cost is on the critical path.
+        3. Its operand is (or can cheaply become) the result of a multiply by a
+           loop-invariant scale — `arith.mulf %x, %scale` — OR you are willing to
+           add one multiply, which makes this a wash unless (1)+(2) are strong.
+      Condition 3 is what makes the rewrite free: the log2(e) factor folds into a
+      scale that is already being applied, so the exp2 form costs zero extra
+      arithmetic. The Intel GPU transcendental unit implements exp2/log2 natively;
+      natural math.exp lowers to exp2 PLUS a multiply by log2(e) (and IGC may take a
+      slower, more accurate path).
 
-      Do NOT apply if the exp is NOT on a perf-critical loop, or if the kernel's
+      Do NOT apply if the exp is not on a perf-critical path, if there is no
+      pre-existing scale to fold into and the exp count is small, or if the kernel's
       correctness oracle ([ALLCLOSE]) uses a tolerance tighter than ~1e-3 in a way
       that the exp2 reassociation would break — verify the ALLCLOSE check still
       passes after the rewrite (it normally does: the transform is algebraically
       exact, exp(x) == exp2(x * log2e)).
     description: |
-      Rewrite exp(x) as exp2(x * 1.4426950408889634) and, when the score is already
-      multiplied by a softmax scale s (e.g. 1/sqrt(d)), premultiply the scale by
-      log2(e) = 1.4426950408889634 so the extra multiply disappears: the scores are
+      Rewrite exp(x) as exp2(x * 1.4426950408889634) and, when the operand is already
+      multiplied by a loop-invariant scale s, premultiply that scale by
+      log2(e) = 1.4426950408889634 so the extra multiply disappears: the values are
       scaled by (s * log2e) once, then fed directly to math.exp2. Attach fastmath
       <afn> (approximate-function) to the math.exp2 so IGC selects the fast native
       expansion. This is the MLIR/XeGPU analogue of the Triton
@@ -40,17 +51,18 @@ patterns:
     rationale: |
       The native hardware primitive is exp2, not exp. Natural math.exp = exp2(x) *
       log2(e) costs an extra multiply per element and can select a higher-precision
-      software path. On a 4096-step attention K-loop the exp is evaluated on every
-      score tile, so removing the multiply and hitting the native unit compounds.
-      Because the softmax already applies a scale, the log2(e) factor folds in for
-      free — the rewrite adds zero arithmetic and is algebraically exact.
+      software path. Any loop that evaluates exp per iteration pays that multiply per
+      iteration, so removing it and hitting the native unit compounds with trip count.
+      Whenever the operand already carries a scale (a softmax 1/sqrt(d), a layernorm
+      1/sigma, an RBF -gamma, a temperature), the log2(e) factor folds in for free —
+      the rewrite adds zero arithmetic and is algebraically exact.
     pattern_before: |
-      // scores already scaled by %scale = 1/sqrt(d)
+      // any exp whose operand is already scaled by a loop-invariant %scale
       %qk = xegpu.dpas %q, %kT : vector<128x64xf16>, vector<64x64xf16> -> vector<128x64xf32>
       %scaled = arith.mulf %qk, %scale_bcast : vector<128x64xf32>
       %p = math.exp %scaled : vector<128x64xf32>
     pattern_after: |
-      // fold log2(e) into the score scale: %scale_log2e = %scale * 1.4426950408889634
+      // fold log2(e) into that scale: %scale_log2e = %scale * 1.4426950408889634
       %qk = xegpu.dpas %q, %kT : vector<128x64xf16>, vector<64x64xf16> -> vector<128x64xf32>
       %scaled = arith.mulf %qk, %scale_log2e_bcast : vector<128x64xf32>
       %p = math.exp2 %scaled fastmath<afn> : vector<128x64xf32>
@@ -58,34 +70,43 @@ patterns:
       Verify on device: whether XeVM actually routes math.exp2 + fastmath<afn> to the
       native exp2 instruction (vs. the exp2 pattern already emitted by
       convert-math-to-xevm) must be confirmed by timing — CoVeR/GRF sweep will keep
-      it only if faster AND [ALLCLOSE: TRUE]. See the running-max correction factor
-      too: exp(m_old - m_new) becomes exp2((m_old - m_new) * log2e).
+      it only if faster AND [ALLCLOSE: TRUE]. Apply it to EVERY exp in the loop nest,
+      including the cheap-looking scalar/1-D ones (in an online softmax that is the
+      running-max correction factor: exp(m_old - m_new) becomes
+      exp2((m_old - m_new) * log2e)).
 
       LIGHTER ALTERNATIVE (verified in production): the tuned WG flash-attention
       kernel does NOT hand-rewrite to exp2 — it keeps math.exp and simply tags it
       fastmath<fast>, letting IGC pick the native fast exp expansion. See
       xegpu_softmax_reduction_fastmath. Try that first; use this explicit exp2 +
-      log2e-fold rewrite only if timing shows IGC did not take the native path. The
-      in-file CPU reference of that kernel does spell out the exp2(x * log2e)
-      identity, confirming the transform is algebraically exact.
+      log2e-fold rewrite only if timing shows IGC did not take the native path.
+
+      MEASURED INSTANCE — 4096x4096 f16 flash attention (BMG), WG-level MLIR: the
+      hand-tuned reference kernel's in-file CPU reference spells out the
+      exp2(x * log2e) identity, confirming the transform is algebraically exact
+      there. The 1.05-1.2x figure above is the exp-bound-loop range; on that kernel
+      the measured win came from the lighter fastmath route instead (1.92x on the
+      small compute-bound softmax, see xegpu_softmax_exp_needs_fastmath), because
+      IGC had already selected an exp2 expansion.
 
   - id: xegpu_exp_quotient_fold
     name: "Fold a quotient of exponentials into a single exp of a difference: exp(a)/exp(b) -> exp(a-b)"
     stage: algorithmic
     scope: sku_specific
     skus: [bmg, pvc, arc_a770]
-    tags: [exp, transcendental, strength-reduction, algebraic, softmax, attention, algorithmic]
-    expected_speedup: "removes ONE math.exp and ONE arith.divf per occurrence; compounds over the K-loop"
+    tags: [exp, transcendental, strength-reduction, algebraic, algorithmic, softmax, attention]
+    applies_to: [any_divf_of_two_exps, transcendental_strength_reduction, online_softmax, softmax, attention, logsumexp]
+    expected_speedup: "removes ONE math.exp and ONE arith.divf per occurrence; compounds with loop trip count"
     precondition: |
-      APPLIES when the kernel divides one math.exp by another:
-        %e1 = math.exp %a ; %e2 = math.exp %b ; %q = arith.divf %e1, %e2
-      i.e. a ratio of two exponentials. Classic in the online-softmax running-max
-      correction factor: alpha = exp(-m_new) / exp(-m_old). The identity
-      exp(a)/exp(b) = exp(a - b) is algebraically exact, so it holds for any a, b.
-      Only fold when the numerator and denominator exps are each consumed ONLY by the
-      divf (no other use) -- otherwise the rewrite deletes a value still needed
-      elsewhere. Verify [ALLCLOSE: TRUE] survives (exact in reals; within attention
-      tolerance in f16). Do NOT apply to a lone exp with no dividing partner.
+      DECISION PROCEDURE — a purely local IR match, no workload knowledge needed:
+        1. Find `arith.divf %e1, %e2` where BOTH operands are `math.exp` results
+           (directly, or through a fastmath-tagged exp).
+        2. Check that %e1 and %e2 each have exactly ONE use — the divf. If either exp
+           result feeds anything else, folding deletes a value still needed: skip.
+        3. Apply. The identity exp(a)/exp(b) = exp(a - b) is algebraically exact, so
+           it holds for ANY a, b — no assumption about what the kernel computes.
+      Verify [ALLCLOSE: TRUE] survives (exact in reals; within tolerance in f16).
+      Do NOT apply to a lone exp with no dividing partner.
     description: |
       Replace the divide-of-two-exps with a single exp of the difference of the
       exponents:
@@ -94,22 +115,23 @@ patterns:
       This deletes one math.exp (the expensive transcendental) AND the arith.divf,
       replacing them with a single cheap arith.subf feeding the surviving exp. Carry
       any fastmath flag that was on the original exps onto the surviving exp so this
-      stacks with the native_exp fastmath rewrite. In the online-softmax alpha term
-      where a = (0 - m_new) and b = (0 - m_old), the two subtract-from-zero negations
-      further cancel, so the whole term collapses to exp(m_old - m_new) =
-      math.exp(arith.subf %m_old, %m_new).
+      stacks with the native_exp fastmath rewrite. Look for a second fold on top: when
+      the exponents are themselves negations, a = (0 - x) and b = (0 - y), the two
+      subtract-from-zero ops cancel and the whole term collapses to exp(y - x) =
+      math.exp(arith.subf %y, %x), removing two more ops.
     rationale: |
-      math.exp is the single most expensive op in the softmax correction term (native
-      or software-emulated transcendental) and arith.divf is also costly. exp(a)/exp(b)
-      spends TWO exps plus a divide to compute what exp(a - b) computes with ONE exp
-      plus a subtract. On an attention K-loop this term runs every iteration, so
-      cutting one exp + one divide per step compounds over the sequence. Pure algebraic
-      strength reduction, correctness-neutral in exact arithmetic. NOTE: the analyzer
-      only sees KB *constraints*, so the companion constraint xegpu_redundant_exp_quotient
-      is what makes this smell get detected and routed to the algorithmic stage;
-      without it this pattern, though in the optimizer's context, never fires.
+      math.exp is typically the most expensive op in the expression that contains it
+      (native or software-emulated transcendental) and arith.divf is also costly.
+      exp(a)/exp(b) spends TWO exps plus a divide to compute what exp(a - b) computes
+      with ONE exp plus a subtract. Inside a loop the term runs every iteration, so
+      cutting one exp + one divide per step compounds with the trip count. Pure
+      algebraic strength reduction, correctness-neutral in exact arithmetic. NOTE: the
+      analyzer only sees KB *constraints*, so the companion constraint
+      xegpu_redundant_exp_quotient is what makes this smell get detected and routed to
+      the algorithmic stage; without it this pattern, though in the optimizer's
+      context, never fires.
     pattern_before: |
-      // online-softmax alpha = exp(-m_new) / exp(-m_old)
+      // ratio of two exps -- here an online-softmax alpha = exp(-m_new) / exp(-m_old)
       %37 = arith.subf %cst_0, %m_new : vector<128xf16>    // -m_new
       %38 = math.exp %37 fastmath<fast> : vector<128xf16>
       %39 = arith.subf %cst_0, %m_old : vector<128xf16>    // -m_old
@@ -126,25 +148,43 @@ patterns:
       AND one fewer exp). Complementary to xegpu_exp2_not_exp_softmax. Fold ONLY when
       both source exps feed nothing but the divf.
 
+      MEASURED INSTANCE — the online-softmax running-max correction
+      alpha = exp(-m_new)/exp(-m_old), one occurrence inside the K-loop:
+        * small compute-bound softmax kernel: 1.23x alone, and 2.17x stacked with the
+          fastmath<afn> rewrite (detection fired live from the companion constraint).
+        * 4096x4096 f16 flash attention (BMG): 1.236x.
+      Both are single-occurrence folds, so the ceiling scales with how many exp
+      quotients the kernel actually has.
+
   - id: xegpu_softmax_reduction_fastmath
-    name: "Attach fastmath<fast> to softmax max-reductions and exp on the attention hot path"
+    name: "Attach fastmath<fast> to hot-loop math.exp and arith.maximumf/minimumf reductions"
     stage: device_specific
     scope: sku_specific
     skus: [bmg, pvc, arc_a770]
-    tags: [fastmath, softmax, attention, reduction, exp, device_specific]
-    expected_speedup: "1.05-1.2x on the softmax-bound inner loop"
+    tags: [fastmath, reduction, exp, device_specific, softmax, attention]
+    applies_to: [any_untagged_math_exp, any_untagged_float_reduction, reduction_trees_in_loops, softmax, attention, layernorm, rms_norm]
+    expected_speedup: "1.05-1.2x on a transcendental- or reduction-bound inner loop"
     precondition: |
-      APPLIES to the online-softmax reductions and exp inside an attention K-loop:
-      the arith.maximumf tree that folds the QK partials, the running-max update, and
-      the math.exp of centered scores and of the (m_old - m_new) alpha correction.
+      DECISION PROCEDURE — apply to every op in the loop nest that matches:
+        1. `math.exp` / `math.exp2` / `math.log` / other math.* transcendental with NO
+           `fastmath<...>` on it, or
+        2. `arith.maximumf` / `arith.minimumf` / `arith.addf` forming a REDUCTION —
+           i.e. a pairwise tree over partials, or an op whose result is carried as an
+           scf.for iter_arg and updated each iteration — with no fastmath flag.
+      Tag them all in one edit; the flag is per-op, so a partial pass leaves the
+      slowest op behind. No workload assumption: any loop that reduces floats or
+      calls a transcendental qualifies.
+
       Verify [ALLCLOSE: TRUE] survives -- fastmath<fast> permits reassociation and the
-      fast (approximate) exp expansion; on attention with ~1e-2..1e-3 tolerance this
-      passes. Do NOT apply where the oracle demands bit-accurate exp/reductions.
+      fast (approximate) exp expansion; at ~1e-2..1e-3 oracle tolerance this passes.
+      Do NOT apply where the oracle demands bit-accurate exp/reductions, and prefer
+      fastmath<afn> (transcendentals only, no reassociation) if a reduction-order
+      change is what breaks correctness.
     description: |
-      Add fastmath<fast> to every arith.maximumf used in the softmax max reduction
-      (both the pairwise tree over the 4 QK partials and the running-max update
-      m_ij = max(scaled_max, m_i)) and to every math.exp (the exp of centered scores
-      and the exp of the alpha = m_old - m_new correction). This is the VERIFIED,
+      Add fastmath<fast> to every float reduction op (both a pairwise max/add tree over
+      partials and the loop-carried running update, e.g. m_ij = max(tile_max, m_i)) and
+      to every math.exp in the loop body (including the cheap-looking 1-D or scalar
+      ones — a correction factor is still a transcendental). This is the VERIFIED,
       in-production spelling used by the tuned WG kernel: it keeps math.exp (does not
       hand-rewrite to exp2) and lets IGC route to the fast native exp expansion while
       relaxing reduction ordering.
@@ -152,7 +192,8 @@ patterns:
       Without fastmath, arith.maximumf keeps strict NaN/ordering semantics and
       math.exp may select a higher-precision software path. fastmath<fast> lets IGC
       reassociate the reductions (cheaper tree) and pick the fast exp2-based exp
-      expansion. On a long K-loop the softmax runs every iteration, so this compounds.
+      expansion. Inside a loop these ops run every iteration, so the saving compounds
+      with the trip count.
     pattern_before: |
       %m_t0 = arith.maximumf %qk0, %qk1 : vector<128x16xf32>
       %m_ij = arith.maximumf %m_scaled, %m_i : vector<128xf32>
@@ -164,11 +205,20 @@ patterns:
       %p    = math.exp %centered fastmath<fast> : vector<128x16xf32>
       %alpha = math.exp %m_diff fastmath<fast> : vector<128xf32>
     notes: |
-      Complementary to xegpu_exp2_not_exp_softmax: that pattern folds log2(e) into the
-      score scale and calls math.exp2 (the explicit route, and what the CPU reference
-      emulates); THIS pattern is the lighter-touch route the tuned kernel actually
-      ships -- keep math.exp, just tag fastmath<fast>. Try fastmath first; reach for
-      the explicit exp2 rewrite only if timing shows IGC didn't take the native path.
+      Complementary to xegpu_exp2_not_exp_softmax: that pattern folds log2(e) into a
+      pre-existing scale and calls math.exp2 (the explicit route); THIS pattern is the
+      lighter-touch route the tuned kernel actually ships -- keep math.exp, just tag
+      fastmath<fast>. Try fastmath first; reach for the explicit exp2 rewrite only if
+      timing shows IGC didn't take the native path.
+
+      MEASURED INSTANCE — online-softmax K-loop of a WG flash-attention kernel: the
+      shipped hand-tuned kernel carries fastmath<fast> on both math.exp and
+      arith.maximumf and passes correctness, which is where the 1.05-1.2x range and
+      the "keep math.exp" advice come from. On a small compute-bound softmax the
+      minimal fastmath<afn> variant measured 1.92x on its own and 2.17x stacked with
+      xegpu_exp_quotient_fold; on 4096x4096 f16 flash attention fastmath<fast> on the
+      surviving exponentials was the third of three stacked edits that reached 3.75x
+      in one stage.
 
 constraints:
   - id: xegpu_redundant_exp_quotient
@@ -177,35 +227,41 @@ constraints:
     stage: algorithmic
     scope: sku_specific
     skus: [bmg, pvc, arc_a770]
-    tags: [exp, transcendental, strength-reduction, algebraic, divf, softmax, attention, algorithmic]
+    tags: [exp, transcendental, strength-reduction, algebraic, divf, algorithmic, softmax, attention]
+    applies_to: [any_divf_of_two_exps, transcendental_strength_reduction, softmax, attention, logsumexp]
     precondition: |
       APPLIES when the IR contains arith.divf whose two operands are each a math.exp
-      (directly, or through a fastmath-tagged exp), i.e. exp(a)/exp(b) -- most commonly
-      the online-softmax running-max correction alpha = exp(-m_new)/exp(-m_old) inside
-      an attention/softmax K-loop. This is an ANALYSIS-time trigger: when you see
-      `arith.divf %e1, %e2` where both %e1 and %e2 are `math.exp` results, flag it as an
-      algorithmic issue (issue_type: algebraic_simplification, stage: algorithmic). Do
-      NOT flag a divf whose operands are not both exps, or an exp result that also feeds
-      consumers other than the divf (folding would then delete a still-needed value).
+      (directly, or through a fastmath-tagged exp), i.e. exp(a)/exp(b) -- for ANY a and
+      b, since the identity is unconditional. This is an ANALYSIS-time trigger: when you
+      see `arith.divf %e1, %e2` where both %e1 and %e2 are `math.exp` results,
+      flag it as an algorithmic issue (issue_type: algebraic_simplification, stage:
+      algorithmic). It does not matter what the kernel computes; a common source is an
+      online-softmax running-max correction alpha = exp(-m_new)/exp(-m_old), but
+      logsumexp ratios, importance weights and Boltzmann factors produce the same
+      shape. Do NOT flag a divf whose operands are not both exps, or an exp result that
+      also feeds consumers other than the divf (folding would then delete a
+      still-needed value).
     description: |
       exp(a)/exp(b) computes with TWO transcendental exps and one divide what
       exp(a - b) computes with ONE exp and one subtract. The identity is algebraically
       exact (exp(a)/exp(b) = exp(a-b) for all a, b), so folding it removes one expensive
       math.exp and one arith.divf per occurrence with no accuracy cost in exact
-      arithmetic and none measurable within attention tolerance in f16. On an attention
-      K-loop the alpha correction is evaluated every iteration, so the saving compounds
-      over the sequence length. Because the analyzer only ever sees KB *constraints*
-      (never optimization patterns), this smell must live as a constraint so the analyzer
-      reliably surfaces it as an algorithmic issue and routes it to the algorithmic stage;
-      the actual rewrite lives in pattern xegpu_exp_quotient_fold.
+      arithmetic and none measurable at typical AI tolerances in f16. Inside a loop the
+      quotient is evaluated every iteration, so the saving compounds with the trip
+      count. Because the analyzer only ever sees KB *constraints* (never optimization
+      patterns), this smell must live as a constraint so the analyzer reliably surfaces
+      it as an algorithmic issue and routes it to the algorithmic stage; the actual
+      rewrite lives in pattern xegpu_exp_quotient_fold.
     rationale: |
-      Transcendental exp is the dominant cost in the softmax correction term and divf is
-      also expensive. Spending two exps + a divide where one exp + a subtract suffices is
-      pure waste, repeated every K-iteration. This is the transcendental analogue of a
-      classic strength reduction; it is invisible to the device_specific fastmath rewrite
-      (which makes each exp cheaper but never reduces the exp COUNT), so it needs its own
-      analysis trigger. The two optimizations stack: fold to one exp, then fastmath that
-      exp to native_exp.
+      Transcendental exp is usually the dominant cost in the expression containing it
+      and divf is also expensive. Spending two exps + a divide where one exp + a
+      subtract suffices is pure waste, repeated every iteration. This is the
+      transcendental analogue of a classic strength reduction; it is invisible to the
+      device_specific fastmath rewrite (which makes each exp cheaper but never reduces
+      the exp COUNT), so it needs its own analysis trigger. The two optimizations
+      stack: fold to one exp, then fastmath that exp to native_exp — measured on a
+      softmax K-loop alpha term as 1.23x for the fold alone and 2.17x stacked, and
+      1.236x for the fold on 4096x4096 f16 flash attention.
     fix: |
       // before: exp(a) / exp(b) -> TWO exps + one divf
       %e1 = math.exp %a fastmath<fast> : vector<128xf16>
@@ -217,49 +273,60 @@ constraints:
       // KEEP ONLY IF both source exps fed nothing but the divf and [ALLCLOSE: TRUE] holds.
 
   - id: xegpu_softmax_exp_needs_fastmath
-    name: "Bare natural math.exp on the softmax/attention hot path is a Xe perf defect — needs fastmath<afn>"
+    name: "Bare natural math.exp on a hot path is a Xe perf defect — needs fastmath<afn>"
     severity: warning
     stage: device_specific
     scope: sku_specific
     skus: [bmg, pvc, arc_a770]
-    tags: [fastmath, math.exp, native_exp, transcendental, softmax, attention, device_specific, spirv, igc]
+    tags: [fastmath, math.exp, native_exp, transcendental, device_specific, spirv, igc, softmax, attention]
+    applies_to: [any_untagged_math_exp, transcendental_in_a_loop, softmax, attention, layernorm, gelu, logsumexp]
     precondition: |
-      APPLIES when a kernel evaluates math.exp (and/or arith.maximumf) on a
-      softmax / attention hot path — an online-softmax K-loop over the sequence —
-      and those ops carry NO fastmath flag. This is an ANALYSIS-time trigger: if you
-      see bare `math.exp %x : vectorNxf..` (no `fastmath<...>`) inside the attention
-      inner loop, flag it as a device_specific issue (issue_type: missing_fastmath /
-      slow_transcendental). Do NOT flag exp that is already tagged fastmath, exp that
-      is off the hot path, or kernels whose correctness oracle needs bit-accurate exp.
+      APPLIES when a kernel evaluates math.exp (and/or arith.maximumf) with NO fastmath
+      flag on it, anywhere its cost is repeated — inside any loop, or applied to a tile
+      or tensor large enough to matter. This is an ANALYSIS-time trigger: if you see
+      bare `math.exp %x : vectorNxf..` (no `fastmath<...>`) in the kernel body, flag it
+      as a device_specific issue (issue_type: missing_fastmath / slow_transcendental).
+      The workload is irrelevant to the trigger — softmax and attention are the usual
+      suspects, but layernorm, GELU, logsumexp and any exp-bearing elementwise loop hit
+      the same lowering. Do NOT flag exp that is already tagged fastmath, exp that is
+      demonstrably off the hot path (evaluated once, outside every loop), or kernels
+      whose correctness oracle needs bit-accurate exp.
     description: |
       On Intel Xe, natural math.exp lowers to the SPIR-V OpenCL `exp` builtin. To
       honor OpenCL's tight accuracy ULP requirement, IGC implements that builtin via
-      a SOFTWARE-EMULATED polynomial expansion — expensive, and evaluated on every
-      score element every K-loop iteration. Attaching `fastmath<afn>` (approximate-
-      functions) to the math.exp lets IGC lower it to the hardware `native_exp`
-      instruction instead, which is dramatically cheaper. `afn` is the minimal flag
-      that unlocks native_exp; it does NOT reassociate the surrounding reductions, so
-      it is the accuracy-safest choice. `fastmath<fast>` (a superset that also enables
-      reassoc/contract/nnan/ninf) is an acceptable escalation if timing shows the
-      softmax max/sum reductions also benefit — the tuned reference WG kernel uses
-      `fast` on both math.exp and arith.maximumf and passes correctness.
+      a SOFTWARE-EMULATED polynomial expansion — expensive, and paid on every element
+      of every evaluation. Attaching `fastmath<afn>` (approximate-functions) to the
+      math.exp lets IGC lower it to the hardware `native_exp` instruction instead,
+      which is dramatically cheaper. `afn` is the minimal flag that unlocks native_exp;
+      it does NOT reassociate the surrounding reductions, so it is the accuracy-safest
+      choice. `fastmath<fast>` (a superset that also enables reassoc/contract/nnan/ninf)
+      is an acceptable escalation if timing shows nearby float reductions also benefit —
+      the tuned reference WG kernel uses `fast` on both math.exp and arith.maximumf and
+      passes correctness.
 
       This is a PERFORMANCE constraint, not a correctness gate: for AI/ML workloads
       the fastmath (native_exp) accuracy is acceptable. The rewrite MUST be kept only
-      if the in-file oracle still prints [ALLCLOSE: TRUE] (rtol ~1e-2 is typical for
-      attention) — the pipeline's correctness gate is the backstop. The fix is
-      surgical (add a flag, no structural change) and correctness-preserving within
-      AI tolerances. See pattern xegpu_softmax_reduction_fastmath for the exact edit,
-      and xegpu_exp2_not_exp_softmax for the explicit exp2 + log2e-fold alternative.
+      if the in-file oracle still prints [ALLCLOSE: TRUE] (rtol ~1e-2 is typical) —
+      the pipeline's correctness gate is the backstop. The fix is surgical (add a flag,
+      no structural change) and correctness-preserving within AI tolerances. See
+      pattern xegpu_softmax_reduction_fastmath for the exact edit, and
+      xegpu_exp2_not_exp_softmax for the explicit exp2 + log2e-fold alternative.
     rationale: |
       math.exp -> OpenCL exp -> IGC software emulation is a well-known Xe transcendental
-      bottleneck. On a 4096-step attention K-loop the exp runs on every 128x64 score
-      tile, so software emulation dominates the softmax cost. native_exp (unlocked by
-      fastmath<afn>) removes that emulation. Because the analyzer only ever sees KB
-      *constraints* (never optimization patterns), this fact must live as a constraint
-      so the analyzer reliably surfaces bare hot-path math.exp as an issue and routes
-      it to the device_specific stage — otherwise the fastmath pattern, though present
-      in the optimizer's context, is never triggered.
+      bottleneck, and it does not care what the surrounding algorithm is: every
+      untagged exp pays the polynomial. In a loop that evaluates exp over a tile per
+      iteration, software emulation dominates. native_exp (unlocked by fastmath<afn>)
+      removes that emulation. Because the analyzer only ever sees KB *constraints*
+      (never optimization patterns), this fact must live as a constraint so the analyzer
+      reliably surfaces bare hot-path math.exp as an issue and routes it to the
+      device_specific stage — otherwise the fastmath pattern, though present in the
+      optimizer's context, is never triggered.
+
+      MEASURED INSTANCE — a small compute-bound softmax kernel: adding fastmath<afn> to
+      its math.exp measured 1.92x, and 2.17x when stacked with the exp-quotient fold. A
+      4096-step attention K-loop evaluating exp on every 128x64 score tile is the
+      largest-exposure case seen so far, where the shipped tuned kernel uses
+      fastmath<fast>.
     fix: |
       // before: bare natural exp -> IGC software-emulated OpenCL exp
       %p = math.exp %centered : vector<128x64xf16>

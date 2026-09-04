@@ -39,6 +39,17 @@ named after a kernel makes generic rules look kernel-specific: the register-budg
 and prefetch-pipeline rules apply to any loop streaming large tiles, not only to
 attention. Each entry carries its own `precondition` stating when it fires.
 
+A `precondition` is written as an **IR-feature decision procedure** — which ops,
+which operand types, which layout fields, what to count — never "applies to
+attention". Where a workload is named in one, it is as an example list ("a GEMM
+K-panel, an attention K/V stream, a convolution weight stream all qualify"), not as a
+gate. The test: a precondition should still be actionable for someone who has never
+heard of the kernel it was tuned on. The measurements stay, in a
+**`MEASURED INSTANCE`** block at the end of the `description` (constraints) or `notes`
+(patterns), which records every number *with the conditions it was measured under* —
+kernel, shape, GRF mode, what else was already applied. A number without its
+conditions is how a 1.36x gets re-applied where it measures 0.96x.
+
 - `xegpu_dtype.yaml` — which dtype each value carries; where a cast must go.
 - `xegpu_layout_and_tiling.yaml` — `sg_layout` / `sg_data` / `inst_data`, tile
   geometry, layout propagation, and the register budget for loop-carried state.

@@ -24,9 +24,11 @@ patterns:
       an scf.for reduction) over a tile whose layout gives each lane MORE THAN ONE
       element along the reduction axis — i.e. sg_data / inst_data on the reduced
       dim is > 1, so a lane privately owns several of the values being combined.
-      This is exactly the softmax max/sum over a vector<64x16xf32> tile. Do NOT
-      apply when each lane owns a single element on the reduce axis (nothing to
-      pre-reduce) or when the reduction is already two-stage.
+      Read it off the layout, not off the workload: any max/sum/min over a tile axis
+      qualifies (a softmax max/sum over a vector<64x16xf32> tile, a layernorm
+      mean/variance, an L2 norm, an argmax's max half). Do NOT apply when each lane
+      owns a single element on the reduce axis (nothing to pre-reduce) or when the
+      reduction is already two-stage.
     description: |
       A monolithic within-subgroup reduction along an axis is expensive because it
       is all cross-lane shuffles. When a lane owns k>1 elements along the reduce
@@ -37,7 +39,7 @@ patterns:
       (reduce-owned-elements -> relayout-for-locality -> final reduce); the
       enabling condition there is executionSize == threadsPerWarp with the reduce
       axis lane-multi-valued. Translate ONLY the two-stage principle, NOT the
-      Triton blocked-encoding reshape mechanics. Optionally choose the softmax
+      Triton blocked-encoding reshape mechanics. Optionally choose the tile's
       layout so the reduction axis is lane-local (transpose-for-locality) to make
       the private partial as large as possible.
     rationale: |
@@ -53,5 +55,5 @@ patterns:
       // registers, then a single cross-lane reduction finishes the row:
       %partial = vector.multi_reduction <maximumf>, %lane_owned, %init [1] : vector<64xNxf32> to vector<64xf32>  // register-local, no shuffle
       %m       = <cross-lane reduce of %partial over the subgroup>            // one size-16 shuffle tree
-    expected_speedup: "1.1-1.4x on reduction-bound softmax / row-normalization"
-    applies_to: ["softmax", "layernorm", "reduction", "flash_attention"]
+    expected_speedup: "1.1-1.4x on a reduction-bound row reduction"
+    applies_to: ["any_lane_multivalued_reduce_axis", "shuffle_bound_reductions", "softmax", "layernorm", "reduction", "flash_attention"]

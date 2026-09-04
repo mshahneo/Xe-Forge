@@ -253,6 +253,17 @@ the former `xegpu_flash_attention_patterns.yaml` and `xegpu_wg_patterns.yaml` we
 dissolved into the concern files above: the register-budget, prefetch-pipeline and
 K-slicing rules apply to any loop streaming large tiles. Every entry carries its own
 `precondition` stating when it fires.
+
+Splitting the files was only half of it: the *wording* was attention-framed too, so a
+generic rule still read as a flash-attention rule. Each `precondition` is now an
+**IR-feature decision procedure** (which ops, which operand dtypes, which layout
+fields, what to add up), and the measurements moved into a **`MEASURED INSTANCE`**
+block at the end of the `description` / `notes` that keeps every number *together with
+the conditions it was measured under*. That pairing is the point: the same paired
+`inst_data` widening is +1.237x on an f16 kernel and 0.962x once the accumulator is
+f32, so a number carried without its conditions is actively misleading. Verified by
+diffing the rendered prompts before/after — same entry ids, no measured number
+dropped, and the analyzer still sees the same 13 `critical`/`warning` constraints.
 [`knowledge_base/mlir/README.md`](../knowledge_base/mlir/README.md) is the map,
 including where a new rule belongs.
 

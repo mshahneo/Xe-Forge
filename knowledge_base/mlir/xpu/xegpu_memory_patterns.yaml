@@ -1,5 +1,14 @@
+kb_schema_version: 1
 # XeGPU Workgroup-Level Memory-Access Patterns
 # Prefetching, cache hints, and coalesced 2D block loads for WG-level XeGPU.
+#
+# Every rule triggers on IR features — which ops carry which layout, what the loop
+# streams, where a transpose sits — not on the workload. Attention/GEMM appear only
+# as MEASURED INSTANCE blocks recording where a number came from and under what
+# conditions; do not read them as preconditions.
+language: mlir
+device: xpu
+category: optimization
 
 constraints:
   - id: xegpu_no_dead_prefetch_reads
@@ -76,9 +85,18 @@ constraints:
     scope: sku_specific
 
   - id: xegpu_widen_load_inst_data_in_pairs
-    name: Widening load inst_data pays only when BOTH DPAS operands are widened together — one-sided widening REGRESSES
+    name: Widening load inst_data pays only when ALL loads feeding one DPAS chain are widened together — one-sided widening REGRESSES
     severity: high
     stage: memory_access
+    applies_to: [any_multi_operand_dpas_chain, inst_data_tuning, register_pressure_tradeoffs, gemm, matmul, attention]
+    precondition: |
+      APPLIES whenever you are about to change inst_data on a load_nd that feeds an
+      xegpu.dpas. Enumerate EVERY load feeding that DPAS chain first (both operands of
+      each dpas, and every dpas in a fused chain) — the widening must be one atomic
+      edit across all of them, and its verdict must be measured only in that form.
+      Re-measure from scratch after any change to accumulator dtype or register
+      pressure: the sign of this rewrite depends on the GRF budget, so a previous
+      verdict does not carry forward.
     description: |
       xegpu_distinct_layout_per_access_role says the LOAD role wants the widest
       2D-block message. That is right, but it is NOT a per-load decision you can
@@ -86,35 +104,55 @@ constraints:
       hardware message shape AND the register block the DPAS consumes. Widen the
       load feeding operand A but not operand B and the mismatch inserts a relayout
       that costs MORE than the load messages you saved, so a correct, legal, wider
-      load measures SLOWER in isolation.
-      Measured on BMG B580, 4k flash attention (median-of-100, large-GRF, all
+      load measures SLOWER in isolation. Propose an inst_data widening as ONE atomic
+      edit covering every load that feeds the same DPAS chain, and never accept or
+      reject the direction on a one-sided measurement.
+
+      SECOND GOVERNOR — it is not monotone in kernel structure. Wide loads trade
+      message count against register pressure, so once the loop's live state grows
+      (a promoted f32 accumulator, an added prefetch buffer) the same widening turns
+      negative: the wider live load blocks now compete for GRF the accumulator needs
+      (see xegpu_sink_large_load_to_dpas, xegpu_grf_budget_loop_accumulators).
+
+      THIRD GOVERNOR — do NOT port a wide layout across layout IDIOMS to get there. A
+      kernel whose layouts live in the !xegpu.tensor_desc TYPE can express things a
+      kernel whose layouts are op ATTRIBUTES cannot; transplanting the former's
+      layouts into the latter both regresses and can fail to lower outright
+      (XeGPUPropagateLayout asserts the DPAS B operand needs an anchor layout carrying
+      inst_data).
+
+      MEASURED INSTANCE — BMG B580, 4k flash attention (median-of-100, large-GRF, all
       ALLCLOSE TRUE), starting from an f16 kernel at 1.4119 ms:
         * K/V inst_data [16,16] -> [32,32] ALONE      -> 1.5888 ms (0.888x, WORSE)
         * Q   inst_data [8,16]  -> [16,32] ALONE      -> 1.3957 ms (1.012x, ~noise)
         * BOTH widened together                       -> 1.1410 ms (1.237x)
-      The pair is worth 1.237x; each half alone is worthless or harmful. So:
-      propose an inst_data widening as ONE atomic edit covering every load that
-      feeds the same DPAS chain, and never accept/reject the direction on a
-      one-sided measurement.
-      SECOND governor — it is not monotone in kernel structure. Applied on top of
-      an f32 accumulator (xegpu_f32_accumulator_softmax_recipe) the SAME widening turns
-      negative again: 1.0352 -> 1.0759 ms (0.962x), because the f32 acc is
-      ~32 KB/WG and the wider live load blocks now compete for GRF that the
-      accumulator needs (see xegpu_sink_large_load_to_dpas,
-      xegpu_grf_budget_loop_accumulators). Wide loads trade message count against
-      register pressure; re-measure after any dtype or accumulator change rather
-      than carrying a previous verdict forward.
-      Do NOT port a wide layout across layout IDIOMS to get there: a hand-tuned
-      reference whose layouts live in the !xegpu.tensor_desc TYPE can use
-      sg_layout=[1,1] sg_data=[64,64]; transplanting that onto a kernel whose
-      layouts are op ATTRIBUTES measured 1.6488 ms (0.856x) and first failed to
-      lower outright (XeGPUPropagateLayout asserts the DPAS B operand needs an
-      anchor layout carrying inst_data).
+      The pair is worth 1.237x; each half alone is worthless or harmful. On top of an
+      f32 accumulator (xegpu_f32_accumulator_softmax_recipe, ~32 KB/WG) the SAME paired
+      widening goes negative: 1.0352 -> 1.0759 ms (0.962x). And the cross-idiom
+      transplant (a hand-tuned reference using sg_layout=[1,1] sg_data=[64,64] in the
+      tensor_desc type, moved onto an attribute-layout kernel) measured 1.6488 ms
+      (0.856x).
 
   - id: xegpu_prefetch_depth_is_tunable
     name: Prefetch depth is a tunable, not a free win — suppress it on compute-bound loops
     severity: warning
     stage: device_specific
+    applies_to: [any_streaming_loop_considering_prefetch, compute_bound_loops, cache_resident_operands, short_runtime_kernels, gemm, matmul, attention, softmax]
+    precondition: |
+      DECISION PROCEDURE — before proposing ANY prefetch, classify the loop:
+        1. Is it compute-bound? Count the DPAS/transcendental work per iteration
+           against the bytes loaded per iteration. If arithmetic dominates, or the
+           tile is small relative to the compute on it, prefetch has no latency to
+           hide → depth 0-1.
+        2. Is the streamed operand already cache-resident? If MANY workgroups re-read
+           the SAME tile (the operand is indexed independently of the WG id, or its
+           reuse factor across the grid is high), it is already in L2 and there is no
+           DRAM latency left to hide → prefetch adds only overhead.
+        3. Is total kernel time below ~50us? Then run-to-run noise exceeds any
+           plausible prefetch effect → do not trust a single measurement.
+      Only a loop that streams large contiguous tiles over >=3-4 iterations AND
+      re-reads little AND is latency-bound is a real prefetch candidate. This is a
+      property of the loop's arithmetic-intensity and reuse, not of the workload name.
     description: |
       A prefetch is NOT always beneficial, and there is no automatic cost model
       that decides for you. Intel's production software pipeliner
@@ -124,28 +162,15 @@ constraints:
       relies on the autotuner to dial depth down for kernels where prefetch does
       not pay. Encode that judgement here:
         * COMPUTE-BOUND loops (DPAS/matmul-dominated, or where DPAS throughput
-          already hides global-load latency — e.g. flash-attention QK/PV) should
-          use depth 0-1. Deeper prefetch just adds live tiles and REGRESSES
-          (observed: prefetch measured SLOWER on the FA_wg kernel; the DPAS array,
-          not memory, is the bottleneck).
-          This holds even AFTER the loop has been optimized, which is the natural
-          objection ("compute got cheaper, so latency must now be exposed").
-          Measured on BMG B580, 4k FA at 1.6679 ms (exp-quotient fold + cached
-          hints + fastmath already applied, i.e. compute already 2.2x cheaper than
-          the naive kernel), K+V prefetch on the live descriptors with the CORRECT
-          cooperative-disjoint layout (sg_layout=[2,4] sg_data=[32,16]):
-            depth 1 -> 1.7317 ms (0.963x)   depth 2 -> 1.7367 ms (0.962x)
-            depth 3 -> 1.7419 ms (0.958x)
-          Flat in depth and uniformly negative. The same kernel with the REPLICATED
-          compute layout on prefetch measures 2.0351 ms (0.819x), so getting the
-          layout right (xegpu_dedicated_prefetch_layout) is worth 1.175x of pure
-          overhead removal — but it only removes overhead, it never turns prefetch
-          into a win here. The K/V tiles are already L2-resident because all 32
-          y-blocks of a head re-read the same K/V; there is no exposed DRAM latency
-          left to hide. DO NOT re-litigate prefetch on flash attention: spend
-          memory_access iterations on cache hints and on shortening live ranges.
-        * MEMORY-LATENCY-BOUND loops that stream large contiguous A/B tiles over
-          many (>=3-4) iterations are where deeper prefetch (see
+          already hides global-load latency) should use depth 0-1. Deeper prefetch
+          just adds live tiles and REGRESSES; the systolic array, not memory, is the
+          bottleneck. This holds even AFTER the loop has been optimized, which is the
+          natural objection ("compute got cheaper, so latency must now be exposed") —
+          it did not hold up in measurement.
+        * OPERANDS WITH HIGH CROSS-WORKGROUP REUSE are already L2-resident, so there
+          is no exposed DRAM latency for a prefetch to hide no matter how deep.
+        * MEMORY-LATENCY-BOUND loops that stream large contiguous tiles over many
+          (>=3-4) iterations are where deeper prefetch (see
           xegpu_multibuffer_prefetch_pipeline) actually helps.
         * SMALL / SHORT-RUNTIME kernels (total kernel time < ~50us, e.g. a
           1024x512 softmax at ~30us) are dominated by run-to-run timing noise: a
@@ -156,6 +181,21 @@ constraints:
       Detection trigger: when a memory_access prefetch is proposed on a loop that
       is compute-bound or whose measured runtime is below the noise floor, surface
       this as a warning so the optimizer down-weights / skips it.
+
+      MEASURED INSTANCE — BMG B580, 4k flash attention at 1.6679 ms (exp-quotient
+      fold + cached hints + fastmath already applied, i.e. compute already 2.2x
+      cheaper than the naive kernel), K+V prefetch on the live descriptors with the
+      CORRECT cooperative-disjoint layout (sg_layout=[2,4] sg_data=[32,16]):
+        depth 1 -> 1.7317 ms (0.963x)   depth 2 -> 1.7367 ms (0.962x)
+        depth 3 -> 1.7419 ms (0.958x)
+      Flat in depth and uniformly negative. The same kernel with the REPLICATED
+      compute layout on prefetch measures 2.0351 ms (0.819x), so getting the layout
+      right (xegpu_dedicated_prefetch_layout) is worth 1.175x of pure overhead
+      removal — but it only removes overhead, it never turns prefetch into a win
+      here. The reason is case 2 above: all 32 y-blocks of a head re-read the same
+      K/V, so those tiles are already L2-resident. On THAT kernel class, do not
+      re-litigate prefetch — spend memory_access iterations on cache hints and on
+      shortening live ranges instead.
 
   - id: xegpu_sink_large_load_to_dpas
     name: Do not hoist a large (>~32KB) operand load far from its DPAS — keep its live range short
@@ -213,10 +253,15 @@ constraints:
 
 patterns:
   - id: xegpu_add_prefetch_nd
-    name: Prefetch operand tiles ahead of the K-loop with cache hints
+    name: Prefetch operand tiles ahead of the streaming loop with cache hints
     stage: memory_access
     precondition: |
-      APPLIES ONLY when the kernel body already contains xegpu.load_nd on an
+      FIRST check xegpu_prefetch_depth_is_tunable: on a compute-bound loop, or one
+      whose operand is already cache-resident from cross-workgroup reuse, a correct
+      prefetch is a measured REGRESSION. Only proceed if that classification says the
+      stream is latency-bound.
+
+      Then, APPLIES ONLY when the kernel body already contains xegpu.load_nd on an
       xegpu.tensor_desc created by xegpu.create_nd_tdesc (i.e. the kernel is
       ALREADY in xegpu block-load form — typically a GEMM/MLP lowered by the
       matmul path). It does NOT apply to a vector-dialect kernel whose loads are
@@ -343,15 +388,16 @@ patterns:
     name: Fold a transpose into the 2D block load (stride/shape swap) instead of materializing it
     stage: memory_access
     precondition: |
-      APPLIES when a DPAS operand (typically the B operand, e.g. K in QK^T) is
+      APPLIES when a DPAS operand (typically the B operand of an A*B^T) is
       produced by transposing a freshly loaded tile — i.e. the IR does
-      xegpu.load_nd -> vector.transpose -> (feed dpas). Requires the source to be a
+      xegpu.load_nd -> vector.transpose -> (feed dpas). Match it on that op triple,
+      whatever the operand means. Requires the source to be a
       2-D block tensor_desc (create_nd_tdesc) whose transposed view still satisfies
       the 2D-block alignment preconditions (see xegpu_2d_block_alignment). Do NOT
       apply if the tile is already loaded in the orientation DPAS wants, or if the
       in-register slice-and-transpose form is deliberately used for register
       budget (that is the DISTINCT xegpu_kslice_transpose_dpas pattern — which
-      slices K for DPAS packing; THIS pattern eliminates a standalone transpose op
+      slices B for DPAS packing; THIS pattern eliminates a standalone transpose op
       via a descriptor stride swap).
     description: |
       Never materialize dot(a, trans(load(ptr))) as a separate vector.transpose on
@@ -376,7 +422,7 @@ patterns:
       %k  = xegpu.load_nd %k_tile_t[%c0, %off] <{transpose = array<i64: 1, 0>}> : !xegpu.tensor_desc<64x16xf16, #kt> -> vector<64x16xf16>
       %qk = xegpu.dpas %q, %k, %acc : vector<128x64xf16>, vector<64x16xf16>, vector<128x16xf32> -> vector<128x16xf32>
     expected_speedup: "1.1-1.3x when a B-operand transpose is on the hot path"
-    applies_to: ["gemm", "matmul", "flash_attention"]
+    applies_to: ["any_load_then_transpose_then_dpas", "gemm", "matmul", "flash_attention"]
 
   - id: xegpu_store_nd_contiguous_128b
     name: Coalesce store_nd so each lane writes a contiguous <=128-bit chunk on the stride-1 axis
@@ -412,13 +458,21 @@ patterns:
     stage: memory_access
     scope: sku_specific
     skus: [bmg, pvc, arc_a770]
-    tags: [prefetch, multibuffer, software-pipeline, attention, memory_access, latency-hiding]
-    expected_speedup: "1.2-1.7x on the memory-bound K/V stream of an attention K-loop"
+    tags: [prefetch, multibuffer, software-pipeline, memory_access, latency-hiding, attention]
+    applies_to: [any_tile_streaming_loop, latency_bound_loops, gemm, matmul, attention]
+    expected_speedup: "1.2-1.7x on a memory-latency-bound tile stream"
     precondition: |
-      APPLIES ONLY to a streaming inner loop that walks a large operand tile-by-tile
-      (attention K/V over N_CTX; GEMM K-loop over a long contraction). The win comes
-      from hiding global-load latency, so it applies when the loop is memory-latency
-      bound and there are enough iterations (>= ~3-4) to fill the pipeline.
+      DECISION PROCEDURE — apply only when ALL hold:
+        1. An inner scf.for walks a large operand tile-by-tile with a monotone offset
+           (one xegpu.load_nd per iteration at base + k*BLOCK).
+        2. That stream is MEMORY-LATENCY bound, and the operand is NOT already
+           cache-resident from cross-workgroup reuse. Check this against
+           xegpu_prefetch_depth_is_tunable FIRST — on a compute-bound or
+           already-L2-resident stream this pattern is a measured regression, not a win.
+        3. The loop has enough iterations (>= ~3-4) to fill the pipeline.
+      Any operand that streams this way qualifies (a GEMM K-panel, an attention K/V
+      stream over the context, a convolution's weight stream); what matters is the
+      access shape and the boundedness, not the algorithm.
 
       Do NOT convert a single per-iteration prefetch guarded by scf.if into this form
       naively: an scf.if-guarded, one-iteration-ahead prefetch on this hardware has
@@ -478,8 +532,15 @@ patterns:
         ...
       }
     notes: |
-      Lead distance is a tunable: 3 is the validated value on BMG for a 64-wide K
-      block; deeper pipes cost more register/cache residency for marginal latency
-      gain. Issue the K prefetch AND the V prefetch at the same running offset (both
-      streams advance together in attention). See xegpu_add_prefetch_nd for the base
-      "add a prefetch at all" pattern; this is its production-grade multi-buffer form.
+      Lead distance is a tunable: 3 is the validated value on BMG for a 64-wide tile;
+      deeper pipes cost more register/cache residency for marginal latency gain. When
+      two operands advance together over the same offset (attention's K and V), issue
+      both prefetches at the same running offset rather than pipelining them
+      separately. See xegpu_add_prefetch_nd for the base "add a prefetch at all"
+      pattern; this is its production-grade multi-buffer form.
+
+      MEASURED INSTANCE — the depth-3 branch-free form is the validated one on BMG for
+      a 64-wide tile. On the 4k flash-attention K/V stream, which fails precondition 2
+      (already L2-resident), the same correct form measured 0.958-0.963x across depths
+      1-3 — see the numbers in xegpu_prefetch_depth_is_tunable. That is the intended
+      use of this pattern's precondition: it is not a free win to be applied on sight.

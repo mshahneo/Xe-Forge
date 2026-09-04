@@ -2,7 +2,10 @@ kb_schema_version: 1
 # CONCERN: dtype / precision choices in a WG-level XeGPU kernel.
 #
 # Which dtype each value carries: what DPAS accepts, where a cast has to go, and
-# what the loop-carried softmax state should be. The hardware contract itself is
+# what loop-carried accumulators / reduction state should be. Rules trigger on IR
+# features (iter_arg types, dpas operand types), not on the workload — softmax and
+# attention appear only as the instances they were MEASURED on. The hardware
+# contract itself is
 # stated once in mlir/common/xegpu_hardware_contract.yaml
 # (mlir_dpas_operand_dtype_contract); this file is how to satisfy it in XeGPU IR.
 #
@@ -17,38 +20,59 @@ category: optimization
 
 constraints:
   - id: xegpu_f32_accumulator_softmax_recipe
-    name: How to apply the f32 accumulator in a WG attention loop — measured 1.364x, the single largest lever
+    name: Keep loop-carried accumulators and reduction state in f32, down-cast only where the hardware forces it — measured 1.364x, the single largest lever
     severity: critical
     stages: [dtype_fix, algorithmic, device_specific]
+    applies_to: [any_loop_carried_16bit_accumulator, any_16bit_reduction_state, fused_dpas_chains, gemm, matmul, attention, softmax, layernorm]
     precondition: |
-      APPLIES to a WG kernel with an scf.for carrying a DPAS accumulator, especially
-      a fused chain where the first DPAS's output feeds a softmax and then a second
-      DPAS (attention: QK^T -> softmax -> PV). If the loop-carried accumulator or the
-      softmax statistics are 16-bit, this rule applies.
+      DECISION PROCEDURE — read the scf.for's iter_args and their types:
+        1. Any iter_arg that ACCUMULATES across iterations (a DPAS accumulator, a
+           running sum, a running max/min, a normalizer) whose element type is 16-bit
+           (f16/bf16) → this rule applies to it.
+        2. Any elementwise chain that produces such an accumulator's update and is
+           itself computed in 16-bit → it applies to that chain too.
+        3. Strongest case: a FUSED chain where one DPAS's output is reduced/normalized
+           elementwise and then feeds a second DPAS. Then the 16-bit state is both a
+           precision risk and (measured) a throughput loss.
+      No workload assumption: a GEMM K-loop accumulator, a layernorm running variance,
+      an online-softmax (m_i, l_i) pair and an attention QK^T→softmax→PV chain are all
+      the same shape to this rule — 16-bit state carried across a loop.
     description: |
       mlir_dpas_operand_dtype_contract says the accumulator must be f32. This is the
-      concrete WG recipe, and the measurement that shows it is a PERF lever:
-
-      Measured on BMG B580, 4k flash attention (median-of-100, large-GRF, both
-      ALLCLOSE TRUE): all-f16 loop 1.4119 ms -> f32 acc + f32 softmax with
-      `arith.truncf` of P to f16 only for the PV DPAS **1.0352 ms = 1.364x faster**
-      (4 runs, 0.8% spread), which also BEAT a hand-tuned reference kernel at
-      1.0948 ms. Note the f16 version PASSED its ALLCLOSE check — the harness fills
-      inputs with a uniform constant, which makes softmax exact — so the correctness
-      gate gave no signal at all here. Check the dtypes structurally.
+      concrete WG recipe, and the measurement that shows it is a PERF lever, not just a
+      numerics rule.
 
       Apply it as:
-        * acc / running-max (m_i) / running-sum (l_i) iter_args in f32
-        * the whole softmax chain (scale, max-reduce, sub, exp, sum) in f32
-        * ONE `arith.truncf` of P to f16 immediately before the PV DPAS — that
-          second DPAS still needs a 16-bit A operand (see the contract)
-        * ONE `arith.truncf` in the epilogue before the store
-      i.e. exactly two down-casts, both where the hardware forces one.
+        * every accumulating iter_arg in f32 — the DPAS acc, and the reduction
+          statistics carried with it (in an online softmax: running-max m_i and
+          running-sum l_i)
+        * the whole elementwise chain that computes their updates in f32 (scale,
+          max-reduce, sub, exp, sum)
+        * ONE `arith.truncf` immediately before each DPAS that needs a 16-bit A/B
+          operand — a second, fused DPAS still needs a 16-bit A operand (see the
+          contract), so truncate the value feeding it and nothing else
+        * ONE `arith.truncf` in the epilogue before the store, if the output memref is
+          16-bit
+      i.e. exactly as many down-casts as the hardware forces, each placed at the op
+      that forces it, and none on the loop-carried state itself.
 
-      Register cost: the f32 accumulator is ~32 KB/WG, so it REQUIRES large-GRF
-      (default GRF measured 4.2 ms, 4.1x worse) and it consumes the budget — adding a
-      K/V prefetch on top of it costs 13% (1.0352 -> 1.1883). See
-      xegpu_grf_budget_loop_accumulators and xegpu_prefetch_depth_is_tunable.
+      A 16-bit accumulator CAN PASS the correctness gate and still be the defect: in
+      the measurement below the all-f16 loop printed ALLCLOSE TRUE because the harness
+      fills inputs with a uniform constant, which makes the reduction exact. The
+      correctness gate gives no signal here — check the dtypes STRUCTURALLY, by reading
+      the iter_arg types, not by trusting a passing run.
+
+      Register cost: an f32 accumulator doubles that state's GRF footprint (~32 KB/WG
+      in the measured kernel), so it REQUIRES large-GRF and it CONSUMES the budget —
+      whatever else wants registers (prefetch buffers, extra tiles) now competes with
+      it. See xegpu_grf_budget_loop_accumulators and xegpu_prefetch_depth_is_tunable.
+
+      MEASURED INSTANCE — BMG B580, 4096x4096 f16 flash attention, median-of-100,
+      large-GRF, both variants ALLCLOSE TRUE: all-f16 loop 1.4119 ms → f32 acc + f32
+      softmax with `arith.truncf` of P to f16 only for the PV DPAS **1.0352 ms =
+      1.364x faster** (4 runs, 0.8% spread), which also BEAT a hand-tuned reference
+      kernel at 1.0948 ms. At default GRF the same f32 variant measured 4.2 ms (4.1x
+      worse), and adding a K/V prefetch on top of it cost 13% (1.0352 → 1.1883 ms).
 
   - id: xegpu_dpas_operand_dtype_promote
     name: Promote DPAS-unsupported operand dtypes to f16/bf16 before the dpas
@@ -85,27 +109,37 @@ patterns:
     applies_to: ["gemm", "matmul", "flash_attention"]
 
   - id: xegpu_truncf_scores_to_f16_for_pv
-    name: "Truncate exp'd softmax scores f32->f16 before the P*V DPAS; keep the accumulator f32"
+    name: "Truncate an f32-computed DPAS operand to f16 at the dpas only; keep the accumulator and reduction state f32"
     stage: dtype_fix
     scope: sku_specific
     skus: [bmg, pvc, arc_a770]
-    tags: [dpas, dtype, truncf, attention, mixed-precision, dtype_fix]
-    expected_speedup: "enables the P*V DPAS at full f16 throughput; correctness-preserving"
+    tags: [dpas, dtype, truncf, mixed-precision, dtype_fix, attention, softmax]
+    applies_to: [any_f32_dpas_operand_from_elementwise, fused_dpas_chains, mixed_precision_matmul, attention, softmax]
+    expected_speedup: "enables the DPAS at full f16 throughput; correctness-preserving"
     precondition: |
-      APPLIES to the second matmul of attention, P*V, where P = exp(scores) is
-      computed in f32 (softmax must run in f32 for numerical range) but DPAS-A wants
-      an f16/bf16 input. Do NOT truncate the accumulator or the running softmax
-      statistics (m_i, l_i) -- only the P operand fed to DPAS.
+      DECISION PROCEDURE — apply when the IR contains an xegpu.dpas one of whose A/B
+      operands is an f32 value produced by elementwise arithmetic in the same loop
+      (rather than loaded as f16/bf16). That happens whenever a chain deliberately
+      computes in f32 for dynamic range — an exp, a normalization, a rescale — and then
+      needs to feed a matmul. Truncate ONLY that operand, at the dpas. Do NOT truncate
+      the accumulator, nor any loop-carried reduction state (in an online softmax:
+      m_i, l_i), nor values consumed by anything other than the dpas.
+      Skip if the operand's producer is already 16-bit, or if the f32 range is needed
+      by a later consumer of the SAME value (then truncate a copy).
     description: |
-      After computing the exp'd, centered scores in f32 (vector<128x16xf32> per
-      slice), arith.truncf each to vector<128x16xf16>, then feed those as the A
-      operand of xegpu.dpas against the f16 V slices, accumulating into the f32
-      128x64 output. The softmax max/sum/alpha arithmetic stays entirely in f32.
+      Insert `arith.truncf` on the f32 operand immediately before the dpas — e.g. the
+      exp'd, centered scores computed as vector<128x16xf32> per slice become
+      vector<128x16xf16>, then feed those as the A operand of xegpu.dpas against f16 B
+      slices, accumulating into the f32 128x64 output. Everything upstream (max / sum /
+      rescale arithmetic) stays entirely in f32.
     rationale: |
-      DPAS runs at peak throughput with f16/bf16 inputs and an f32 accumulator.
-      Softmax needs f32 dynamic range (exp of centered scores), but once P is
-      exponentiated its values are in [0,1] and lose little to f16, so truncating
-      only the DPAS-A input keeps peak matmul throughput without hurting [ALLCLOSE].
+      DPAS runs at peak throughput with f16/bf16 inputs and an f32 accumulator, so an
+      f32 A operand is either illegal or takes a slow path. The upstream chain still
+      needs f32 dynamic range, and the value at the dpas boundary usually does not:
+      once scores are exponentiated they lie in [0,1] and lose little to f16. Truncating
+      exactly at the DPAS-A input keeps peak matmul throughput without hurting
+      [ALLCLOSE], while a truncf placed earlier would degrade the f32 chain and one
+      placed on the accumulator would break the contract outright.
     pattern_before: |
       %p0 = math.exp %centered0 fastmath<fast> : vector<128x16xf32>
       // f32 P fed to DPAS -> slow / illegal DPAS-A dtype

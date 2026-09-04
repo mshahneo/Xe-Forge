@@ -40,14 +40,16 @@ constraints:
       applies to this same product.
 
   - id: xegpu_propagate_dpas_layout_epilogue
-    name: Keep the DPAS accumulator layout through the elementwise/softmax epilogue — no intermediate relayouts
+    name: Keep the DPAS accumulator layout through the elementwise epilogue — no intermediate relayouts
     severity: warning
     stage: device_specific
+    applies_to: [any_dpas_with_elementwise_epilogue, gemm, matmul, attention, softmax, activation]
     description: |
       Redundant layout conversions cost cross-lane shuffles/copies. Anchor the
       #xegpu.layout at the ops that MUST fix it (xegpu.dpas, xegpu.load_nd) and
-      propagate that single layout through the elementwise / softmax epilogue
-      chain (scale, sub, math.exp, mul, truncf) to the store, inserting a relayout
+      propagate that single layout through the whole elementwise epilogue chain —
+      whatever it is: bias/scale, sub, math.exp, mul, truncf, an activation — to the
+      store, inserting a relayout
       ONLY where a consumer genuinely demands a different layout. Do NOT emit a
       convert_layout / transpose between the DPAS accumulator and its epilogue
       users just to make an op "fit" — reuse the accumulator's layout downstream.
@@ -57,37 +59,61 @@ constraints:
       through the whole epilogue to store.
 
   - id: xegpu_grf_budget_loop_accumulators
-    name: "Size loop-carried f32 accumulators to the GRF budget; FA-class kernels REQUIRE large-register-file"
+    name: "Budget loop-carried live state against the GRF you actually have — the register file is a shared, zero-sum resource"
     severity: warning
     stage: device_specific
     scope: sku_specific
     skus: [bmg, pvc, arc_a770]
-    tags: [grf, register-pressure, spill, large-register-file, attention, device_specific]
+    tags: [grf, register-pressure, spill, large-register-file, device_specific, attention]
+    applies_to: [any_loop_carried_large_tile, register_pressure_tradeoffs, gemm, matmul, attention, reduction]
     precondition: |
-      APPLIES when a scf.for carries large f32 accumulators/statistics across
-      iterations (e.g. attention: a 128x64xf32 output accumulator = 32 KB per WG tile,
-      plus the resident 128x64xf16 Q tile and running m_i/l_i vectors). Relevant to
-      any WG kernel whose loop-carried live state approaches the register-file size.
+      DECISION PROCEDURE — add up what the scf.for keeps live across iterations:
+        * every iter_arg (accumulators, running statistics), by shape x element width
+        * every tile hoisted out of the loop and held resident (a reused A operand)
+        * every buffer a prefetch/multi-buffer scheme keeps in flight
+      Divide by the subgroup count (product of sg_layout) to get per-thread bytes.
+      This rule applies as soon as that total is within ~2x of the per-thread register
+      file, and it applies to EVERY decision that adds to the total — widening a tile,
+      promoting an accumulator to f32, adding a prefetch stage.
+      It is workload-independent: a GEMM K-loop accumulator, a resident operand tile
+      and an attention (acc, m_i, l_i) triple all draw on the same budget.
     description: |
-      At the default 128 GRF the loop-carried accumulators of a WG flash-attention
-      kernel do not fit and IGC spills (~8.9 KB, ~282 spill/fill accesses in the loop
-      body) -- catastrophic on the hot path. Compile with the large-register-file flag
-      to get 256 GRF: pass igc-cmd-options=-ze-opt-large-register-file through
-      --gpu-lower-to-xevm-pipeline. This is a COMPILE FLAG, not an IR edit, so it is
-      correctness-neutral (identical results, just no spills) -- exactly the kind of
-      knob a GRF-sweep should always try for accumulator-heavy kernels. Conversely,
-      budget the design so loop-carried f32 state fits in 256 GRF: prefer slicing
-      operands (see xegpu_kslice_transpose_dpas) over holding whole tiles resident.
+      The compile-flag half of this is stated once in
+      mlir_subgroup_count_and_grf_budget: large-register-file is a correctness-neutral
+      flag that doubles per-thread registers to 256 GRF, it is the cheapest thing to
+      measure first, and its verdict goes stale once register pressure changes. Do not
+      re-derive it here — set it, and re-sweep it LAST.
+
+      What is specific to writing XeGPU IR is that the register file is then a fixed,
+      SHARED budget which every other optimization competes for, so its consumers must
+      be ranked, not all applied:
+        * prefer SLICING an operand and consuming the slices in sequence over holding a
+          whole tile resident (see xegpu_kslice_transpose_dpas)
+        * treat "add a prefetch buffer" and "promote the accumulator to f32" as
+          COMPETING, not stacking: the accumulator promotion is worth more (measured
+          1.364x, xegpu_f32_accumulator_softmax_recipe) and once it is in place the
+          prefetch on top costs 13% (1.0352 -> 1.1883 ms on 4k FA)
+        * remember large-GRF halves the subgroup budget to <=32 per workgroup, so
+          buying registers costs parallelism
+      If the total does not fit, cut a consumer rather than accepting spills: a spill
+      inside the innermost loop converts a register access into memory traffic.
+
+      MEASURED INSTANCE — WG flash attention, 128x64xf32 accumulator (32 KB per WG
+      tile) plus a resident 128x64xf16 Q tile and running m_i/l_i vectors: fits at
+      256 GRF, does NOT fit at the default 128 GRF, where IGC spills ~8.9 KB with ~282
+      spill/fill accesses per loop body and the kernel measures 4.1x worse.
     rationale: |
-      GRF spills turn register accesses into memory traffic inside the innermost loop;
-      at ~282 spill/fill per iteration over thousands of K-steps this dominates
-      runtime. 256 GRF removes the spills for the standard 128x64 FA accumulator. The
-      flag is free correctness-wise, so failing to set it is pure lost performance on
-      any kernel whose accumulator is large enough to spill at 128 GRF.
+      Register pressure is the one budget in a WG kernel that every optimization spends
+      from, which is why individually-good rewrites stop composing: each extra live tile
+      either evicts another or spills. Reasoning about it as a total, per subgroup,
+      before applying a register-hungry rewrite is what keeps a 1.36x from turning into
+      a 13% loss.
     fix: |
-      // in the RUN / lowering pipeline options:
-      --gpu-lower-to-xevm-pipeline="xegpu-op-level=workgroup igc-cmd-options=-ze-opt-large-register-file"
-      // and keep loop-carried f32 live state <= 256 GRF (slice operands if needed).
+      // 1. set the flag (details: mlir_subgroup_count_and_grf_budget), and re-sweep it
+      //    AFTER the IR changes, not before.
+      // 2. then pick ONE register-hungry rewrite at a time and re-measure:
+      //    slice operands instead of holding tiles resident, and prefer the f32
+      //    accumulator over an extra prefetch buffer when they do not both fit.
 
 patterns:
   - id: xegpu_tune_sg_data_for_dpas
@@ -162,34 +188,41 @@ patterns:
     applies_to: ["gemm", "matmul", "flash_attention"]
 
   - id: xegpu_kslice_transpose_dpas
-    name: "QK^T via 16-row K slices + in-register vector.transpose + unrolled DPAS"
+    name: "A*B^T via row slices of B + in-register vector.transpose + unrolled DPAS"
     stage: device_specific
     scope: sku_specific
     skus: [bmg, pvc, arc_a770]
-    tags: [dpas, register-pressure, transpose, attention, unroll, device_specific]
-    expected_speedup: "1.1-1.3x vs loading the full 64x64 K tile (fewer spills, better DPAS overlap)"
+    tags: [dpas, register-pressure, transpose, unroll, device_specific, attention]
+    applies_to: [any_transposed_b_dpas, register_pressure_tradeoffs, gemm, matmul, attention]
+    expected_speedup: "1.1-1.3x vs loading the full B tile (fewer spills, better DPAS overlap)"
     precondition: |
-      APPLIES to the QK^T matmul of attention (or any A*B^T where B arrives
-      row-major but DPAS wants it as the B/transposed operand) when the full B tile
-      would inflate register pressure. Requires DPAS with an f32 accumulator and f16
-      A/B inputs. Do NOT apply if a hardware transposed-load path is available and
-      cheaper, or if the tile already fits comfortably in registers.
+      DECISION PROCEDURE — apply when ALL hold:
+        1. There is an A*B^T matmul: B arrives row-major in memory but DPAS needs the
+           contraction axis on B's rows, so a transpose is required somewhere.
+        2. Holding the whole B tile live would push the loop's total live state past
+           the register budget (see xegpu_grf_budget_loop_accumulators) — typically
+           because A is also resident and an f32 accumulator is loop-carried.
+        3. The DPAS has an f32 accumulator and 16-bit A/B inputs (the contract).
+      B's row count must be divisible by the slice height (use the DPAS B tile height,
+      16 on SIMD16). Do NOT apply if a hardware transposed-load path is available and
+      cheaper, or if the whole tile already fits comfortably in registers.
     description: |
-      Instead of loading K as one 64x64 tile, load it as 4 slices of 16x64. For each
+      Instead of loading B as one 64x64 tile, load it as 4 slices of 16x64. For each
       slice: xegpu.load_nd -> vector<16x64xf16>, vector.transpose [1,0] ->
-      vector<64x16xf16>, then xegpu.dpas %q_value (128x64), %k_slice_t (64x16),
-      %zero (128x16) -> vector<128x16xf32>. This yields four 128x16 QK partials
-      (columns [0:16],[16:32],[32:48],[48:64] of the 128x64 score tile). Interleave
+      vector<64x16xf16>, then xegpu.dpas %a_value (128x64), %b_slice_t (64x16),
+      %zero (128x16) -> vector<128x16xf32>. This yields four 128x16 output partials
+      (columns [0:16],[16:32],[32:48],[48:64] of the 128x64 result tile). Interleave
       load(slice i+1) with dpas(slice i) so loads overlap compute. The transpose
-      happens in-register because K is stored row-major ([N, D]) but DPAS-B wants D
-      on the contraction axis; encode the transposed layout as order=[0,1].
+      happens in-register because B is stored row-major but DPAS-B wants the
+      contraction axis on its rows; encode the transposed layout as order=[0,1].
     rationale: |
-      Holding the whole 64x64 K tile plus the 128x64 Q tile plus the loop-carried
+      Holding the whole 64x64 B tile plus a 128x64 resident A tile plus a loop-carried
       128x64 f32 accumulator overruns even a 256-GRF budget and forces spills.
-      Slicing K into 16-row chunks caps the live K footprint to one 16x64 slice at a
+      Slicing B into 16-row chunks caps the live B footprint to one 16x64 slice at a
       time; the 4-way unroll keeps 4 independent DPAS in flight for the DPAS pipeline
       while the next slice loads. In-register transpose avoids a separate transposed
-      global load.
+      global load. The partials it produces are also a better shape for any subsequent
+      row-wise reduction than one wide tile.
     pattern_before: |
       %kT = xegpu.load_nd %k_tile[%off, %c0] ... : ... -> vector<64x64xf16>  // whole tile, heavy
       %qk = xegpu.dpas %q_value, %kT, %zero_128x64 : vector<128x64xf16>, vector<64x64xf16>, vector<128x64xf32> -> vector<128x64xf32>
@@ -203,7 +236,13 @@ patterns:
       %qk1 = xegpu.dpas %q_value, %k1, %zero_128x16 {...} -> vector<128x16xf32>
       // ... slices 2, 3 identically -> %qk2, %qk3
     notes: |
-      The four 128x16 partials are the natural inputs to the online-softmax max/sum
-      tree-reductions (arith.maximumf over the 4 partials, then vector.multi_reduction
-      along dim 1). Pairs with xegpu_truncf_scores_to_f16_for_pv and
+      When the matmul feeds a row-wise reduction, the N separate 128x16 partials are
+      the natural reduction inputs: a pairwise arith.maximumf/addf tree over the
+      partials, then one vector.multi_reduction along dim 1 — cheaper than reducing a
+      single 128x64 tile. Pairs with xegpu_truncf_scores_to_f16_for_pv and
       xegpu_f32_accumulator_softmax_recipe.
+
+      MEASURED INSTANCE — the QK^T matmul of a WG flash-attention kernel (Q 128x64f16
+      resident, K 64x64f16 per step, 128x64f32 accumulator loop-carried): this is the
+      spelling the tuned kernel ships, and the 1.1-1.3x range above is measured against
+      loading the full 64x64 K tile there.
