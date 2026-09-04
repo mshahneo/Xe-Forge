@@ -302,6 +302,40 @@ be re-measured per DSL rather than assumed safe (see §8).
 - **`excludes_dsl` / `dsl` / `language` file scoping** — a KB file can state which
   DSLs it applies to, which is how the host-Python `common/` tier is kept out of the
   MLIR views (§6.1).
+- **Per-example fence language** — `loader._fence_language` derives the markdown fence
+  from the example file's extension, so an `.mlir` example is not rendered as
+  ```` ```python ````. Unknown extensions keep `python`, which is what every
+  pre-existing Triton/SYCL example was, so their prompts stay byte-identical.
+
+### 6.5 Full-module examples, and what they cost
+
+[`mlir/xpu/examples/`](../knowledge_base/mlir/xpu/examples/) holds one matched
+before/after pair of the same 4k FMHA WG kernel
+(`fa_4k_f16acc_baseline.mlir` → `fa_4k_f32acc_optimized.mlir`), listed in
+`examples/index.yaml`. What a pair adds over the per-op patterns is the two things a
+pattern cannot show: the **shape of a valid whole module** (`gpu.module` + `gpu.func`
+with `known_block_size`/`known_grid_size`, host `@main` with its `gpu.launch_func`,
+the in-file CPU reference, the allclose print) and the **composition** of eight
+separate patterns — f32 iter_args, the DPAS dtype contract, a single `truncf` at the
+PV operand, the exp-quotient fold, `fastmath<fast>`, a hoisted invariant Q load,
+cache hints, an f32 epilogue — as an ~80-line diff over ~395 lines that are otherwise
+byte-identical.
+
+The cost is real and worth stating: `loader._load_examples` inlines the **full text**
+of every named file into **every** stage in the example's `stages:` list, so this one
+pair takes the `dtype_fix` prompt from 10.9 KB to 62.5 KB. It is scoped to
+`dtype_fix` **only** — that is the stage which has repeatedly failed to land the
+f32-accumulator edit on this kernel class (returning prose or a truncated module),
+and it has the smallest stage prompt. It is deliberately **not** declared for
+`device_specific`, whose prompt is already the largest in this view (42.5 KB) and
+whose win comes from the non-LLM `GRF_SWEEP` rather than from the LLM. Widen that
+list only on a measurement. Examples are invisible to the analyzer, so they cost
+nothing at ANALYSIS.
+
+Both files self-verify `[ALLCLOSE: TRUE]`. They are verbatim copies of the measured
+artifacts, with one honest wart called out in `index.yaml`: the optimized file's CPU
+reference still emulates the *baseline's* f16 softmax numerics and passes anyway
+because the oracle's tolerance absorbs the difference.
 
 ---
 

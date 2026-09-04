@@ -1,0 +1,95 @@
+# Full-module worked examples for the mlir/xpu view.
+#
+# The loader (`_load_examples`) inlines the WHOLE text of every file named here
+# into the prompt of every stage listed in `stages:`, so an example is expensive:
+# each of these modules is ~24 KB. Add one only when a *complete, valid module*
+# teaches something the per-op patterns in ../*.yaml cannot, and scope `stages:`
+# as narrowly as the lesson allows.
+#
+# Convention, same as the pattern files: measured numbers are recorded WITH the
+# conditions they were measured under. A speedup without its conditions cannot
+# be re-checked and gets re-applied where it does not hold.
+
+examples:
+- id: fa_4k_f32acc_last_mile
+  name: "Flash attention 4k, WG-level XeGPU: the f32-accumulator last mile"
+  # dtype_fix ONLY, deliberately. This is the stage that has repeatedly failed to
+  # land the f32-accumulator edit on this kernel class (returning prose or a
+  # truncated module rather than a kernel), and it has the smallest stage prompt,
+  # so it is where a full valid module is worth ~48 KB. device_specific's prompt
+  # is already the largest in this view and its win comes from the non-LLM GRF
+  # sweep, so the pair is NOT declared there -- adding it would inflate the one
+  # stage prompt that is already working. Widen this list only with a measurement.
+  stages:
+  - dtype_fix
+  description: |
+    A matched before/after pair of the SAME 4096x4096 f16 fused multi-head
+    attention forward kernel, both already lowered to the XeGPU *workgroup*
+    dialect (explicit create_nd_tdesc, #xegpu.layout sg_layout/sg_data/inst_data
+    on every op) and both self-verifying against an in-file scalar CPU reference
+    with an [ALLCLOSE] oracle.
+
+    WHAT THIS TEACHES. Not lowering, and not tiling: the baseline already has
+    correct layouts, a K-slice + transposed-B QK^T, and a working online softmax.
+    It teaches the LAST MILE -- the handful of dtype, algebra and residency edits
+    that separate a correct WG kernel from a fast one, and it teaches them as a
+    complete module so the shape of a valid answer is unambiguous: gpu.module +
+    gpu.func with known_block_size/known_grid_size, the host func.func @main with
+    its gpu.launch_func, the CPU reference, and the allclose print all present.
+
+    HOW TO READ IT. Diff the two files. The diff is ~80 lines out of ~395 and
+    every hunk is one of the patterns in ../xegpu_dtype.yaml,
+    ../xegpu_transcendental_patterns.yaml and ../xegpu_memory_patterns.yaml
+    applied to real IR; `optimizations_applied` below lists them in the order
+    they appear. Everything outside those hunks is byte-identical and MUST stay
+    that way -- that is the other half of the lesson.
+
+    ONE INCONSISTENCY, ON PURPOSE. Both files are verbatim copies of the measured
+    artifacts, so the optimized file's CPU reference (and the prose comments
+    around it) still emulate the BASELINE's f16 block-wise numerics. It passes
+    [ALLCLOSE: TRUE] anyway, because the oracle's tolerance absorbs the f16-vs-f32
+    difference in the softmax state. Do not read that reference as a description
+    of the optimized kernel, and do not "fix" the kernel to match it.
+  unoptimized: fa_4k_f16acc_baseline.mlir
+  optimized: fa_4k_f32acc_optimized.mlir
+  optimizations_applied:
+  - "Loop-carried softmax state promoted f16 -> f32: all three scf.for iter_args
+     (running sum, output accumulator, running max) and their init constants,
+     including the -inf sentinel 0xFC00 (f16) -> 0xFF800000 (f32)."
+  - "DPAS dtype contract kept intact while doing so: A/B operands stay f16, only
+     the C/D accumulator becomes vector<128x64xf32> (see
+     xegpu_f32_accumulator_softmax_recipe)."
+  - "arith.truncf of the probability tile placed at the PV dpas operand ONLY --
+     the one point where the hardware forces f16 -- not earlier in the chain
+     (see xegpu_truncf_scores_to_f16_for_pv)."
+  - "exp(-m_new)/exp(-m_old) folded to a single exp(m_old - m_new): one math.exp
+     and one arith.divf deleted from the inner loop (see xegpu_exp_quotient_fold)."
+  - "fastmath<fast> attached to both hot math.exp ops (see
+     xegpu_softmax_exp_needs_fastmath). NOTE the ordering rule in
+     xegpu_exp2_not_exp_softmax: fastmath first, and do NOT then rewrite to an
+     explicit exp2 -- that measured 0.787x on this exact kernel."
+  - "The loop-invariant Q tile load hoisted out of the K loop, with a comment
+     marking it (see xegpu_hoist_invariant_loads)."
+  - "l1/l2/l3 cache_hint<cached> on the streaming K and V load_nd."
+  - "Epilogue normalization done in f32 with a single arith.truncf at the store
+     boundary; the redundant block-id decomposition CSE'd against the values the
+     prologue already computed."
+  expected_speedup: |
+    MEASURED INSTANCE -- 4096x4096 f16 FMHA forward (Z=2, H=8, N_CTX=4096,
+    D_HEAD=64; BLOCK_M=128, BLOCK_N=64) on Intel Xe2 BMG, lowered with
+    xegpu-op-level=workgroup enable-vector-to-xegpu=true and
+    igc-cmd-options=-ze-opt-large-register-file. Large-GRF is part of BOTH files'
+    RUN lines, so none of the numbers below include the separate 1.42x that the
+    GRF sweep contributes.
+      * the pair end-to-end, all eight edits together, median-of-3 through the
+        same MlirExecutor.compare_kernels path Xe-Forge accepts/rejects on:
+        3.7469 -> 1.0316 ms = 3.632x, both [ALLCLOSE: TRUE]. (3.7469 ms agrees
+        with the GRF sweep's large-GRF baseline of 3.7450 ms to 0.05%.)
+      * the f32-accumulator step alone, isolated on this kernel:
+        1.4119 -> 1.0352 ms = 1.364x, the single largest lever measured on it
+        (4 runs, 0.8% spread), which also puts it past the 1.0948 ms hand-tuned
+        reference.
+      * the exp-quotient fold alone, on this kernel: 1.236x.
+    Do not read the pair's 3.632x as any single pattern's speedup -- the two
+    files differ by all eight edits listed above, and the two isolated numbers
+    show how unevenly that total is distributed.

@@ -58,6 +58,26 @@ conditions is how a 1.36x gets re-applied where it measures 0.96x.
 - `xegpu_reductions.yaml` — cross-lane reductions (softmax max/sum, layernorm).
 - `xegpu_transcendental_patterns.yaml` — `math.exp`/`exp2`, fastmath, algebraic
   folds on the softmax.
+- `examples/` — whole-module before/after pairs, listed in `examples/index.yaml`.
+
+## Examples cost real prompt budget
+
+`loader._load_examples` inlines the **entire** text of every file an example names
+into the prompt of **every** stage in its `stages:` list. The one MLIR example
+(`fa_4k_f32acc_last_mile`, a ~24 KB pair) takes the `dtype_fix` prompt from 10.9 KB
+to 62.5 KB on its own. So:
+
+- Add a full-module example only when a *complete, valid module* teaches something
+  the per-op patterns cannot — here, the shape of a valid answer (`gpu.module` +
+  `gpu.func` with `known_block_size`/`known_grid_size`, host `@main` with its
+  `gpu.launch_func`, CPU reference, allclose print) plus the exact minimal diff.
+- Scope `stages:` as narrowly as the lesson allows, and say in a comment why those
+  stages and not others. Widen the list only on a measurement.
+- Examples are invisible to the analyzer (`_get_kb_context` reads constraints
+  only), so they cost nothing at ANALYSIS.
+- The fence language is derived from the file extension (`loader._fence_language`),
+  so `.mlir` examples render as ```` ```mlir ````; unknown extensions stay
+  `python`, which is what every pre-MLIR example was.
 
 ## Conventions
 

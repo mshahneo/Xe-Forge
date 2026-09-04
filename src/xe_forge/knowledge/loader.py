@@ -124,6 +124,10 @@ class KnowledgeExample:
     expected_speedup: str = ""
     unoptimized_code: str = ""
     optimized_code: str = ""
+    # Markdown fence language for the rendered code blocks. Derived from the
+    # example file's extension so an MLIR example is not fenced as ```python.
+    # Defaults to "python", which is what every pre-MLIR example was.
+    language: str = "python"
 
 
 # ---------------------------------------------------------------------------
@@ -288,12 +292,18 @@ class KnowledgeBase:
                     lines += [
                         "",
                         "### Unoptimized:",
-                        "```python",
+                        f"```{ex.language}",
                         ex.unoptimized_code.strip(),
                         "```",
                     ]
                 if ex.optimized_code:
-                    lines += ["", "### Optimized:", "```python", ex.optimized_code.strip(), "```"]
+                    lines += [
+                        "",
+                        "### Optimized:",
+                        f"```{ex.language}",
+                        ex.optimized_code.strip(),
+                        "```",
+                    ]
                 lines.append("")
             parts.append("\n".join(lines))
 
@@ -576,6 +586,17 @@ def _normalize_stage(stage_str: str) -> OptimizationStage | None:
     return None
 
 
+_FENCE_LANGUAGES = {".py": "python", ".mlir": "mlir", ".cpp": "cpp", ".hpp": "cpp"}
+
+
+def _fence_language(filename: str | None) -> str:
+    """Markdown fence language for an example file. Unknown extensions stay
+    "python" so every pre-existing (Triton/SYCL) example renders unchanged."""
+    if not filename:
+        return "python"
+    return _FENCE_LANGUAGES.get(Path(filename).suffix.lower(), "python")
+
+
 def _load_examples(kb: KnowledgeBase, examples_dir: Path) -> None:
     """Load full code examples from the examples/ subdirectory."""
     index_file = examples_dir / "index.yaml"
@@ -629,6 +650,8 @@ def _load_examples(kb: KnowledgeBase, examples_dir: Path) -> None:
         # A "file" key means there is only one file (the optimized version).
         unopt_fname = ex_meta.get("unoptimized")
         opt_fname = ex_meta.get("optimized") or ex_meta.get("file")
+
+        example.language = _fence_language(opt_fname or unopt_fname)
 
         if unopt_fname:
             fp = examples_dir / unopt_fname
