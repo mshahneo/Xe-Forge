@@ -204,8 +204,23 @@ patterns:
            because A is also resident and an f32 accumulator is loop-carried.
         3. The DPAS has an f32 accumulator and 16-bit A/B inputs (the contract).
       B's row count must be divisible by the slice height (use the DPAS B tile height,
-      16 on SIMD16). Do NOT apply if a hardware transposed-load path is available and
-      cheaper, or if the whole tile already fits comfortably in registers.
+      16 on SIMD16). Do NOT apply if the whole tile already fits comfortably in
+      registers.
+
+      NOTE — there is no hardware transposed-load escape hatch at WG level. An
+      earlier version of this rule said to prefer one "if available and cheaper".
+      That was wrong: `transpose` on `xegpu.load_nd` is silently dropped by the WG
+      lowering pass, so that path yields a wrong kernel. See constraint
+      xegpu_wg_loadnd_transpose_attr_dropped. An in-register `vector.transpose` is
+      the ONLY correct way to transpose a DPAS operand at WG level.
+
+      Both upstream WG flash-attention tests do exactly that, and both pass on
+      random input: flash_attention_fwd.mlir and
+      flash_attention_fwd_ov_with_arrray_len_4k.mlir each keep an in-loop
+      `vector.transpose` on K (in the 4k test it is line 121, inside the K loop
+      that starts at line 81). So "the fast hand-tuned kernel avoids the in-loop
+      vector.transpose" is FALSE — do not flag an in-loop K `vector.transpose` as a
+      defect by comparison to those kernels, because they have one too.
     description: |
       Instead of loading B as one 64x64 tile, load it as 4 slices of 16x64. For each
       slice: xegpu.load_nd -> vector<16x64xf16>, vector.transpose [1,0] ->
