@@ -1,0 +1,117 @@
+kb_schema_version: 1
+# DRAM roofline rules for memory-intensive (bandwidth-bound) kernels.
+#
+# These are about DECIDING WHETHER TO OPTIMIZE AT ALL and about NOT BELIEVING A
+# BAD MEASUREMENT. They are deliberately DSL-independent: the arithmetic is the
+# same for Triton, MLIR/XeGPU, SYCL and Gluon, so this file is NOT excluded from
+# any dsl view.
+#
+# Source of the numbers: a fused-softmax study on Intel Arc B580 (Xe2/Battlemage),
+# Triton 3.8.0+git871667a6, f32, square shapes 1K/2K/4K/8K. Full report and raw
+# dumps: /data/gta/upstream/triton-softmax-study/REPORT.md
+category: analysis
+
+constraints:
+  - id: bw_compute_dram_roofline_before_optimizing
+    name: "Compute the DRAM roofline first; a kernel already at >=85% of peak has no headroom left"
+    severity: critical
+    # analysis: where the decision is made. memory_access + device_specific: the two
+    # stages that would otherwise spend budget on cache hints, prefetch and cheaper
+    # math for a kernel whose pipe is already full.
+    stages: [analysis, memory_access, device_specific]
+    description: |
+      For any kernel whose arithmetic intensity is low (a normalization, an
+      elementwise chain, a reduction, a copy/transpose, an embedding gather —
+      anything that touches each element a small constant number of times), the
+      FIRST step is arithmetic, not code:
+
+        min_bytes = (bytes that MUST be read) + (bytes that MUST be written)
+        achieved_GBs = min_bytes * 1e-9 / (kernel_seconds)
+        pct_peak     = 100 * achieved_GBs / peak_dram_GBs
+
+      Use the MINIMUM traffic the algorithm allows, not the traffic the current
+      code performs. For a row-wise softmax over an MxN f32 matrix that is
+      2*M*N*4 bytes: read the matrix once, write it once.
+
+      Board peaks: Arc B580 = 456 GB/s, Arc B570 = 380 GB/s.
+
+      DECISION RULE:
+        pct_peak >= 85%  -> STOP. The kernel is at the practical DRAM ceiling.
+                            Further instruction-level work (better exp, cheaper
+                            division, fewer masks, prefetch) cannot help, because
+                            the pipe is the limit. Only reducing min_bytes can:
+                            fusion, a smaller dtype, or not materializing a
+                            tensor at all.
+        60-85%           -> real headroom. Work on access width, coalescing and
+                            masks (the memory-side rules), in that order.
+        < 60%            -> suspect uncoalesced or narrow access, or a launch
+                            geometry that under-occupies the machine. Check the
+                            per-lane access width before anything else.
+
+      MEASURED INSTANCE (Arc B580, f32 fused softmax, device kernel time, median
+      of 500 runs): 4096x4096 = 339.0 us = 396.0 GB/s = 86.8% of peak;
+      8192x8192 = 1336.4 us = 401.7 GB/s = 88.1% of peak. Both are past the stop
+      line, and both were reached with NO cache hints, NO prefetch, NO 2-D block
+      loads and NO fast division — which is the point: those knobs were not the
+      binding constraint. The only optimization worth 4x on this kernel was
+      fusion, i.e. cutting min_bytes.
+
+  - id: bw_working_set_must_exceed_l2_or_measurement_is_not_dram
+    name: "A working set that fits in L2 does not measure DRAM bandwidth; %peak > 100% is the tell"
+    severity: critical
+    # autotuning too: a config chosen on an L2-resident size does not transport.
+    stages: [analysis, autotuning]
+    description: |
+      Before believing any GB/s number, compare the working set against the L2:
+
+        Arc B580 (BMG): 18 MiB L2, 256 B line
+        Arc B570:       18 MiB L2
+
+      If (bytes read + bytes written) is at or below L2, the run is measuring L2
+      bandwidth, not DRAM. The measurement is still valid as a latency number but
+      the "% of peak DRAM" column is meaningless, and speedups found there will
+      NOT transport to the large shapes.
+
+      HOW TO SPOT IT: an achieved bandwidth ABOVE the board's DRAM peak. That is
+      arithmetically impossible from DRAM, so it proves cache residency.
+
+      MEASURED INSTANCE (Arc B580, peak 456 GB/s), f32 softmax:
+        1024x1024 =   8 MB working set -> torch.softmax reported 551.6 GB/s (121% of peak)
+        2048x2048 =  34 MB             -> torch.softmax reported 536.9 GB/s (118% of peak)
+        4096x4096 = 134 MB             -> 422.0 GB/s  (honest)
+        8192x8192 = 537 MB             -> 404.9 GB/s  (honest)
+      A 256 MB scratch-buffer L2 flush before every iteration did NOT make the
+      two small shapes DRAM-bound; the kernel reloads its own input immediately.
+
+      CONSEQUENCE FOR TUNING: on the two L2-resident shapes the same Triton
+      kernel LOST to torch.softmax (0.79x, 0.80x) while it TIED at the two DRAM
+      shapes (0.94x, 0.99x). The small shapes are dominated by launch and
+      fixed per-kernel cost, so they reward different changes than the large
+      ones. Tune and report at a size above L2, or state the residency
+      explicitly.
+
+      This is why a size sweep can look non-monotonic: see the Xe-Forge softmax
+      1k/2k/4k/8k sweep, where per-size verdicts disagreed.
+
+  - id: bw_do_not_credit_a_win_below_measurement_noise
+    name: "Bandwidth-bound kernels sit in a narrow band; require median-of-N and a real margin"
+    severity: warning
+    stages: [analysis, autotuning]
+    description: |
+      A kernel at 85-90% of DRAM peak cannot move much, so candidate speedups
+      land close to noise. Two rules:
+
+      1. Report the MEDIAN of many runs, not a single timing, and quote a spread
+         (p20-p80). The softmax study used 500 warmup + 500 measured iterations
+         with a device-side kernel-time profiler.
+      2. Beware benchmark helpers whose "warmup"/"rep" arguments are a TIME
+         BUDGET IN MILLISECONDS rather than an iteration count.
+         `triton.testing.do_bench` is one: passing rep=500 asks for 500 ms of
+         back-to-back iterations, and it batches them without a synchronize.
+         In the softmax study that changed the reported median by roughly 8x on
+         the L2-resident shapes. An explicit
+         `perf_counter -> call -> synchronize` loop is unambiguous.
+
+      Also keep JIT bookkeeping out of the timed region: cache the compiled
+      kernel and its launch geometry per shape, or the first-call compile path
+      shows up as latency.

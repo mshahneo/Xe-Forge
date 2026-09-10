@@ -95,6 +95,31 @@ patterns:
       order is not negotiable: apply fastmath first, time it, and reach for this
       rewrite ONLY if the timing shows the native path was not taken.
 
+      CROSS-CHECK — the Intel Triton backend already does this rewrite for you, and
+      does it WITHOUT any fast-math flag. In a f32 fused-softmax study on Arc B580
+      (see /data/gta/upstream/triton-softmax-study/REPORT.md), the
+      TritonIntelGPU->LLVM conversion turns every f32 exp into
+      `fmul %x, 0x3FB8AA3B` (= log2(e)) followed by `llvm.exp2.f32`, unconditionally
+      and with no fastmath required — the rewrite is hardcoded in
+      ElementwiseOpToLLVM.cpp createDestOps(math::ExpOp) and is gated only on the
+      element type being 32-bit (non-f32 falls through to the library expf). It
+      deliberately calls `llvm.exp2.f32` rather than emitting math::Exp2Op, to avoid
+      that op's denorm flushing. In the Xe2 ISA it lands as exactly ONE
+      `math.exp (32|M0) ... // ALU pipe: math` per element.
+      TWO THINGS THIS PINS DOWN:
+      1. On Xe2 the ISA mnemonic `math.exp` IS the base-2 exponential unit — that is
+         precisely why the explicit `* log2(e)` multiply sits in front of it. Seeing
+         `math.exp` in an ISA dump does NOT mean the natural-base software path was
+         taken; it means the native unit was reached.
+      2. It corroborates the 0.787x counter-measurement above rather than
+         contradicting it. The production toolchain reaches the native exp2 unit on
+         its own, so hand-writing exp2 in the MLIR adds IR without adding hardware
+         reach. Keep the order: fastmath first, time it, explicit rewrite only if the
+         timing proves the native path was missed.
+      Caveat on transporting this: the Triton study never A/B-timed exp vs exp2 (its
+      kernel was at 87-88% of DRAM peak, where a math-pipe change cannot show up), so
+      it is evidence about WHICH INSTRUCTION IS REACHED, not about speed.
+
   - id: xegpu_exp_quotient_fold
     name: "Fold a quotient of exponentials into a single exp of a difference: exp(a)/exp(b) -> exp(a-b)"
     stage: algorithmic

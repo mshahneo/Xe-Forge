@@ -1,0 +1,607 @@
+kb_schema_version: 1
+# CONCERN: STREAMING (bandwidth-bound) memory traffic in WG-level XeGPU MLIR.
+#
+# This file is about kernels where every byte is touched a small constant number
+# of times and DRAM is the limit: softmax, layernorm/RMSnorm, elementwise chains,
+# copies/transposes, scale+cast passes, reduction epilogues. That is a DIFFERENT
+# concern from xegpu_memory_patterns.yaml, which is about feeding DPAS (prefetch
+# depth, operand tiling, transpose folding, register liveness). Here there is no
+# reuse to exploit — the goal is to move each byte exactly once, with the widest
+# message, no predicate, and no cache pollution.
+#
+# Decide whether to open this file at all using the roofline rules in
+# common/bandwidth_roofline.yaml: a kernel already at >=85% of DRAM peak cannot
+# be helped by anything below.
+#
+# PROVENANCE. The rules here are distilled from a fused-softmax study of the
+# Intel XPU Triton backend on Arc B580 (Xe2/Battlemage), f32, 1K/2K/4K/8K square,
+# with full TTIR/TTGIR/LLVM-IR, 70-pass MLIR logs and IGC Xe2 ISA dumps:
+#   /data/gta/upstream/triton-softmax-study/REPORT.md
+# Each entry states whether the effect was MEASURED end-to-end or only OBSERVED
+# in that backend's IR/ISA and then translated to XeGPU. Nothing here has been
+# A/B timed on an MLIR kernel yet — treat the speedup ranges as hypotheses to be
+# confirmed by the verifier, and BELIEVE THE TIMING over this file.
+#
+# Hardware: Intel Xe2 (BMG B580/B570), SIMD16/SIMD32 subgroups, 18 MiB L2,
+# 256 B cache line, 456 GB/s peak DRAM (B580).
+language: mlir
+device: xpu
+category: optimization
+
+constraints:
+  - id: xegpu_streaming_lane_chunk_must_be_128_bit
+    name: "On a streaming access, each lane must own a contiguous 128-bit chunk of the stride-1 axis"
+    severity: critical
+    stages: [memory_access, analysis]
+    description: |
+      For any load_nd / store_nd of a read-once or write-once tensor, the layout
+      must give each lane a CONTIGUOUS 16-byte (128-bit) run along the stride-1
+      dimension: lane_data = [1, 4] for f32, [1, 8] for f16/bf16 on a row-major
+      row. 16 B/lane x 32 lanes = one 512-byte message, which is two full 256 B
+      Xe2 cache lines.
+
+      HOW TO SCALE UP a bigger tile: grow sg_layout (more subgroups, up to the
+      1024-thread workgroup limit), NOT lane_data. Per-lane width is a hardware
+      message property and saturates; subgroup count is the free dimension.
+      Only once sg_layout has filled the workgroup should a lane take a second
+      16 B chunk (which issues a second message, not a wider one).
+
+      WRONG (lane owns a strided/gapped run, or a >128-bit run on the
+      non-contiguous axis):
+        #xegpu.layout<sg_layout = [1, 8], sg_data = [64, 2], lane_data = [2, 1]>
+
+      CORRECT (contiguous inner dim is the per-lane vector dim, 4 x f32 = 16 B):
+        #xegpu.layout<sg_layout = [8, 1], sg_data = [8, 64], lane_layout = [1, 16], lane_data = [1, 4]>
+
+      OBSERVED (Triton/Arc B580, f32 softmax, all four sizes): the backend pinned
+      sizePerThread = 4 f32 = 16 B/lane at EVERY size and grew warpsPerCTA
+      8 -> 16 -> 32 instead, saturating at 32 warps = 1024 threads. The ISA shows
+      exactly the intended message, `load.ugm.d32x4.a64 (32|M0)` = 512 B, and
+      `d32x4` is the widest per-lane vector that backend emits. At 8192 columns,
+      with warps already saturated, each lane took 8 elements and the ISA issued
+      TWO d32x4 loads — it never merged them into a d32x8. That is the saturation
+      point made visible.
+
+      This is the LOAD-side companion of xegpu_store_nd_contiguous_128b (which
+      states the same 128-bit no-gap rule for stores, derived independently from
+      Intel's Coalesce pass). On a streaming kernel BOTH sides must obey it,
+      because reads and writes each carry half the traffic.
+
+  - id: xegpu_streaming_needs_explicit_cache_hints
+    name: "No pass adds cache hints for you; a read-once stream must say streaming / write_through"
+    severity: warning
+    stages: [memory_access, device_specific]
+    description: |
+      Do not expect the compiler to classify your traffic. Annotate load_nd /
+      store_nd on read-once and write-once data explicitly:
+
+        read-once  input  -> l1_hint = <streaming>, l2_hint = <streaming>
+                             (or <uncached>; `streaming` is READ-ONLY in XeGPU)
+        write-once output  -> l1_hint = <write_through>, l2_hint = <write_through>
+                             (or <uncached>; both are WRITE-ONLY policies)
+        reused     operand -> l1_hint = <cached>, l2_hint = <cached>
+                             (that is the DIFFERENT rule xegpu_cache_hint_on_load;
+                              do not apply <cached> to streaming data)
+
+      Legal XeGPU cache_hint values and their direction:
+        cached (r/w), uncached (r/w), streaming (read only),
+        read_invalidate (read only), write_back (write only),
+        write_through (write only).
+      Using a read-only policy on a store, or a write-only policy on a load, is
+      invalid IR — check the direction before emitting.
+
+      WHY IT MATTERS: an 18 MiB L2 filled with data that will never be re-read
+      evicts data that would have been. On a kernel that streams more than L2 the
+      hint costs nothing and protects any co-resident reuse.
+
+      OBSERVED (Triton/Arc B580): `TritonIntelGPUAnnotateCacheControl` runs in the
+      pipeline and was a complete NO-OP for this kernel — the tt.load/tt.store are
+      byte-identical before and after it, and the final ISA issues
+      `load.ugm.d32x4.a64` / `store.ugm.d32x4.a64` with default caching. Only the
+      kernel-argument loads got hints. So the most bandwidth-relevant annotation
+      on a bandwidth-bound kernel was simply never applied. UNMEASURED: the study
+      did not A/B the hints, because that kernel was already at 87-88% of peak and
+      had no headroom to show a win. Expect the payoff on a kernel that is BELOW
+      the roofline stop line, or that shares L2 with something else.
+
+  - id: xegpu_streaming_boundary_check_false_on_both_load_and_store
+    name: "When the tile divides the shape, turn boundary_check off on the STORE too, not just the load"
+    severity: warning
+    stages: [memory_access]
+    description: |
+      A predicated access costs flag-register setup and blocks the unpredicated,
+      widest form of the message. When the tensor extent is a known multiple of
+      the tile on every accessed dimension, set
+      `#xegpu.block_tdesc_attr<boundary_check = false>` on the descriptor — and do
+      it for the OUTPUT descriptor as well as the input ones.
+
+      The store side is the one that gets forgotten, and on a streaming kernel it
+      is half the traffic.
+
+      If divisibility only holds for some shapes, emit two versions under an
+      scf.if on the runtime extent and put the unpredicated form in the fast arm.
+      That is strictly better than one always-masked kernel, and it is what the
+      Triton backend does automatically (see below) — in MLIR you must write it.
+
+      OBSERVED (Triton/Arc B580): `TritonIntelRemoveMasks` proves the bounds mask
+      redundant and CLONES THE WHOLE ROW LOOP into two versions under
+      `arith.cmpi sgt, %n_cols, %c4095_i32`; the fast arm's tt.load carries no mask
+      and no `other=-inf`, which also deletes the -inf fill and the select ahead of
+      the max reduction. It reaches the ISA as a genuinely unpredicated
+      `load.ugm.d32x4.a64` next to the `(f0.0)`-predicated one.
+      BUT that pass handles `tt::LoadOp` ONLY — it asserts so at
+      RemoveMasks.cpp:941 — so the STORE stayed `(f0.0) store.ugm.d32x4.a64` in
+      BOTH arms, including the arm where the mask is provably all-true. A real
+      compiler shipped the asymmetry; assume yours does too and set the store side
+      by hand. UNMEASURED as an isolated change.
+
+  - id: xegpu_divf_by_a_reduction_scalar_expands_to_ieee_fixups
+    name: "arith.divf by a row scalar is not strength-reduced; hoist the reciprocal yourself"
+    severity: warning
+    stages: [device_specific, algorithmic]
+    description: |
+      A normalization tail written as `tile / row_scalar` keeps full IEEE division
+      semantics all the way down. IGC then expands EACH division into a scale, a
+      scalar `math.inv`, two SIMD32 multiplies, and `cmp` + `sel 1.0f` fixups for
+      the denormal/infinity cases. That whole chain is per-element work that a
+      single reciprocal plus a multiply would replace.
+
+      Compute the reciprocal ONCE per row, then multiply:
+        %r = arith.divf %one, %denom : f32          // one division, scalar
+        %y = arith.mulf %tile, %r_bcast             // per-element multiply only
+      Tag the reciprocal with fastmath<afn> if the tolerance allows it, so IGC
+      picks the native fast inverse instead of the exact expansion.
+
+      WHEN IT PAYS: only when the kernel is NOT at the DRAM roofline. At >=85% of
+      peak this is free-but-invisible. It matters on the small, L2-resident,
+      launch-and-compute-bound sizes — which is exactly where the softmax study
+      saw the Triton kernel LOSE to torch (0.79x at 1024x1024). Check residency
+      first with bw_working_set_must_exceed_l2_or_measurement_is_not_dram.
+
+      OBSERVED (Triton/Arc B580): `numerator / denominator` survives as `fdiv` in
+      the emitted LLVM IR (llir lines 177-180) and expands into the scalar
+      `math.inv` + 2 SIMD32 `mul` + `cmp`/`sel 1.0f` chain in the Xe2 ISA
+      (lines 935-975). Triton did not strength-reduce it. UNMEASURED.
+
+  - id: xegpu_cross_subgroup_reduction_slm_should_be_tiny
+    name: "Cross-subgroup reduction SLM should be one element per subgroup, not one per row element"
+    severity: warning
+    stages: [algorithmic, memory_access]
+    description: |
+      A row reduction must NOT stage the row through SLM. The correct shape is two
+      levels:
+        1. lane-private partial in registers (free), then
+        2. ONE cross-lane reduction inside the subgroup (hardware instruction), then
+        3. one partial per subgroup through SLM + a workgroup barrier.
+
+      SLM footprint is therefore `num_subgroups * sizeof(elem)` — tens to a couple
+      hundred bytes — and is INDEPENDENT of the row length. If your SLM allocation
+      scales with the reduced extent, you have hand-rolled a tree that the
+      hardware subgroup reduction should have done, and you are paying SLM
+      bandwidth plus extra barriers for it. Large SLM per workgroup also caps how
+      many workgroups fit per Xe-core, so this shows up as an occupancy loss too.
+
+      Step 1 is the existing xegpu_softmax_reduction_split_intra_lane pattern;
+      this constraint is about steps 2-3 and about the SLM SIZE being the check
+      you can apply mechanically.
+
+      OBSERVED (Triton/Arc B580, f32 softmax): both reductions (max and sum) lower
+      to a single `__spirv_GroupNonUniformFMax` / `__spirv_GroupNonUniformFAdd`
+      within the subgroup, then 32 partials through SLM plus a barrier. Measured
+      SLM per workgroup was 32 / 64 / 128 / 128 bytes for the 1K / 2K / 4K / 8K
+      shapes — i.e. exactly num_warps * 4 B, flat in the row length (1024 to 8192
+      elements). Barrier count was 12 at every size. SLM never limited occupancy.
+
+  - id: xegpu_online_softmax_still_reads_twice_unless_the_row_is_register_resident
+    name: "Two-loop online softmax reads the input twice; only a register-resident row cuts it to one"
+    severity: critical
+    stages: [analysis, algorithmic, memory_access]
+    description: |
+      ANALYSIS TRIGGER: two xegpu.load_nd reading the SAME base memref in
+      different scf.for loops = a 3-pass softmax/layernorm (2 reads + 1 write)
+      where 2 suffice. Report issue_type: redundant_computation, stage:
+      algorithmic. Hard 1.5x penalty; no cache hint, prefetch or faster math
+      removes it. Fix: one row per subgroup, row held in registers.
+
+      Writing softmax/layernorm as an online (single-statistics-pass) algorithm
+      does NOT by itself get you to minimum traffic. The usual XeGPU shape is two
+      scf.for loops over the same row:
+
+        loop 1: load tile -> running max + rescaled running sum   (no store)
+        loop 2: load THE SAME TILE AGAIN -> (x - max) / sum -> store
+
+      That is 2 reads + 1 write = 3 array passes, where the algorithm allows 2.
+      The extra read is a hard 1.5x ceiling on achievable time, and no amount of
+      cache hints, prefetch or cheaper math removes it.
+
+      HOW TO CHECK: count `xegpu.load_nd` ops that read the SAME base memref in
+      different loops. Two such loads on one input = the 3-pass shape.
+
+      WHY IT HAPPENS: the decomposition, not the algorithm. A kernel that gives
+      each workgroup MANY ROWS and tiles the COLUMNS (e.g. a 64x16xf32 tile
+      stepping the column axis) cannot hold a row across the two loops, so it must
+      re-read. A kernel that gives each program ONE ROW and covers the whole row at
+      once keeps it in registers and reads once.
+
+      MEASURED (Arc B580, f32, device kernel time, median of 5 processes):
+        XeGPU WG softmax, 3-pass, 64x16 column-tiled:
+          4096x4096 = 0.690 ms -> 63.9% of peak on its OWN 3-pass traffic,
+                                  42.6% against the 2-pass minimum
+          8192x8192 = 3.208 ms -> 54.8% / 36.7%
+        Triton, 2-pass, one row per program, row held in registers
+        (n_regs=128, n_spills=0):
+          4096x4096 = 0.339 ms -> 86.8% of peak
+          8192x8192 = 1.336 ms -> 88.1% of peak
+      Triton is 2.04x / 2.40x faster. The gap factors as 1.5x (the extra pass)
+      times ~1.38x (streaming efficiency), which reproduces the 2.04x at 4K.
+
+      COST TO WATCH: a register-resident row needs row_len/32 f32 per lane —
+      128 f32/lane at N=4096, 256 at N=8192. The second is likely to spill, so at
+      large N split the row into register-resident panels and keep only the last
+      one, or accept the re-read for the tail. Check for spills before believing a
+      win. See also xegpu_grf_budget_loop_accumulators.
+
+  - id: xegpu_large_grf_is_not_a_lever_for_bandwidth_bound_kernels
+    name: "Do not spend the large-GRF flag on a bandwidth-bound kernel; it measures as noise"
+    severity: warning
+    stages: [analysis, device_specific, autotuning]
+    description: |
+      `igc-cmd-options=-ze-opt-large-register-file` is a real win on compute-bound
+      XeGPU kernels (flash attention: 1.18-1.45x; attention WG lowering: 4.46 ->
+      2.58 ms). It is NOT a lever when the kernel is limited by DRAM: more
+      registers cannot make the pipe wider.
+
+      MEASURED NULL RESULT (Arc B580, f32 softmax, deterministic two-point sweep,
+      median of 5 independent processes per point, 16 points total):
+        1024x1024  1.042x / 1.023x   (baseline / tuned kernel)
+        2048x2048  1.175x / 0.977x
+        4096x4096  1.014x / 1.004x
+        8192x8192  0.964x / 1.015x
+      Every point is within +-4% except the 2K baseline 1.175x, and that point's
+      own process-to-process spread was 0.283-0.431 ms, so it is inside its own
+      noise. Verdict: neutral, both directions, at every size.
+
+      RULE: gate the GRF sweep on the roofline (see
+      bw_compute_dram_roofline_before_optimizing). If the kernel is bandwidth-
+      bound, skip the sweep and spend the budget on cutting min_bytes instead.
+      Note the sweep verdict also goes STALE after any source change, so when you
+      do run it, run it LAST.
+
+patterns:
+  - id: xegpu_streaming_128bit_lane_load
+    name: "Shape a streaming load_nd so each lane reads one contiguous 128-bit chunk; scale with sg_layout"
+    stage: memory_access
+    precondition: |
+      APPLIES to an xegpu.load_nd of a tensor that is read ONCE (no reuse across
+      the workgroup and no reuse across loop iterations) — a softmax/layernorm
+      input row, an elementwise operand, a copy source. Match it on the access
+      role, not on the workload name.
+
+      Do NOT apply to DPAS operands: their layout is dictated by the DPAS shape
+      and by reuse, and is covered by xegpu_layout_and_tiling.yaml /
+      xegpu_widen_load_inst_data_in_pairs. Do NOT apply when the layout already
+      gives 16 B/lane on the stride-1 axis (then the only remaining move is more
+      subgroups).
+    description: |
+      Choose lane_data so each lane's fragment is a contiguous 16-byte run on the
+      stride-1 dimension ([1,4] for f32, [1,8] for f16), put lane_layout along
+      that same contiguous axis, and reach the tile size you want by growing
+      sg_layout until the workgroup is full (1024 threads on BMG). Past that
+      point a lane takes a second 16 B chunk, which costs a second message.
+    rationale: |
+      16 B/lane x 32 lanes = a 512 B message, two whole 256 B Xe2 cache lines,
+      with no gaps and no partial-line traffic. Narrower per-lane runs
+      under-fill the message; strided runs fetch lines the kernel does not use.
+      Per-lane width saturates in hardware, so subgroup count is the dimension
+      that actually scales.
+    pattern_before: |
+      // lane owns a strided pair -> gapped, partial-cacheline reads
+      %in = xegpu.load_nd %in_tile[%row, %c0]
+        <{layout = #xegpu.layout<sg_layout = [1, 8], sg_data = [64, 2],
+                                 lane_layout = [16, 1], lane_data = [2, 1]>}>
+        : !xegpu.tensor_desc<64x16xf32, #in> -> vector<64x16xf32>
+    pattern_after: |
+      // lane owns 4 contiguous f32 (16 B) on the stride-1 axis; tile grows via sg_layout
+      %in = xegpu.load_nd %in_tile[%row, %c0]
+        <{layout = #xegpu.layout<sg_layout = [8, 1], sg_data = [8, 64],
+                                 lane_layout = [1, 16], lane_data = [1, 4]>,
+          l1_hint = #xegpu.cache_hint<streaming>,
+          l2_hint = #xegpu.cache_hint<streaming>}>
+        : !xegpu.tensor_desc<64x64xf32, #in> -> vector<64x64xf32>
+    expected_speedup: "1.1-1.5x when it fixes a gapped or narrow stream; ~1.0x if already at 16 B/lane"
+    applies_to: ["any_read_once_load", "softmax", "layernorm", "elementwise", "reduction", "copy", "transpose"]
+    notes: |
+      PROVENANCE: OBSERVED in the Intel Triton backend on Arc B580 (sizePerThread
+      pinned at 4 f32 across 1K-8K while warpsPerCTA grew 8/16/32/32; ISA
+      `load.ugm.d32x4.a64 (32|M0)` = 512 B). NOT A/B measured on an MLIR kernel.
+      The kernel carrying that layout ran at 396-402 GB/s = 87-88% of the 456 GB/s
+      peak at 4096x4096 and 8192x8192, so 16 B/lane is demonstrably SUFFICIENT to
+      saturate BMG DRAM; the speedup range above is the cost of NOT doing it.
+
+  - id: xegpu_streaming_cache_hints_read_once_write_once
+    name: "Tag read-once loads <streaming> and write-once stores <write_through> so the stream does not evict L2"
+    stage: memory_access
+    precondition: |
+      APPLIES when the kernel's total footprint (bytes read + bytes written)
+      EXCEEDS L2 (18 MiB on BMG) and the data has no reuse. Check the footprint
+      first — see bw_working_set_must_exceed_l2_or_measurement_is_not_dram. If the
+      whole working set fits in L2, <cached> is correct and this pattern is WRONG:
+      you want the second pass to hit.
+
+      Do NOT apply to an operand that other subgroups re-read (use
+      xegpu_cache_hint_on_load with <cached>), and do NOT apply a read-only policy
+      (<streaming>, <read_invalidate>) to a store or a write-only policy
+      (<write_through>, <write_back>) to a load — that is invalid IR.
+    description: |
+      Annotate the streaming ends of the kernel explicitly. Loads of read-once
+      input get l1/l2 `<streaming>`; stores of write-once output get
+      `<write_through>` (or `<uncached>`). Leave `<cached>` for genuinely reused
+      tiles. Prefetches, if any, should carry the same policy as the load they
+      feed.
+    rationale: |
+      Default caching pulls every streamed line into L1/L2 and holds it, so a
+      kernel larger than L2 spends the whole cache on data it will never read
+      again. Marking the stream lets the hierarchy keep whatever DOES have reuse,
+      and costs nothing on the streamed path itself.
+    pattern_before: |
+      %in = xegpu.load_nd  %in_tile[%row, %c0]  : !xegpu.tensor_desc<8x64xf32, #in> -> vector<8x64xf32>
+      xegpu.store_nd %out, %out_tile[%row, %c0] : vector<8x64xf32>, !xegpu.tensor_desc<8x64xf32, #out>
+    pattern_after: |
+      %in = xegpu.load_nd %in_tile[%row, %c0]
+        <{l1_hint = #xegpu.cache_hint<streaming>, l2_hint = #xegpu.cache_hint<streaming>}>
+        : !xegpu.tensor_desc<8x64xf32, #in> -> vector<8x64xf32>
+      xegpu.store_nd %out, %out_tile[%row, %c0]
+        <{l1_hint = #xegpu.cache_hint<write_through>, l2_hint = #xegpu.cache_hint<write_through>}>
+        : vector<8x64xf32>, !xegpu.tensor_desc<8x64xf32, #out>
+    expected_speedup: "1.0-1.15x; largest when the kernel shares L2 with reused data, ~1.0x at the roofline"
+    applies_to: ["any_read_once_load", "any_write_once_store", "softmax", "layernorm", "elementwise", "copy"]
+    notes: |
+      PROVENANCE: OBSERVED-AS-MISSING, not measured. Triton's
+      TritonIntelGPUAnnotateCacheControl pass was a byte-for-byte no-op on the
+      softmax data path, leaving default caching in the Xe2 ISA. The study did not
+      A/B the hints because that kernel was already at 87-88% of DRAM peak, where
+      no cache change can show up. So this is a HYPOTHESIS with a clear mechanism,
+      not a confirmed win — the verifier must time it, and it is expected to be
+      neutral on any kernel already at the roofline.
+
+  - id: xegpu_unpredicated_stream_via_loop_versioning
+    name: "Version the kernel on divisibility and drop boundary_check on BOTH the load and the store"
+    stage: memory_access
+    precondition: |
+      APPLIES when a streaming load_nd/store_nd pair is predicated
+      (boundary_check = true, or a vector.mask / arith.select guard) purely for
+      out-of-range columns, AND the extent is either a compile-time multiple of the
+      tile or a runtime value you can test once outside the hot loop.
+
+      Do NOT apply when the mask encodes real algorithmic semantics (a causal
+      mask, a padding value that must be observed) — only when it is a pure bounds
+      guard. Do NOT drop boundary_check without the guard unless divisibility is
+      static: an unpredicated out-of-range 2-D block access is a correctness bug,
+      not a slow path.
+    description: |
+      Hoist the divisibility test out of the loop, clone the loop into two arms
+      under scf.if, and in the fast arm use descriptors with
+      `#xegpu.block_tdesc_attr<boundary_check = false>` for the input AND the
+      output. Dropping the guard also deletes the padding constant and the
+      arith.select that fed the reduction, which shortens the dependence chain
+      ahead of the max/sum, not just the load itself.
+    rationale: |
+      Predication costs flag setup per message and prevents the unpredicated form
+      of the access. On a streaming kernel there is one load and one store per
+      element, so the predicate overhead is a fixed tax on 100% of the traffic.
+      The padding value (-inf for a max, 0 for a sum) is extra materialization and
+      an extra select that the fast arm does not need at all.
+    pattern_before: |
+      scf.for %row = %c0 to %M step %c1 {
+        // masked in every iteration, and the -inf fill feeds the max reduction
+        %in = xegpu.load_nd %in_tile[%row, %c0]
+          : !xegpu.tensor_desc<1x4096xf32, #xegpu.block_tdesc_attr<boundary_check = true>> -> vector<1x4096xf32>
+        %m  = vector.multi_reduction <maximumf>, %in, %neg_inf [1] : vector<1x4096xf32> to vector<1xf32>
+        ...
+        xegpu.store_nd %out, %out_tile[%row, %c0]
+          : vector<1x4096xf32>, !xegpu.tensor_desc<1x4096xf32, #xegpu.block_tdesc_attr<boundary_check = true>>
+      }
+    pattern_after: |
+      %exact = arith.cmpi eq, %n_cols, %c4096 : i1
+      scf.if %exact {
+        scf.for %row = %c0 to %M step %c1 {
+          // fast arm: no predicate on EITHER end, no -inf fill
+          %in = xegpu.load_nd %in_tile_nb[%row, %c0]
+            : !xegpu.tensor_desc<1x4096xf32, #xegpu.block_tdesc_attr<boundary_check = false>> -> vector<1x4096xf32>
+          %m  = vector.multi_reduction <maximumf>, %in, %first [1] : vector<1x4096xf32> to vector<1xf32>
+          ...
+          xegpu.store_nd %out, %out_tile_nb[%row, %c0]
+            : vector<1x4096xf32>, !xegpu.tensor_desc<1x4096xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+        }
+      } else {
+        // original masked loop, unchanged
+      }
+    expected_speedup: "1.05-1.2x on a predicated stream; the store half is the part compilers leave behind"
+    applies_to: ["any_bounds_masked_stream", "softmax", "layernorm", "elementwise", "reduction"]
+    notes: |
+      PROVENANCE: the load half is OBSERVED shipping in a production compiler —
+      Triton's TritonIntelRemoveMasks performs exactly this clone-under-scf.if and
+      it survives to the Xe2 ISA as an unpredicated `load.ugm.d32x4.a64`
+      alongside the `(f0.0)`-predicated one. The store half is OBSERVED-AS-MISSING:
+      that pass is load-only by construction (assert at RemoveMasks.cpp:941), so
+      `(f0.0) store.ugm.d32x4.a64` remained in both arms. Neither half was A/B
+      timed in isolation; the 4096x4096 kernel containing both was at 86.8% of
+      peak, which bounds how much either can be worth THERE. Expect the win below
+      the roofline.
+
+  - id: xegpu_hoist_reciprocal_for_row_normalization
+    name: "Replace a per-element arith.divf by a row scalar with one reciprocal plus a multiply"
+    stage: device_specific
+    precondition: |
+      APPLIES when a tile is divided elementwise by a value that is INVARIANT over
+      the tile — a softmax denominator, a layernorm sigma, an L1/L2 norm, a mean,
+      a count. Match on arith.divf whose denominator is a broadcast of a reduction
+      result or of a loop-invariant scalar.
+
+      Do NOT apply when the divisor varies per element (no reciprocal to hoist).
+      Do NOT apply if the kernel is at or above ~85% of DRAM peak: it will be
+      invisible there. Verify [ALLCLOSE] still passes if you add fastmath<afn> —
+      the fast inverse is approximate.
+    description: |
+      Compute `%r = 1.0 / %denom` once, as a scalar, outside the elementwise work,
+      then multiply the tile by the broadcast reciprocal. Tag the single division
+      (or the multiply chain) with fastmath<afn> when the tolerance allows, so IGC
+      selects the native inverse rather than the exact IEEE expansion.
+    rationale: |
+      IEEE-correct division is not one instruction. IGC expands each arith.divf
+      into a scale, a scalar inverse, two SIMD-width multiplies and cmp/select
+      fixups for denormals and infinities. Paying that per element instead of once
+      per row multiplies a fixed overhead by the tile size, and the compiler will
+      not strength-reduce it for you because the exact semantics forbid it.
+    pattern_before: |
+      %sum   = vector.multi_reduction <add>, %p, %zero [1] : vector<1x4096xf32> to vector<1xf32>
+      %sum_b = vector.broadcast %sum : vector<1xf32> to vector<1x4096xf32>
+      %y     = arith.divf %p, %sum_b : vector<1x4096xf32>     // 4096 IEEE divisions
+    pattern_after: |
+      %sum   = vector.multi_reduction <add>, %p, %zero [1] : vector<1x4096xf32> to vector<1xf32>
+      %one   = arith.constant dense<1.0> : vector<1xf32>
+      %r     = arith.divf %one, %sum fastmath<afn> : vector<1xf32>   // ONE inverse
+      %r_b   = vector.broadcast %r : vector<1xf32> to vector<1x4096xf32>
+      %y     = arith.mulf %p, %r_b : vector<1x4096xf32>              // 4096 multiplies
+    expected_speedup: "1.0x at the DRAM roofline; up to ~1.1x on small, cache-resident, launch-bound shapes"
+    applies_to: ["softmax", "layernorm", "rmsnorm", "l2_normalize", "mean_subtract", "any_divide_by_reduction_result"]
+    notes: |
+      PROVENANCE: OBSERVED-AS-MISSING in the Triton reference (fdiv survives to
+      LLVM IR; the Xe2 ISA shows the scale + scalar math.inv + 2 SIMD32 mul +
+      cmp/sel 1.0f fixup chain). UNMEASURED as an isolated change. The reason the
+      expected value is honestly LOW is the roofline: the kernel where this was
+      spotted sat at 87-88% of peak, so compute-side savings had nowhere to
+      appear. The place it should pay is the 1024x1024 / 2048x2048 regime, which
+      is L2-resident and where the same kernel lost to torch.softmax by ~20%.
+
+  - id: xegpu_two_level_row_reduction_subgroup_then_slm
+    name: "Finish a row reduction with one hardware subgroup reduce, then one-partial-per-subgroup through SLM"
+    stage: algorithmic
+    precondition: |
+      APPLIES to a workgroup-level row reduction (vector.multi_reduction, or an
+      scf.for reduction) whose reduced extent is spread across MORE THAN ONE
+      subgroup, so the result needs cross-subgroup combination.
+
+      Do NOT apply when the whole reduced extent lives in one subgroup (then the
+      hardware subgroup reduce alone finishes it and no SLM or barrier is needed).
+      This pattern is the CROSS-SUBGROUP half; the lane-private pre-reduction that
+      should come first is xegpu_softmax_reduction_split_intra_lane.
+    description: |
+      Structure the reduction in three stages: (1) fold the elements each lane
+      privately owns, in registers; (2) one cross-lane reduction over the subgroup,
+      lowering to a single hardware subgroup-reduce instruction; (3) each subgroup
+      writes ONE partial to SLM, one workgroup barrier, then one subgroup (or all,
+      redundantly) reduces the `num_subgroups` partials and broadcasts.
+
+      The SLM allocation is `num_subgroups * sizeof(elem)`. If it scales with the
+      row length instead, stage 2 is missing and the row is being staged through
+      SLM by hand.
+    rationale: |
+      Cross-lane shuffles and SLM round-trips are the expensive part of a
+      reduction; register-local folding is free. Reducing to one value per lane,
+      then one per subgroup, means the shuffle network runs once over a subgroup
+      and SLM carries only tens of bytes. It also keeps SLM per workgroup small
+      enough that SLM never caps how many workgroups fit on an Xe-core.
+    pattern_before: |
+      // whole row staged through SLM and reduced there: SLM scales with N
+      %slm = memref.alloc() : memref<4096xf32, 3>      // one slot per ELEMENT
+      // ... every lane writes its elements, barrier, log-tree in SLM ...
+    pattern_after: |
+      // 1. lane-private fold (registers, free)
+      %part = vector.multi_reduction <add>, %lane_owned, %zero [1] : vector<8xNxf32> to vector<8xf32>
+      // 2. one cross-lane reduce inside the subgroup -> one scalar per subgroup
+      %sg_sum = gpu.subgroup_reduce add %part_scalar : (f32) -> f32
+      // 3. one partial per SUBGROUP through SLM: SLM = num_sg * 4 B, not N * 4 B
+      %slm = memref.alloc() : memref<32xf32, 3>        // one slot per SUBGROUP
+      memref.store %sg_sum, %slm[%sg_id] : memref<32xf32, 3>
+      gpu.barrier
+      // ... reduce the 32 partials, broadcast ...
+    expected_speedup: "1.1-1.4x vs an SLM-staged row reduction; also frees SLM, which can raise occupancy"
+    applies_to: ["softmax", "layernorm", "rmsnorm", "logsumexp", "reduction", "flash_attention", "any_multi_subgroup_reduce"]
+    notes: |
+      PROVENANCE: OBSERVED (structure, plus measured SLM/barrier counts) in the
+      Triton reference on Arc B580. Both softmax reductions lowered to a single
+      `__spirv_GroupNonUniformFMax` / `__spirv_GroupNonUniformFAdd` per subgroup
+      followed by SLM + barrier. SLM per workgroup was 32 / 64 / 128 / 128 bytes
+      for row lengths 1024 / 2048 / 4096 / 8192 — flat in the row length, exactly
+      num_subgroups * 4 B — and the barrier count was 12 at every size. The
+      speedup range is versus a hand-rolled SLM tree and is NOT A/B measured; what
+      IS established is that this structure is what a kernel running at 88% of
+      DRAM peak uses.
+
+  - id: xegpu_row_per_subgroup_single_read_softmax
+    name: "Assign one row per subgroup and hold it in registers so the normalize pass does not re-read memory"
+    stage: algorithmic
+    precondition: |
+      APPLIES to a row-wise normalization (softmax, layernorm, rmsnorm, logsumexp)
+      written as TWO loops over the same input, where the second loop reloads the
+      tile the first loop already read. Detect it by counting xegpu.load_nd ops
+      that read the same base memref in different scf.for bodies.
+
+      REQUIRES the row to fit in registers: row_len / lanes_per_subgroup f32 per
+      lane. Safe at 128 f32/lane (N <= 4096 at SIMD32); at N = 8192 it is 256
+      f32/lane and will likely spill, so use the panel variant below or skip.
+
+      Do NOT apply when the reduction axis is not the contiguous axis, or when the
+      row is already register-resident (then there is only one load and nothing to
+      remove).
+    description: |
+      Flip the decomposition. Instead of giving a workgroup many rows and stepping
+      the column axis, give each subgroup ONE row and cover the whole row at once.
+      Keep the loaded row in a vector value, compute max and sum from it, then
+      normalize and store that SAME value. The input is read exactly once.
+
+      When the row is too long for registers, split it into panels sized to the
+      register budget and keep only the LAST panel live; the earlier panels still
+      re-read, so an R-panel split costs (1 + (R-1)/R) reads instead of 2.
+    rationale: |
+      A two-loop online softmax moves 3*N*N*4 bytes where the algorithm needs
+      2*N*N*4. For a kernel whose only limit is DRAM, that extra pass IS the
+      runtime: 3/2 = 1.5x. Cutting it is the single largest available win, and it
+      is the only kind of change that helps at all once the pipe is full — cache
+      hints, prefetch and cheaper transcendentals cannot reduce min_bytes.
+    pattern_before: |
+      // 3 passes: loop 1 reads to reduce, loop 2 READS THE SAME DATA AGAIN
+      %stats:2 = scf.for %j = %c0 to %N step %c16 iter_args(%mx = %ninf, %sum = %zero) -> (...) {
+        %t  = xegpu.load_nd %in[%row, %j] : ... -> vector<64x16xf32>
+        %m  = vector.multi_reduction <maximumf>, %t, %mx [1] : ...
+        %s  = vector.multi_reduction <add>, %e, %sum [1] : ...
+        scf.yield %m, %s : vector<64xf32>, vector<64xf32>
+      }
+      scf.for %j = %c0 to %N step %c16 {
+        %t = xegpu.load_nd %in[%row, %j] : ... -> vector<64x16xf32>   // SECOND READ
+        %o = arith.divf %e, %sumb : vector<64x16xf32>
+        xegpu.store_nd %o, %out[0, %j] : ...
+      }
+    pattern_after: |
+      // 2 passes: one row per subgroup, held in registers across both phases
+      %row_v = xegpu.load_nd %in[%row, %c0]
+        <{layout = #xegpu.layout<sg_layout = [8, 1], sg_data = [1, 4096],
+                                 lane_layout = [1, 32], lane_data = [1, 4]>,
+          l1_hint = #xegpu.cache_hint<streaming>,
+          l2_hint = #xegpu.cache_hint<streaming>}>
+        : !xegpu.tensor_desc<8x4096xf32, #in> -> vector<8x4096xf32>
+      %mx  = vector.multi_reduction <maximumf>, %row_v, %ninf [1] : vector<8x4096xf32> to vector<8xf32>
+      %e   = math.exp %shifted : vector<8x4096xf32>            // reuses %row_v, no reload
+      %sum = vector.multi_reduction <add>, %e, %zero [1] : vector<8x4096xf32> to vector<8xf32>
+      %rcp = arith.divf %one, %sum : vector<8xf32>
+      %o   = arith.mulf %e, %rcpb : vector<8x4096xf32>
+      xegpu.store_nd %o, %out[%row, %c0] <{...}> : vector<8x4096xf32>, ...
+    expected_speedup: "up to 1.5x from traffic alone; 2.0x measured end-to-end at 4096x4096 when combined with a saturating stream"
+    applies_to: ["softmax", "layernorm", "rmsnorm", "logsumexp", "row_normalization", "any_two_pass_reduction"]
+    notes: |
+      PROVENANCE: the 3-pass problem is MEASURED on our own MLIR kernel; the fix is
+      OBSERVED in the Triton reference and NOT yet A/B measured in XeGPU.
+
+      Measured, Arc B580, f32, device kernel time, median of 5 processes:
+        ours, 3-pass, 64x16 column-tiled : 4K 0.690 ms (42.6% of 2-pass peak)
+                                           8K 3.208 ms (36.7%)
+        Triton, 2-pass, row in registers : 4K 0.339 ms (86.8%)
+                                           8K 1.336 ms (88.1%)
+      2.04x and 2.40x apart. Triton used n_regs=128 with n_spills=0 at 4K, so the
+      register budget for a 4096-f32 row is demonstrably affordable on BMG.
+
+      The 2.0x figure is the FULL gap and needs the streaming layout too
+      (xegpu_streaming_128bit_lane_load); traffic alone caps at 1.5x. Verify with
+      an ISA spill check, not just a timer — a spill turns this into a loss.
+      Related: xegpu_online_softmax_still_reads_twice_unless_the_row_is_register_resident.

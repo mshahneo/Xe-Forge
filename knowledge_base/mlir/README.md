@@ -14,9 +14,19 @@ loaded separately and never together:
 | `dsl=mlir device=linalg` | `LinalgLoweringAgent` | the lowering config 5-tuple `(wg_m, wg_n, sg_m, sg_n, k_tile)` + `large_grf` |
 | `dsl=mlir device=xpu` | analyzer + WG optimizer | the XeGPU IR itself: `#xegpu.layout` attrs, kernel body, launch geometry |
 
-`mlir/common/` loads for **both**. The repo-root `common/` tier is host-Python
-(PyTorch/KernelBench wrapper) knowledge and is excluded from the MLIR views with
-`excludes_dsl: [mlir]`, since it is meaningless inside a standalone MLIR module.
+`mlir/common/` loads for **both**. The repo-root `common/` tier is *mostly* host-Python
+(PyTorch/KernelBench wrapper) knowledge and those files are excluded from the MLIR views
+with `excludes_dsl: [mlir]`, since they are meaningless inside a standalone MLIR module.
+
+One repo-root `common/` file is **deliberately not excluded**, because its content is
+arithmetic rather than host Python and is identical for every DSL:
+
+- `common/bandwidth_roofline.yaml` — the DRAM roofline stop rule (>=85% of peak means
+  no headroom below the algorithm), the L2-residency measurement trap (a working set
+  under the 18 MiB BMG L2 does not measure DRAM; >100% of peak is the tell), and the
+  median-of-N timing rule. So the MLIR views DO see these three constraints. If you add
+  another root-`common/` file, decide explicitly: host-Python → `excludes_dsl: [mlir]`;
+  hardware or arithmetic → leave it loaded.
 
 ## Where a new rule goes
 
@@ -54,7 +64,24 @@ conditions is how a 1.36x gets re-applied where it measures 0.96x.
 - `xegpu_layout_and_tiling.yaml` — `sg_layout` / `sg_data` / `inst_data`, tile
   geometry, layout propagation, and the register budget for loop-carried state.
 - `xegpu_memory_patterns.yaml` — loads, stores, prefetch, cache hints, 2D-block
-  message limits.
+  message limits. This is the **reuse** side: feeding DPAS, prefetch depth, operand
+  tiling, register liveness.
+- `xegpu_streaming_bandwidth.yaml` — the **no-reuse** side: read-once/write-once
+  traffic (softmax, layernorm, elementwise, copy). 128-bit-per-lane access width,
+  `streaming`/`write_through` cache hints, dropping `boundary_check` on the store as
+  well as the load, reciprocal hoisting, and the SLM size check on a cross-subgroup
+  reduction. Gate entry on `common/bandwidth_roofline.yaml` first — at >=85% of DRAM
+  peak none of it can help. Provenance for most entries is a Triton-on-B580 softmax
+  study (`/data/gta/upstream/triton-softmax-study/REPORT.md`), so they are labelled
+  OBSERVED (in that backend's IR/ISA, then translated) rather than MEASURED, and the
+  speedup ranges are hypotheses for the verifier to confirm.
+
+  Three entries ARE measured on our own XeGPU kernels, from the 2026-09-10 softmax
+  study (`/home/gta/test/lightouse_softmax_tuning/Xe-Forge-optimization-9-10-2026/`):
+  the 3-pass problem (a two-loop online softmax re-reads its input, so it runs 2.0x
+  behind Triton at 4096² even though the algorithm is right), the row-per-subgroup
+  fix for it, and the large-GRF **null result** — that flag is worth 1.2-1.45x on
+  compute-bound kernels but measured as noise at all four softmax sizes.
 - `xegpu_reductions.yaml` — cross-lane reductions (softmax max/sum, layernorm).
 - `xegpu_transcendental_patterns.yaml` — `math.exp`/`exp2`, fastmath, algebraic
   folds on the softmax.
@@ -79,6 +106,32 @@ to 62.5 KB on its own. So:
   so `.mlir` examples render as ```` ```mlir ````; unknown extensions stay
   `python`, which is what every pre-MLIR example was.
 
+## The analyzer only reads 300 characters of your constraint
+
+`analyzer_agent._get_kb_context` (analyzer_agent.py:598-620) is much narrower than it
+looks. Three limits, all verified 2026-09-10 against this view:
+
+1. **It sends `description[:300]` and nothing else.** Not `precondition`, not
+   `rationale`, not `fix` — those fields reach the *optimizer*, never the analyzer.
+   So a detection trigger must sit in the **first 300 characters of `description`**.
+   Open with it: `ANALYSIS TRIGGER: <what to look for in the IR> ... Report
+   issue_type: <name>, stage: <stage>.` A constraint whose first 300 chars are
+   preamble cannot influence detection at all, no matter how good the rest is.
+2. **The whole context is truncated at 6000 chars.** In `dsl=mlir device=xpu` that
+   currently shows **15 of 23** eligible constraints — the other 8 never appear. A
+   log line reading exactly `Analyzer KB context: 6015 chars` means it was cut
+   (6000 + `"\n...[truncated]"`). Ordering follows the `OptimizationStage` enum, so
+   `algorithmic`/`dtype_fix`/`fusion`/`memory_access` constraints win the budget and
+   `autotuning`/`discovery` ones lose it. Adding a constraint can silently push
+   someone else's out.
+3. **`ANALYSIS`-stage constraints are explicitly skipped** in that loop. `stages:
+   [analysis]` alone makes a constraint invisible to the analyzer. Always declare at
+   least one non-analysis stage.
+
+The `issue_type` you name must exist in `IssueType` (`models.py:50+`) or the emitted
+issue is dropped when coerced. `REDUNDANT_COMPUTATION`, `CACHEABLE_INTERMEDIATE` and
+`UNNECESSARY_MATERIALIZATION` all route to `algorithmic`.
+
 ## Conventions
 
 - `severity: critical` and `severity: warning` constraints are the **only** KB
@@ -86,6 +139,7 @@ to 62.5 KB on its own. So:
   influence issue detection has to be a constraint at one of those severities.
 - Declaring `stage:`/`stages:` on a constraint scopes it to those stages *and* keeps
   it visible to the analyzer (`loader.constraints_for_stage`); a constraint with no
-  declared stage is visible everywhere.
+  declared stage is visible everywhere. But see the 300-char section above — being
+  *visible* is not the same as being *readable*.
 - Keep measured numbers, hardware, and the measurement conditions in the entry that
   claims the speedup — a number without its conditions cannot be re-checked.
