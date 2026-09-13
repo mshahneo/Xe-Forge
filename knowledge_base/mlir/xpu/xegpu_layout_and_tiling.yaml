@@ -207,12 +207,14 @@ patterns:
       16 on SIMD16). Do NOT apply if the whole tile already fits comfortably in
       registers.
 
-      NOTE — there is no hardware transposed-load escape hatch at WG level. An
-      earlier version of this rule said to prefer one "if available and cheaper".
-      That was wrong: `transpose` on `xegpu.load_nd` is silently dropped by the WG
-      lowering pass, so that path yields a wrong kernel. See constraint
-      xegpu_wg_loadnd_transpose_attr_dropped. An in-register `vector.transpose` is
-      the ONLY correct way to transpose a DPAS operand at WG level.
+      NOTE — the hardware transposed-load path is correct as of the 2026-09-11 fix,
+      but it is NOT cheaper. Folded: 1.14431 ms, in-register `vector.transpose`:
+      1.14582 ms on 4k flash attention. On Xe2 a sub-32-bit transposed block read
+      happens at 32-bit granularity, so it is real work either way. It also only
+      accepts one square tile per subgroup. See constraint
+      xegpu_wg_loadnd_transpose_supported. So an in-register `vector.transpose`
+      remains the default choice — not because the alternative is wrong, but
+      because it is no faster and has fewer shape restrictions.
 
       Both upstream WG flash-attention tests do exactly that, and both pass on
       random input: flash_attention_fwd.mlir and

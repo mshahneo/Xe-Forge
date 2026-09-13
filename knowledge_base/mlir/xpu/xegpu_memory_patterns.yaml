@@ -197,45 +197,53 @@ constraints:
       re-litigate prefetch — spend memory_access iterations on cache hints and on
       shortening live ranges instead.
 
-  - id: xegpu_wg_loadnd_transpose_attr_dropped
-    name: "CORRECTNESS: the transpose attribute on xegpu.load_nd is SILENTLY DROPPED at WG level — always keep an explicit vector.transpose"
-    severity: critical
+  - id: xegpu_wg_loadnd_transpose_supported
+    name: "The transpose attribute on xegpu.load_nd now works at WG level, but it is NOT a speed win and only a square subgroup tile is accepted"
+    severity: warning
     description: |
-      Do NOT put `transpose = array<i64: 1, 0>` on an `xegpu.load_nd` in a
-      workgroup-level XeGPU kernel (one with `sg_layout` in its layouts). The WG
-      lowering pass drops the attribute and does not warn. The kernel then feeds
-      the DPAS an UNTRANSPOSED operand and computes the wrong answer, at full
-      speed. Keep the standalone `vector.transpose` on the loaded registers
-      instead. It is correct, and it is what both upstream WG flash-attention
-      tests do.
+      `transpose = array<i64: 1, 0>` on an `xegpu.load_nd` is CORRECT at workgroup
+      level as of the 2026-09-11 fix. It used to be dropped silently. It is no
+      longer a correctness trap. Two things still matter, though.
 
-      Upstream bug, verified 2026-09-10 on llvm-project:
-      `mlir/lib/Dialect/XeGPU/Transforms/XeGPUWgToSgDistribute.cpp:244`,
-      `WgToSgLoadNdOp::matchAndRewrite`, rebuilds the subgroup load with
-      `/*packed = */ nullptr, /*transpose = */ nullptr` hardcoded. It never reads
-      `op.getTransposeAttr()`, and it derives the result type from the descriptor
-      shape, so it has no notion of transpose at all. There is no diagnostic and
-      no match failure. Upstream lit tests never cover the load_nd ATTRIBUTE
-      (only the `vector.transpose` op), which is why the gap survived.
+      1. IT IS NOT A SPEED WIN. Measured on 4k flash attention, random [-1,1],
+         median of 500 runs: the folded transpose runs at 1.14431 ms and the
+         explicit `vector.transpose` at 1.14582 ms. That is a 0.1% difference —
+         inside the noise floor. The hardware does the transpose either way; the
+         fold only moves where it happens. Do NOT spend optimizer iterations on
+         this swap expecting a win, in either direction.
 
-      TWO THINGS HIDE THIS, so a passing run is not evidence:
-        1. A square K tile (64x64) means the missing transpose changes NO type.
-           Nothing in the IR or the verifier objects.
-        2. A uniform constant input fill makes it invisible numerically. With
-           Q=K=V=0.625 every QK dot is 64*0.625^2 = 25.0, so S is constant, the
-           row-max subtraction gives zeros, exp(0)=1, P is a uniform 1/4096 and O
-           is 0.625 everywhere. A missing transpose, a wrong reduction axis or a
-           row permutation ALL still pass [ALLCLOSE: TRUE].
-      On random [-1, 1] input the same kernel shows max abs error 0.0219 — about
-      100x above f16 drift (~3e-4). Validate a transpose change on random input.
+         The old KB entry advertised 1.089x for removing the transpose. That
+         number was real but it measured a BROKEN kernel doing less work. The
+         wrong answer ran at 1.03542 ms. Any measured win from removing a
+         transpose is still a correctness red flag — re-validate on random input.
 
-      MEASURED COST OF BEING CORRECT: doing the transpose properly is 1.089x
-      slower (1.33567/1.33406 ms vs 1.22689/1.22528 ms, 500 runs, interleaved).
-      So the broken fold LOOKS like a 1.089x win and a speed-driven optimizer
-      will keep it. That is exactly what happened to FA_gpt56_opt.mlir: the fold
-      was applied to a correct input, the attribute was dropped, and the fake win
-      was banked and built on. Treat any measured win from removing a transpose as
-      a correctness red flag until re-validated on random input.
+      2. THE SUPPORTED SHAPE IS NARROW, and exceeding it is now a HARD BUILD
+         FAILURE (`failed to legalize operation 'xegpu.load_nd'`), not a wrong
+         answer. Workgroup distribution accepts a transposed load_nd only when:
+           - there is exactly ONE tile per subgroup (no round-robin over tiles),
+             because the tiles are enumerated in descriptor order but consumed in
+             permuted order, and
+           - the subgroup tile is SQUARE, e.g. sg_data = [64, 64]. A non-square
+             sg_data such as [32, 16] is rejected.
+         Also, `packed` on a workgroup-level load_nd is rejected outright. It
+         reshapes the result, which the subgroup type converter cannot express.
+
+      REQUIRES the fixed toolchain. The fix is three separate edits in
+      llvm-project, on branch `xegpu-load-transpose-fix`:
+        - XeGPUWgToSgDistribute.cpp — forward the attribute; reject the cases above
+        - XeGPUSgToLaneDistribute.cpp — do not add `packed` on top of a transpose
+        - XeGPUUnroll.cpp — permute the tile grid between split and reassembly
+      Against an older build the attribute is dropped and the kernel is silently
+      wrong. Verify with a random-input run, not a constant fill.
+
+      WHY A CONSTANT FILL CANNOT VALIDATE THIS. With Q=K=V=0.625 every QK dot is
+      64*0.625^2 = 25.0, so S is constant, the row-max subtraction gives zeros,
+      exp(0)=1, P is a uniform 1/4096 and O is 0.625 everywhere. A missing
+      transpose, a wrong reduction axis or a row permutation ALL pass
+      [ALLCLOSE: TRUE]. A square 64x64 K tile also means a missing transpose
+      changes NO type, so the verifier stays quiet. On random [-1,1] the broken
+      kernel showed max abs error 0.0219, about 100x above f16 drift (~3e-4);
+      the fixed kernel shows 1.5486e-05 against an f32 reference.
     stage: any
 
   - id: xegpu_sink_large_load_to_dpas
@@ -429,30 +437,27 @@ patterns:
     name: Fold a transpose into the 2D block load (stride/shape swap) instead of materializing it
     stage: memory_access
     precondition: |
-      *** DO NOT APPLY THIS PATTERN TO WORKGROUP-LEVEL XeGPU. IT PRODUCES A
-      SILENTLY WRONG KERNEL. See constraint
-      xegpu_wg_loadnd_transpose_attr_dropped. ***
+      CORRECT but NOT A WIN at workgroup level. Read
+      xegpu_wg_loadnd_transpose_supported before applying it.
 
-      The WG lowering pass drops `transpose` on `xegpu.load_nd` without a warning,
-      so the DPAS gets an untransposed operand. A square tile hides it in the type
-      system and a constant input fill hides it numerically. Since every MLIR
-      kernel in this project is WG-level (layouts carry `sg_layout`), this pattern
-      is effectively DISABLED — keep the standalone `vector.transpose`. The entry
-      is kept only to record where the idea came from and why it does not work
-      here.
+      The fold was silently wrong until the 2026-09-11 fix. It is correct now, on
+      a toolchain that carries that fix. But it does not buy speed: measured on 4k
+      flash attention, random [-1,1], median of 500 runs, the folded transpose is
+      1.14431 ms and the explicit `vector.transpose` is 1.14582 ms. That is 0.1%,
+      inside the noise floor. Do not spend iterations on the swap.
+
+      Two hard limits, both now a build failure rather than a wrong answer:
+        - exactly ONE tile per subgroup, and
+        - a SQUARE subgroup tile (sg_data = [64, 64] is fine, [32, 16] is not).
+      `packed` on a WG-level load_nd is rejected outright.
 
       It was distilled from Intel's Triton passes OptimizeDotOperands /
-      FuseTransWithLoad. Those operate on Triton `make_tensor_ptr`, a DIFFERENT
-      compiler path that really does support the fold. The technique was ported to
-      the XeGPU KB without checking that the XeGPU WG pipeline honours the
-      attribute. It does not.
-
-      IF the upstream fix lands (XeGPUWgToSgDistribute.cpp:244 must forward the
-      attribute AND swap the result shape), this becomes valid again — but note the
-      measured payoff is then NEGATIVE on flash attention: the correct transpose
-      costs 1.089x, so the entire apparent win was skipped work.
+      FuseTransWithLoad, which operate on Triton `make_tensor_ptr`. That is a
+      different compiler path. The technique was ported to the XeGPU KB before
+      anyone checked that the XeGPU WG pipeline honoured the attribute; for a
+      year it did not.
     description: |
-      DISABLED at WG level — read the precondition first.
+      Correct at WG level, but worth ~0% — read the precondition first.
 
       The idea: instead of materializing dot(a, trans(load(ptr))) as a separate
       vector.transpose on loaded registers, bake the transpose into the descriptor.
@@ -461,11 +466,12 @@ patterns:
       xegpu.load_nd's transpose capability so the hardware 2D block read performs
       the transpose for free.
 
-      Why it does not work here: the WG pass drops the attribute, so the "free"
-      transpose simply does not happen. The kernel is wrong and fast. Verified on
-      FA_gpt56_opt.mlir — the transpose disappears at
-      stage_06_XeGPUWgToSgDistribute and all 40 resulting `xevm.blockload2d` end up
-      with `transpose = false`; max abs error 0.0219 on random [-1, 1] input.
+      Why the "free" transpose is not free: on Xe2 a sub-32-bit transposed block
+      read is done at 32-bit granularity, so an f16 transpose still costs a real
+      pass over the data. The register-level `vector.transpose` and the folded
+      form end up doing the same work. Verified on FA_gpt56_opt.mlir: folded
+      1.14431 ms vs explicit 1.14582 ms, and 1.5486e-05 max abs error against an
+      f32 reference. Before the fix the same kernel gave 0.0219.
     rationale: |
       A transpose materialized in registers costs shuffles/copies and extra live
       state; the 2D block engine can read the transposed layout directly, so the
@@ -479,8 +485,8 @@ patterns:
       %k_tile_t = xegpu.create_nd_tdesc %K_ptr, shape: [%D, %N], strides: [%c1, %N] : i64 -> !xegpu.tensor_desc<64x16xf16, #kt>
       %k  = xegpu.load_nd %k_tile_t[%c0, %off] <{transpose = array<i64: 1, 0>}> : !xegpu.tensor_desc<64x16xf16, #kt> -> vector<64x16xf16>
       %qk = xegpu.dpas %q, %k, %acc : vector<128x64xf16>, vector<64x16xf16>, vector<128x16xf32> -> vector<128x16xf32>
-    expected_speedup: "none at WG level — the fold is dropped. The 1.089x it appears to buy on flash attention is skipped work, not a win."
-    applies_to: []
+    expected_speedup: "~1.00x (measured 1.14431 vs 1.14582 ms on 4k flash attention). Correct, but not a performance lever."
+    applies_to: ["flash_attention", "gemm", "matmul"]
 
   - id: xegpu_store_nd_contiguous_128b
     name: Coalesce store_nd so each lane writes a contiguous <=128-bit chunk on the stride-1 axis
