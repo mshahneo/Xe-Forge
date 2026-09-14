@@ -20,7 +20,7 @@ category: optimization
 
 constraints:
   - id: xegpu_f32_accumulator_softmax_recipe
-    name: Keep loop-carried accumulators and reduction state in f32, down-cast only where the hardware forces it — measured 1.364x, the single largest lever
+    name: Keep loop-carried accumulators and reduction state in f32, down-cast only where the hardware forces it — measured 1.410x, and it stacks on top of fastmath and the exp fold
     severity: critical
     stages: [dtype_fix, algorithmic, device_specific]
     applies_to: [any_loop_carried_16bit_accumulator, any_16bit_reduction_state, fused_dpas_chains, gemm, matmul, attention, softmax, layernorm]
@@ -67,12 +67,19 @@ constraints:
       whatever else wants registers (prefetch buffers, extra tiles) now competes with
       it. See xegpu_grf_budget_loop_accumulators and xegpu_prefetch_depth_is_tunable.
 
-      MEASURED INSTANCE — BMG B580, 4096x4096 f16 flash attention, median-of-100,
-      large-GRF, both variants ALLCLOSE TRUE: all-f16 loop 1.4119 ms → f32 acc + f32
-      softmax with `arith.truncf` of P to f16 only for the PV DPAS **1.0352 ms =
-      1.364x faster** (4 runs, 0.8% spread), which also BEAT a hand-tuned reference
-      kernel at 1.0948 ms. At default GRF the same f32 variant measured 4.2 ms (4.1x
-      worse), and adding a K/V prefetch on top of it cost 13% (1.0352 → 1.1883 ms).
+      MEASURED INSTANCE — BMG B580, 4096x4096 f16 flash attention, 500 runs, large-GRF,
+      3 interleaved reps, 0.06% spread, both variants ALLCLOSE TRUE. On a kernel that
+      already had `fastmath<afn>` and the exp-quotient fold: all-f16 loop 1.57082 ms →
+      f32 acc + f32 softmax with `arith.truncf` of P to f16 only for the PV DPAS
+      **1.11426 ms = 1.410x faster**. That is 3.189x over the unoptimized baseline and
+      **1.245x faster than a hand-tuned reference** at 1.38736 ms — which the f32 kernel
+      also beats on accuracy (the hand kernel reads ALLCLOSE FALSE, the f32 one TRUE).
+      So this lever stacks with fastmath and the fold rather than competing with them.
+
+      Two things that do NOT stack with it. At default GRF the f32 variant measured
+      4.2 ms (4.1x worse), so large-GRF is mandatory. Adding a K/V prefetch on top cost
+      13% (1.0352 → 1.1883 ms on an earlier f32 kernel), because the f32 state has
+      already taken the register budget the prefetch buffers want.
     fix: |
       This is a MULTI-SITE retype. Every site below must change in the SAME edit, or
       the module does not parse. Two stages on 4k flash attention burned 10 of 10

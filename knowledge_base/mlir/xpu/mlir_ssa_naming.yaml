@@ -63,8 +63,14 @@ constraints:
       reported before any pass runs, so it costs a fraction of a second and does not
       need the lowering pipeline.
     measured_impact: |
-      4 of 5 iterations of one `algorithmic` stage on 4k flash attention, 2026-09-14.
-      Attempts 2 and 3 hit it via anchored edits (`%35_f32`, then `%48_f32`), then
-      attempts 4 and 5 fell back to whole-module and reproduced the identical error at
-      the identical line. The stage still shipped its attempt-1 win, so the cost was
-      budget, not correctness — but it is the difference between one lever and three.
+      Two separate stages on 4k flash attention, 2026-09-14.
+
+      First: 4 of 5 iterations of one `algorithmic` stage. Attempts 2 and 3 hit it via
+      anchored edits (`%35_f32`, then `%48_f32`), then attempts 4 and 5 fell back to
+      whole-module and reproduced the identical error at the identical line. That stage
+      still shipped its attempt-1 win, so the cost was budget, not correctness.
+
+      Then the worse case: a `dtype_fix,algorithmic` run lost **10 of 10** attempts and
+      wrote out a file identical to its input. 5 of the 10 were this error. One attempt
+      alone carried 18 digit-led names. So the whole f32-accumulator lever — worth 1.410x
+      — was blocked by a naming habit, not by anything about the optimization.
