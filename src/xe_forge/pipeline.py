@@ -644,7 +644,10 @@ class XeForgePipeline:
                     executor.pipeline += " igc-cmd-options=-ze-opt-large-register-file"
             logger.info("GRF sweep: large-GRF chosen (%.2fx: %.4f -> %.4f ms)", speedup, d, lg)
             return StageResult(
-                stage=OptimizationStage.DEVICE_SPECIFIC,
+                # GRF_SWEEP, not DEVICE_SPECIFIC. Crediting the flag to
+                # device_specific made a stage that produced nothing read as a
+                # success, and hid that the LLM half of it had failed.
+                stage=OptimizationStage.GRF_SWEEP,
                 success=True,
                 input_code=kernel_code,
                 output_code=kernel_code,  # IR unchanged; flag applied at lowering
@@ -995,6 +998,14 @@ class XeForgePipeline:
             current_ms: float | None = val_orig_ms
             vtune_report = ""
             last_trial_id: str | None = None
+
+            # Keep every verify attempt, rejected ones included. A stage that burns
+            # all 5 iterations used to report only "no valid result in budget", so
+            # telling a syntax failure from a slower kernel meant re-running ~35 min.
+            if hasattr(self.optimizer, "attempts_dir"):
+                self.optimizer.attempts_dir = (
+                    Path(self.config.logging.log_dir) / "attempts" / str(display_name)
+                )
 
             for stage_idx, stage in enumerate(stages_to_apply):
                 logger.info("=" * 60 + f"\nSTAGE: {stage.value.upper()}\n" + "=" * 60)

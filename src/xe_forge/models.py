@@ -40,6 +40,8 @@ class OptimizationStage(StrEnum):
     PERSISTENT_KERNEL = "persistent_kernel"
     DEVICE_SPECIFIC = "device_specific"
     XPU_SPECIFIC = "device_specific"  # backward-compatible alias
+    GRF_SWEEP = "grf_sweep"  # compile-flag only (large register file); its own row so
+    # a win here is never read as a device_specific source-level win
     AUTOTUNING = "autotuning"
     DISCOVERY = "discovery"  # handles open_ended issues — novel optimizations
     # not covered by any existing stage

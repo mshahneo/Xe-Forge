@@ -1,0 +1,228 @@
+"""Tests for the anchored-edit path on large MLIR modules.
+
+Why it exists: a 22 KB MLIR module does not survive being re-emitted by an LLM. A
+one-attribute change comes back with unrelated syntax corrupted somewhere else, the
+attempt is rejected, and the stage burns an iteration. That is how the biggest
+measured flash-attention lever (``fastmath<fast>``, 1.834x) went unapplied for a
+whole run. So small changes travel as anchors instead: exact text copied from the
+module, plus its replacement.
+
+Every failure mode below returns a reason string instead of a patched module. The
+reason is written to be read by the LLM and retried against, so these tests also pin
+that a stale or ambiguous anchor is a hard error — never a silent edit in the wrong
+place.
+"""
+
+import json
+
+from xe_forge.agents.optimizer_agent import (
+    EDITS_SENTINEL,
+    SUCCESS_MESSAGE,
+    OptimizerAgent,
+    _apply_anchored_edits,
+)
+
+MODULE = """\
+gpu.func @payload_kernel() kernel {
+  %0 = math.exp %a : vector<128xf32>
+  %1 = arith.mulf %b, %c : vector<128xf32>
+  %2 = math.exp %d : vector<128xf32>
+  gpu.return
+}
+"""
+
+
+def _edits(*pairs):
+    return json.dumps([{"old": o, "new": n} for o, n in pairs])
+
+
+def test_single_edit_applies():
+    new, why = _apply_anchored_edits(
+        MODULE, _edits(("%0 = math.exp %a :", "%0 = math.exp %a fastmath<fast> :"))
+    )
+    assert why == ""
+    assert "%0 = math.exp %a fastmath<fast> :" in new
+    # The second exp is untouched: only the anchored site changes.
+    assert "%2 = math.exp %d : vector<128xf32>" in new
+
+
+def test_multiple_edits_apply_in_order():
+    new, why = _apply_anchored_edits(
+        MODULE,
+        _edits(
+            ("%0 = math.exp %a :", "%0 = math.exp %a fastmath<fast> :"),
+            ("%2 = math.exp %d :", "%2 = math.exp %d fastmath<fast> :"),
+        ),
+    )
+    assert why == ""
+    assert new.count("fastmath<fast>") == 2
+
+
+def test_a_dict_is_accepted_as_one_edit():
+    new, why = _apply_anchored_edits(
+        MODULE, json.dumps({"old": "arith.mulf %b, %c :", "new": "arith.mulf %b, %c fast :"})
+    )
+    assert why == ""
+    assert "arith.mulf %b, %c fast :" in new
+
+
+def test_fenced_json_is_unwrapped():
+    body = _edits(("gpu.return", "gpu.return // done"))
+    new, why = _apply_anchored_edits(MODULE, f"```json\n{body}\n```")
+    assert why == ""
+    assert "gpu.return // done" in new
+
+
+def test_missing_anchor_is_rejected():
+    new, why = _apply_anchored_edits(MODULE, _edits(("math.exp %zzz :", "whatever")))
+    assert new is None
+    assert "ANCHOR NOT FOUND" in why
+
+
+def test_ambiguous_anchor_is_rejected():
+    # "vector<128xf32>" appears 3 times. Applying to the first would be a silent
+    # edit in a place the LLM did not choose.
+    new, why = _apply_anchored_edits(MODULE, _edits(("vector<128xf32>", "vector<128xf16>")))
+    assert new is None
+    assert "ANCHOR AMBIGUOUS (3 matches)" in why
+
+
+def test_invalid_json_is_rejected_with_a_position():
+    new, why = _apply_anchored_edits(MODULE, '[{"old": "gpu.return", "new":}]')
+    assert new is None
+    assert "EDITS NOT VALID JSON" in why
+
+
+def test_missing_key_is_rejected():
+    new, why = _apply_anchored_edits(MODULE, json.dumps([{"old": "gpu.return"}]))
+    assert new is None
+    assert "needs both" in why
+
+
+def test_no_op_edit_is_rejected():
+    new, why = _apply_anchored_edits(MODULE, _edits(("gpu.return", "gpu.return")))
+    assert new is None
+    assert "no-op" in why
+
+
+def test_empty_and_none_mean_no_edits_supplied():
+    # This exact reason is what makes `compile_and_verify` fall back to reading
+    # `optimized_code`, so the whole-module path still works.
+    for raw in ("", "   ", "NONE", "none"):
+        new, why = _apply_anchored_edits(MODULE, raw)
+        assert new is None
+        assert why == "no edits supplied"
+
+
+def test_empty_list_is_rejected():
+    new, why = _apply_anchored_edits(MODULE, "[]")
+    assert new is None
+    assert "non-empty JSON list" in why
+
+
+def test_sentinel_is_a_plain_word():
+    # The verify tool compares `optimized_code.strip().upper()` against it, so it
+    # must not carry punctuation or whitespace.
+    assert EDITS_SENTINEL == EDITS_SENTINEL.strip().upper()
+    assert EDITS_SENTINEL.isalpha()
+
+
+# --- the verify tool end of the path (no executor, no GPU) -------------------
+
+# Minimal module that clears _verify_mlir's structural pre-checks.
+WG_MODULE = """\
+gpu.module @k {
+  gpu.func @payload_kernel() kernel {
+    %0 = math.exp %a : vector<128xf32>
+    gpu.return
+  }
+}
+func.func @main() {
+  gpu.launch_func @k::@payload_kernel blocks in (%c1, %c1, %c1) threads in (%c1, %c1, %c1)
+  call @printAllclose() : () -> ()
+  return
+}
+"""
+
+
+def _mlir_tool(tmp_path=None):
+    from xe_forge.models import DSL, OptimizationStage
+
+    agent = OptimizerAgent(dsl=DSL.MLIR)
+    if tmp_path is not None:
+        agent.attempts_dir = tmp_path
+    tool, last_accepted = agent._create_verify_tool(
+        WG_MODULE, "k", None, None, stage=OptimizationStage.DEVICE_SPECIFIC
+    )
+    return tool, last_accepted
+
+
+def test_verify_tool_applies_edits_and_hands_the_module_back():
+    tool, last_accepted = _mlir_tool()
+    out = tool.func(
+        optimized_code=EDITS_SENTINEL,
+        edits=_edits(("math.exp %a :", "math.exp %a fastmath<fast> :")),
+    )
+    assert out == SUCCESS_MESSAGE
+    # The stage cannot read the module out of `optimized_code` on this path, so the
+    # tool must leave it in `last_accepted["code"]`.
+    assert "fastmath<fast>" in last_accepted["code"]
+
+
+def test_verify_tool_reports_a_bad_anchor_instead_of_falling_back():
+    # Falling back to `optimized_code` here would silently verify the unchanged
+    # module and bank a 1.00x "win".
+    tool, last_accepted = _mlir_tool()
+    out = tool.func(optimized_code=WG_MODULE, edits=_edits(("math.exp %nope :", "x")))
+    assert out.startswith("EDITS REJECTED")
+    assert "ANCHOR NOT FOUND" in out
+    assert last_accepted["code"] is None
+
+
+def test_verify_tool_rejects_the_sentinel_with_no_edits():
+    tool, _ = _mlir_tool()
+    out = tool.func(optimized_code=EDITS_SENTINEL, edits="")
+    assert EDITS_SENTINEL in out and "supplied no" in out
+
+
+def test_verify_tool_still_takes_a_whole_module():
+    tool, last_accepted = _mlir_tool()
+    whole = WG_MODULE.replace("math.exp %a :", "math.exp %a fastmath<fast> :")
+    assert tool.func(optimized_code=whole, edits="NONE") == SUCCESS_MESSAGE
+    assert "fastmath<fast>" in last_accepted["code"]
+
+
+def test_anchors_resolve_against_the_advancing_base():
+    # After a stage banks an improvement the LLM is shown the improved module, so
+    # anchors must resolve against that — not the stage input.
+    tool, last_accepted = _mlir_tool()
+    improved = WG_MODULE.replace("math.exp %a :", "math.exp %a fastmath<fast> :")
+    last_accepted["base"] = improved
+    out = tool.func(
+        optimized_code=EDITS_SENTINEL,
+        edits=_edits(("math.exp %a fastmath<fast> :", "math.exp2 %a fastmath<fast> :")),
+    )
+    assert out == SUCCESS_MESSAGE
+    # Both edits are present: the second stacked on the first instead of reverting it.
+    assert "math.exp2 %a fastmath<fast> :" in last_accepted["code"]
+
+
+def test_rejected_attempts_are_written_to_disk(tmp_path):
+    # A stage that fails 5/5 used to report only "no valid result in budget".
+    tool, _ = _mlir_tool(tmp_path)
+    tool.func(optimized_code="not mlir at all", edits="NONE")
+    rejected = list(tmp_path.glob("*_rejected.mlir"))
+    assert len(rejected) == 1
+    assert rejected[0].read_text() == "not mlir at all"
+    verdict = rejected[0].with_suffix("").with_suffix(".verdict.txt")
+    assert "MISSING" in verdict.read_text()
+
+
+def test_triton_path_ignores_edits():
+    from xe_forge.models import DSL
+
+    agent = OptimizerAgent(dsl=DSL.TRITON)
+    tool, _ = agent._create_verify_tool("x = 1", "k", None, None)
+    # Valid Python with edits set: the edits must not be consulted at all.
+    out = tool.func(optimized_code="def f():\n    return 1\n", edits=_edits(("x", "y")))
+    assert "ANCHOR" not in out and "EDITS REJECTED" not in out

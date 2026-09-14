@@ -5,8 +5,10 @@ The pipeline still builds the list of detected issues and passes them to each st
 """
 
 import ast
+import json
 import logging
 import re
+from pathlib import Path
 
 import dspy
 
@@ -457,8 +459,18 @@ class MlirOptimizationSignature(dspy.Signature):
     MEMORY_ACCESS: add/strengthen prefetch and cache hints; coalesce loads;
       pick sg_data tiles that map to contiguous 2D block loads.
     DEVICE_SPECIFIC: tune sg_layout / sg_data / inst_data and launch geometry
-      for the Xe-core (DPAS shape, subgroup size 16).
+      for the Xe-core (DPAS shape, subgroup size 16). This stage ALSO owns the
+      per-op float flags the Xe backend cares about: `fastmath<fast>` on hot-loop
+      `math.exp` and on `arith.mulf/subf/addf/divf`, and `math.exp2` in place of
+      `math.exp`. Those are one-token edits worth more than most layout changes —
+      apply the knowledge-base patterns for them before retuning tiles.
     DISCOVERY: apply the open-ended optimization described in the issues field.
+
+    === HOW TO SUBMIT A CHANGE ===
+    Prefer `edits`: a JSON list of exact-anchor replacements. Copy `old` verbatim
+    from the module, make it unique, and write `UNCHANGED` in `optimized_code`.
+    Re-emitting the whole module corrupts unrelated syntax and wastes the attempt.
+    Use `optimized_code` only for a restructuring too large to express as anchors.
     """
 
     original_code: str = dspy.InputField(desc="Original MLIR module for reference")
@@ -476,9 +488,18 @@ class MlirOptimizationSignature(dspy.Signature):
     knowledge_base_context: str = dspy.InputField(
         desc="Relevant optimization patterns from knowledge base. Empty if KB disabled."
     )
+    edits: str = dspy.OutputField(
+        desc="PREFERRED. JSON list of exact-anchor replacements: "
+        '[{"old": "<text copied verbatim from the module>", "new": "<replacement>"}]. '
+        "Each `old` must appear EXACTLY ONCE — include indentation and enough "
+        "surrounding text to be unique. Write NONE only if you truly need to "
+        "rewrite the whole module."
+    )
     optimized_code: dspy.Code["mlir"] = dspy.OutputField(
-        desc="Complete optimized MLIR module. Keep the @main harness and reference unchanged; "
-        "edit only the gpu.module kernel, #xegpu.layout attrs, and launch geometry."
+        desc="Write the single word UNCHANGED when you supplied `edits`. Otherwise the "
+        "complete optimized MLIR module, with the @main harness and reference "
+        "unchanged; edit only the gpu.module kernel, #xegpu.layout attrs, and "
+        "launch geometry."
     )
 
 
@@ -502,6 +523,11 @@ class MlirAlgorithmicOptimizationSignature(dspy.Signature):
     - Edit ONLY the `gpu.module` kernel and its `#xegpu.layout` attrs.
     - DO NOT touch the `@main` harness, fill values, or CPU reference.
     - Must stay valid MLIR that lowers through the workgroup XeVM pipeline.
+
+    === HOW TO SUBMIT A CHANGE ===
+    Prefer `edits`: a JSON list of exact-anchor replacements. Copy `old` verbatim
+    from the module, make it unique, and write `UNCHANGED` in `optimized_code`.
+    Re-emitting the whole module corrupts unrelated syntax and wastes the attempt.
     """
 
     original_code: str = dspy.InputField(desc="Original MLIR module for reference")
@@ -512,8 +538,15 @@ class MlirAlgorithmicOptimizationSignature(dspy.Signature):
     problem_context: str = dspy.InputField(desc="Problem context: dimensions, FLOP count.")
     performance_context: str = dspy.InputField(desc="Current performance. Empty if not measured.")
     knowledge_base_context: str = dspy.InputField(desc="KB patterns. Empty if disabled.")
+    edits: str = dspy.OutputField(
+        desc="PREFERRED. JSON list of exact-anchor replacements: "
+        '[{"old": "<text copied verbatim from the module>", "new": "<replacement>"}]. '
+        "Each `old` must appear EXACTLY ONCE. Write NONE only if you truly need to "
+        "rewrite the whole module."
+    )
     optimized_code: dspy.Code["mlir"] = dspy.OutputField(
-        desc="Complete optimized MLIR module with algorithmic improvements; harness unchanged."
+        desc="Write the single word UNCHANGED when you supplied `edits`. Otherwise the "
+        "complete optimized MLIR module with algorithmic improvements; harness unchanged."
     )
 
 
@@ -565,6 +598,68 @@ def _has_cpu_return(code: str) -> bool:
     return False
 
 
+#: What the LLM writes in `optimized_code` when it wants the `edits` path instead.
+EDITS_SENTINEL = "UNCHANGED"
+
+
+def _apply_anchored_edits(code: str, edits_str: str) -> tuple[str | None, str]:
+    """Apply a JSON list of exact-anchor replacements to `code`.
+
+    Returns `(new_code, "")` on success, or `(None, reason)` on failure. The
+    reason is written for the LLM to read and retry against.
+
+    A whole 22KB MLIR module does not survive being re-emitted by an LLM: a
+    one-attribute change arrives with unrelated syntax corrupted somewhere else.
+    So small changes travel as anchors instead. Every anchor must appear exactly
+    once, which makes a stale or ambiguous anchor a hard error rather than a
+    silent edit in the wrong place.
+    """
+    raw = (edits_str or "").strip()
+    if not raw or raw.upper() == "NONE":
+        return None, "no edits supplied"
+
+    if "```" in raw:
+        m = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
+        if m:
+            raw = m.group(1).strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return None, f"EDITS NOT VALID JSON at char {e.pos}: {e.msg}"
+
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list) or not parsed:
+        return None, 'EDITS must be a non-empty JSON list of {"old": ..., "new": ...}'
+
+    out = code
+    for i, ed in enumerate(parsed, 1):
+        if not isinstance(ed, dict) or "old" not in ed or "new" not in ed:
+            return None, f'edit {i}: needs both an "old" and a "new" key'
+        old, new = str(ed["old"]), str(ed["new"])
+        if not old:
+            return None, f'edit {i}: "old" is empty — it must be text copied from the module'
+        n = out.count(old)
+        if n == 0:
+            return None, (
+                f'edit {i}: ANCHOR NOT FOUND. Copy "old" verbatim from the module, '
+                f"including indentation. Got: {old[:120]!r}"
+            )
+        if n > 1:
+            return None, (
+                f"edit {i}: ANCHOR AMBIGUOUS ({n} matches). Add surrounding lines "
+                f"to make it unique. Got: {old[:120]!r}"
+            )
+        if old == new:
+            return None, f'edit {i}: "old" and "new" are identical — that is a no-op'
+        out = out.replace(old, new, 1)
+
+    if out == code:
+        return None, "edits applied but the module is unchanged"
+    return out, ""
+
+
 def _extract_code_from_response(code_str):
     if code_str is None:
         return ""
@@ -600,8 +695,43 @@ class OptimizerAgent(Optimizer):
         self.max_iterations = max_iterations
         self.knowledge_base: KnowledgeBase | None = knowledge_base
         self.dsl = DSL(dsl) if isinstance(dsl, str) else dsl
+        #: Where rejected attempts get written. Set by the pipeline; when it is
+        #: None only the log line is emitted.
+        self.attempts_dir: Path | None = None
         if not executor:
             logger.warning("No executor provided - kernels will NOT be verified at runtime!")
+
+    def _attempt_log(self, stage, n, via, verdict, speedup, code: str | None = None) -> None:
+        """Record one verify attempt, rejected ones included.
+
+        A stage that burns its whole budget used to report only "no valid result in
+        budget", so there was no way to tell a syntax failure from a slower kernel
+        without re-running the stage for ~35 minutes. Every attempt now leaves a
+        verdict line, and every rejected module is kept.
+        """
+        tag = getattr(stage, "value", str(stage))
+        first = (verdict or "").strip().splitlines()
+        head = first[0][:200] if first else "(no verdict)"
+        logger.info(
+            "  attempt %d [%s] via %s: %s%s",
+            n,
+            tag,
+            via,
+            head,
+            f" ({speedup:.3f}x)" if speedup else "",
+        )
+        if not self.attempts_dir or code is None:
+            return
+        try:
+            self.attempts_dir.mkdir(parents=True, exist_ok=True)
+            ok = (verdict or "").strip() == SUCCESS_MESSAGE
+            stem = f"{tag}_a{n}_{'ok' if ok else 'rejected'}"
+            (self.attempts_dir / f"{stem}.mlir").write_text(code)
+            (self.attempts_dir / f"{stem}.verdict.txt").write_text(
+                f"stage: {tag}\nattempt: {n}\nvia: {via}\nspeedup: {speedup}\nverdict:\n{verdict}\n"
+            )
+        except OSError as e:
+            logger.debug("could not write attempt artifact: %s", e)
 
     def _create_verify_tool(
         self,
@@ -619,16 +749,38 @@ class OptimizerAgent(Optimizer):
     ):
         executor = self.executor
         dsl = self.dsl
-        last_accepted = {"comparison": None}
+        # "base" is what anchors resolve against. It advances as the stage improves
+        # the module, so a later edit anchors on the text the LLM was actually shown
+        # and edits stack instead of reverting the previous win.
+        last_accepted = {"comparison": None, "code": None, "base": original_code}
+        attempt_log = self._attempt_log
 
         _verify_call_count = [0]
 
-        def compile_and_verify(optimized_code: dspy.Code["python"]) -> str:
+        def compile_and_verify(optimized_code: dspy.Code["python"], edits: str = "") -> str:
             _verify_call_count[0] += 1
             logger.debug("compile_and_verify call #%d", _verify_call_count[0])
             code = _extract_code_from_response(
                 optimized_code.code if hasattr(optimized_code, "code") else str(optimized_code)
             )
+
+            # Anchored edits win when supplied: they are the reliable way to change
+            # a large module. `optimized_code` is only read when there are none.
+            via = "whole-module"
+            if dsl == DSL.MLIR:
+                patched, why = _apply_anchored_edits(last_accepted["base"], edits)
+                if patched is not None:
+                    code, via = patched, "edits"
+                elif why != "no edits supplied":
+                    attempt_log(stage, _verify_call_count[0], "edits", why, None)
+                    return f"EDITS REJECTED: {why}"
+                elif code.strip().upper() == EDITS_SENTINEL:
+                    msg = (
+                        f"You wrote {EDITS_SENTINEL} in optimized_code but supplied no "
+                        "edits. Provide the edits, or the full module instead."
+                    )
+                    attempt_log(stage, _verify_call_count[0], "edits", msg, None)
+                    return msg
 
             if dsl == DSL.SYCL:
                 result = _verify_sycl(code, original_code, executor, input_shapes, spec_dims)
@@ -649,6 +801,7 @@ class OptimizerAgent(Optimizer):
 
             if dsl == DSL.MLIR:
                 result = _verify_mlir(code, original_code, executor, flop=flop)
+                _spd = None
                 if result == SUCCESS_MESSAGE and executor:
                     try:
                         c = executor.compare_kernels(
@@ -657,8 +810,15 @@ class OptimizerAgent(Optimizer):
                             flop=flop,
                         )
                         last_accepted["comparison"] = c
+                        _spd = c.speedup
                     except Exception:
                         pass
+                if result == SUCCESS_MESSAGE:
+                    # The edits path leaves `optimized_code` a sentinel, so the
+                    # stage cannot recover the module from the prediction. Hand it
+                    # over here instead.
+                    last_accepted["code"] = code
+                attempt_log(stage, _verify_call_count[0], via, result, _spd, code=code)
                 return result
 
             # --- Triton path ---
@@ -802,7 +962,11 @@ class OptimizerAgent(Optimizer):
         tool = dspy.Tool(
             func=compile_and_verify,
             name="compile_and_verify",
-            desc=f'Compiles and verifies optimized kernel. Returns "{SUCCESS_MESSAGE}" on success.',
+            desc=(
+                f'Compiles and verifies optimized kernel. Returns "{SUCCESS_MESSAGE}" on '
+                "success. Pass `edits` (a JSON list of exact-anchor replacements) to change "
+                "a large module; pass `optimized_code` only for a whole rewrite."
+            ),
         )
         return tool, last_accepted
 
@@ -1003,6 +1167,12 @@ class OptimizerAgent(Optimizer):
 
                 run_kwargs = {**kwargs, "current_code": current_code_for_run}
 
+                # Anchors resolve against exactly what the LLM is shown this run, and
+                # a module accepted by an earlier run must not be picked up as if it
+                # came from this one.
+                last_accepted["base"] = current_code_for_run
+                last_accepted["code"] = None
+
                 result = cover(**run_kwargs)
 
                 traj = result.trajectory if hasattr(result, "trajectory") else {}
@@ -1016,6 +1186,15 @@ class OptimizerAgent(Optimizer):
                 candidate = _extract_code_from_response(
                     code_obj.code if hasattr(code_obj, "code") else str(code_obj)
                 )
+
+                # On the edits path `optimized_code` is only the sentinel, so the
+                # real module is whatever the verify tool last accepted.
+                if self.dsl == DSL.MLIR:
+                    _patched = last_accepted.get("code")
+                    if _patched and (not candidate or candidate.strip().upper() == EDITS_SENTINEL):
+                        candidate = _patched
+                    elif not candidate:
+                        break
 
                 ok, spd, mb, ma, err = self._final_verify(
                     original_code,
