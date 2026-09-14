@@ -87,6 +87,11 @@ constraints:
          original alone:
            %cst_acc_f32 = arith.constant dense<0.0> : vector<128x64xf32>
          Name it letter-led — see mlir_new_ssa_name_must_not_start_with_a_digit.
+         This applies to EVERY constant that ends up in the f32 chain, not just the
+         accumulator initialisers. The one most often missed is the in-loop SCALE
+         factor (1/sqrt(d), e.g. `dense<1.25e-01>`): once the dpas returns f32, the
+         `arith.mulf` that scales it needs an f32 constant too, and a run that fixed
+         all three iter_arg constants still failed on that single one.
       2. UPDATE THE `xegpu.dpas` TYPE SIGNATURE in the same edit. Its trailing types
          are `: A, B, C -> D`. A and B stay 16-bit; C and D both become f32. If you
          retype only the constant, MLIR reports
