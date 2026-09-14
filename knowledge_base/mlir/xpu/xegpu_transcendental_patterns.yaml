@@ -316,13 +316,19 @@ constraints:
       flag on it, anywhere its cost is repeated — inside any loop, or applied to a tile
       or tensor large enough to matter. This is an ANALYSIS-time trigger: if you see
       bare `math.exp %x : vectorNxf..` (no `fastmath<...>`) in the kernel body, flag it
-      as a device_specific issue (issue_type: missing_fastmath / slow_transcendental).
+      as a device_specific issue with issue_type: sigmoid_slow_exp.
       The workload is irrelevant to the trigger — softmax and attention are the usual
       suspects, but layernorm, GELU, logsumexp and any exp-bearing elementwise loop hit
       the same lowering. Do NOT flag exp that is already tagged fastmath, exp that is
       demonstrably off the hot path (evaluated once, outside every loop), or kernels
       whose correctness oracle needs bit-accurate exp.
     description: |
+      TRIGGER: a bare `math.exp` or `arith.maximumf` carrying NO `fastmath<...>` flag,
+      inside any loop or applied to a tile. Report it as issue_type: sigmoid_slow_exp
+      (stage device_specific). Untagged math.exp lowers to a SOFTWARE polynomial on Xe;
+      `fastmath<afn>` unlocks the hardware native_exp. Measured 1.92x on a small
+      softmax, 1.834x on 4k attention.
+
       On Intel Xe, natural math.exp lowers to the SPIR-V OpenCL `exp` builtin. To
       honor OpenCL's tight accuracy ULP requirement, IGC implements that builtin via
       a SOFTWARE-EMULATED polynomial expansion — expensive, and paid on every element

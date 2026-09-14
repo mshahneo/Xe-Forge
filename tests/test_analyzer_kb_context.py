@@ -101,3 +101,48 @@ def test_no_knowledge_base_is_empty_not_an_error():
     agent = AnalyzerAgent.__new__(AnalyzerAgent)
     agent.knowledge_base = None
     assert agent._get_kb_context() == ""
+
+
+def test_the_precondition_is_sent_too():
+    # KB authors write the detection trigger in `precondition` ("APPLIES when ...").
+    # Sending only `description` gave the analyzer the mechanism and never the
+    # trigger, so a constraint could be in context and still not fire.
+    agent = _agent()
+    with_pre = [
+        c
+        for bucket in _buckets(agent.knowledge_base)
+        for c in bucket
+        if (c.precondition or "").strip()
+    ]
+    assert with_pre, "test needs at least one constraint with a precondition"
+    ctx = agent._get_kb_context()
+    assert ctx.count("APPLIES WHEN:") == len(with_pre)
+
+
+def test_the_fastmath_trigger_names_a_real_issue_type():
+    # The analyzer's issue is dropped in `_coerce_issue` unless the type exists. This
+    # constraint used to name `missing_fastmath` / `slow_transcendental` — neither is
+    # in `IssueType`, so the trigger was unusable even when read.
+    from xe_forge.knowledge.patterns import get_stage_for_issue
+    from xe_forge.models import IssueType
+
+    ctx = _agent()._get_kb_context()
+    start = ctx.index("needs fastmath")
+    entry = ctx[start : start + 900]
+    assert "sigmoid_slow_exp" in entry
+    assert get_stage_for_issue(IssueType.SIGMOID_SLOW_EXP) == OptimizationStage.DEVICE_SPECIFIC
+
+
+def test_the_fastmath_trigger_survives_the_300_char_window():
+    # Only `description[:300]` is sent. A description that opens with mechanism is
+    # dead weight: that is exactly how this constraint failed.
+    agent = _agent()
+    target = next(
+        c
+        for bucket in _buckets(agent.knowledge_base)
+        for c in bucket
+        if c.id == "xegpu_softmax_exp_needs_fastmath"
+    )
+    window = target.description.strip()[:300]
+    assert "TRIGGER" in window
+    assert "sigmoid_slow_exp" in window

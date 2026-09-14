@@ -624,7 +624,15 @@ class AnalyzerAgent:
                         continue
                     seen.add(c.id)
                     desc = c.description.strip()[:300]
-                    bucket.append(f"[{c.severity.upper()}] {c.name}: {desc}")
+                    line = f"[{c.severity.upper()}] {c.name}: {desc}"
+                    # The precondition is where KB authors write the detection
+                    # trigger — "APPLIES when ...". Sending only `description` meant
+                    # the analyzer got the mechanism and never the trigger, so the
+                    # fastmath constraint could not fire even once it was in context.
+                    pre = (c.precondition or "").strip()[:300]
+                    if pre:
+                        line += f"\n  APPLIES WHEN: {pre}"
+                    bucket.append(line)
                 if bucket:
                     per_stage.append(bucket)
 
