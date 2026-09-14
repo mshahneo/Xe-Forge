@@ -2,6 +2,7 @@
 Analyzer Agent - LLM-based analysis of Triton kernels for optimization opportunities.
 """
 
+import itertools
 import logging
 
 import dspy
@@ -595,6 +596,12 @@ class AnalyzerAgent:
 
     # ------------------------------------------------------------------
 
+    # Room for the analyzer's constraint list. The old 6000 dropped 10 of 24
+    # constraints on mlir/xpu, so the analyzer never saw the fastmath trigger and
+    # never routed an issue to it. The whole list is ~9.8 KB; the optimizer already
+    # gets 57 KB of patterns, so 6000 was protecting nothing.
+    _KB_CONTEXT_BUDGET = 24000
+
     def _get_kb_context(self) -> str:
         """Return critical constraints from KB for the analyzer to check against."""
         if self.knowledge_base is None:
@@ -602,19 +609,48 @@ class AnalyzerAgent:
         try:
             from xe_forge.models import OptimizationStage
 
-            lines_out = ["=== KB Constraints (check these against the code) ==="]
+            # Group by stage first. Cutting a flat enum-ordered list starves whole
+            # late stages: algorithmic took 7 of the 14 that fit and device_specific
+            # kept 2 of its 10. Round-robin instead, so a cut thins every stage
+            # evenly and no stage's constraints all vanish.
+            per_stage: list[list[str]] = []
             seen = set()
             for stage in OptimizationStage:
                 if stage == OptimizationStage.ANALYSIS:
                     continue
+                bucket = []
                 for c in self.knowledge_base.constraints_for_stage(stage):
                     if c.id in seen or c.severity not in ("critical", "warning"):
                         continue
                     seen.add(c.id)
                     desc = c.description.strip()[:300]
-                    lines_out.append(f"[{c.severity.upper()}] {c.name}: {desc}")
-            result = "\n".join(lines_out)
-            return result[:6000] + "\n...[truncated]" if len(result) > 6000 else result
+                    bucket.append(f"[{c.severity.upper()}] {c.name}: {desc}")
+                if bucket:
+                    per_stage.append(bucket)
+
+            lines_out = ["=== KB Constraints (check these against the code) ==="]
+            used = len(lines_out[0])
+            dropped = 0
+            for row in itertools.zip_longest(*per_stage):
+                for line in row:
+                    if line is None:
+                        continue
+                    if used + 1 + len(line) > self._KB_CONTEXT_BUDGET:
+                        dropped += 1
+                        continue
+                    lines_out.append(line)
+                    used += 1 + len(line)
+            if dropped:
+                # Say it out loud. The only old tell was a log line reading exactly
+                # "6015 chars", and you had to know the magic number to spot it.
+                logger.warning(
+                    "Analyzer KB context over budget: %d constraints dropped "
+                    "(budget %d chars). Raise _KB_CONTEXT_BUDGET or trim descriptions.",
+                    dropped,
+                    self._KB_CONTEXT_BUDGET,
+                )
+                lines_out.append(f"...[{dropped} more constraints not shown]")
+            return "\n".join(lines_out)
         except Exception as e:
             logger.debug("KB context failed: %s", e)
             return ""
