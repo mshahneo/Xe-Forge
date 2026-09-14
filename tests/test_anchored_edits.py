@@ -15,6 +15,7 @@ place.
 
 import json
 import logging
+from pathlib import Path
 
 import dspy
 
@@ -361,3 +362,75 @@ def test_a_one_line_verdict_is_unchanged(caplog):
     # A success verdict has no second line and must not grow noise.
     line = _log_one_attempt(caplog, SUCCESS_MESSAGE)
     assert line.endswith(SUCCESS_MESSAGE)
+
+
+# --- a digit-led SSA name is repaired, not rejected -----------------------------
+
+
+def test_a_digit_led_name_is_renamed():
+    from xe_forge.agents.optimizer_agent import _repair_digit_led_ssa_names
+
+    code, note = _repair_digit_led_ssa_names(
+        "%35_f32 = arith.extf %35 : vector<4xf16> to vector<4xf32>\n"
+        "%36 = arith.mulf %35_f32, %35_f32 : vector<4xf32>\n"
+    )
+    # Every occurrence moves together, and the legal `%35` / `%36` are untouched.
+    assert "%v35_f32 = arith.extf %35 :" in code
+    assert "arith.mulf %v35_f32, %v35_f32" in code
+    assert "%35_f32" not in code
+    assert "renamed 1" in note
+
+
+def test_legal_names_are_left_alone():
+    from xe_forge.agents.optimizer_agent import _repair_digit_led_ssa_names
+
+    src = "%0 = arith.addf %arg5, %cst_1 : f32\n%18:3 = scf.for %c0 = %c0 to %c4 step %c1\n"
+    code, note = _repair_digit_led_ssa_names(src)
+    assert code == src
+    assert note == ""
+
+
+def test_a_repair_never_collides_with_an_existing_name():
+    from xe_forge.agents.optimizer_agent import _repair_digit_led_ssa_names
+
+    # `%v35_f32` is already taken, so the repair must pick something else.
+    code, _ = _repair_digit_led_ssa_names("%v35_f32 = f()\n%35_f32 = g()\n")
+    assert "%v35_f32 = f()" in code
+    assert "%v35_f32 = g()" not in code
+    assert "%35_f32" not in code.replace("%v35_f32", "")
+
+
+def test_the_real_rejected_module_loses_its_name_errors(tmp_path):
+    """Repair clears every name error in the f32 retype from run 5.
+
+    It is NOT enough to make that module parse, and the test says so: underneath the
+    names sits a real error (the f16 `%cst` scale feeding an f32 multiply). The claim
+    guarded here is only that repair removes the whole name class and surfaces the
+    genuine problem instead of hiding behind it. Skips without a local mlir-opt.
+    """
+    import shutil
+    import subprocess
+
+    from xe_forge.agents.optimizer_agent import _repair_digit_led_ssa_names
+
+    src = Path(__file__).parent / "data" / "f32_retype_digit_led_names.mlir"
+    opt = shutil.which("mlir-opt") or "/home/gta/upstream/llvm-project/build-with-imex/bin/mlir-opt"
+    if not src.exists() or not Path(opt).exists():
+        import pytest
+
+        pytest.skip("needs the sample module and a local mlir-opt")
+
+    raw = src.read_text()
+    before = subprocess.run([opt, str(src), "-o", "/dev/null"], capture_output=True, text=True)
+    assert "expected '=' after SSA name" in before.stderr, "sample no longer reproduces"
+
+    fixed, note = _repair_digit_led_ssa_names(raw)
+    assert note
+    p = tmp_path / "fixed.mlir"
+    p.write_text(fixed)
+    after = subprocess.run([opt, str(p), "-o", "/dev/null"], capture_output=True, text=True)
+
+    assert "expected '=' after SSA name" not in after.stderr, after.stderr
+    # What is left is the real defect the names were masking: the f16 scale constant
+    # now feeds an f32 multiply. A different error class, and a useful one.
+    assert "expects different type" in after.stderr

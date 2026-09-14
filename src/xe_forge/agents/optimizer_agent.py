@@ -601,6 +601,54 @@ def _has_cpu_return(code: str) -> bool:
 #: What the LLM writes in `optimized_code` when it wants the `edits` path instead.
 EDITS_SENTINEL = "UNCHANGED"
 
+#: A `%`, digits, then a letter/underscore/`$` — e.g. `%35_f32`. Illegal in MLIR: a
+#: numeric SSA id must be ALL digits, and a named one must start with a non-digit.
+_DIGIT_LED_SSA = re.compile(r"%(\d+)([A-Za-z_$][\w$]*)")
+
+#: Every SSA name already present, so a repair cannot collide with one.
+_ANY_SSA = re.compile(r"%[\w$.\-]+")
+
+
+def _repair_digit_led_ssa_names(code: str) -> tuple[str, str]:
+    """Rename `%35_f32`-style values to `%v35_f32`. Returns `(code, note)`.
+
+    Why this exists: converting an accumulator to f32 means introducing values derived
+    from existing ones, and our kernels number their values. The natural name for a
+    derived value is then `%<n>_f32` — which does not parse, because MLIR reads `%35`
+    as a numeric id and then wants `=`. Two stages on 4k flash attention lost 5 of 10
+    attempts to exactly this, three times in a row with identical text, while the
+    conversion around it was correct.
+
+    A KB constraint spelling out the rule did not stop it: the model followed the rest
+    of the recipe (separate f32 constants, updated dpas signature) and still wrote
+    `%34_f32`. So repair it here instead of asking. The rename is purely syntactic and
+    behaviour-preserving — every occurrence of a given name maps to one new name — so
+    it cannot change what the kernel computes.
+
+    `note` is empty when nothing needed repair.
+    """
+    found = {m.group(0) for m in _DIGIT_LED_SSA.finditer(code)}
+    if not found:
+        return code, ""
+
+    taken = set(_ANY_SSA.findall(code))
+    mapping: dict[str, str] = {}
+    for old in sorted(found):
+        digits, suffix = _DIGIT_LED_SSA.match(old).groups()
+        new = f"%v{digits}{suffix}"
+        n = 0
+        while new in taken or new in mapping.values():
+            n += 1
+            new = f"%v{digits}{suffix}_{n}"
+        mapping[old] = new
+        taken.add(new)
+
+    # One pass over the maximal-identifier matches, so each name is replaced whole and
+    # a short name can never clobber part of a longer one.
+    repaired = _DIGIT_LED_SSA.sub(lambda m: mapping[m.group(0)], code)
+    sample = ", ".join(f"{o} -> {mapping[o]}" for o in sorted(mapping)[:3])
+    return repaired, f"renamed {len(mapping)} digit-led SSA name(s): {sample}"
+
 
 def _apply_anchored_edits(code: str, edits_str: str) -> tuple[str | None, str]:
     """Apply a JSON list of exact-anchor replacements to `code`.
@@ -807,6 +855,11 @@ class OptimizerAgent(Optimizer):
                 return result
 
             if dsl == DSL.MLIR:
+                # Repair before parsing, not after failing. An f32 retype is otherwise
+                # correct and still dies on the name it gave a derived value.
+                code, _repair = _repair_digit_led_ssa_names(code)
+                if _repair:
+                    logger.info("  repaired attempt %d: %s", _verify_call_count[0], _repair)
                 result = _verify_mlir(code, original_code, executor, flop=flop)
                 _spd = None
                 if result == SUCCESS_MESSAGE and executor:
