@@ -148,6 +148,54 @@ def test_the_fastmath_trigger_survives_the_300_char_window():
     assert "sigmoid_slow_exp" in window
 
 
+def test_an_issue_type_a_constraint_names_is_not_cut_off():
+    """A constraint that names an `issue_type` must name it in the part that is SENT.
+
+    Only `description[:300]` and `precondition[:300]` reach the analyzer. The
+    exp-quotient fold named `issue_type: algebraic_simplification` at char 337 of its
+    precondition, so the analyzer got the detection condition and never the label to
+    report it under. Same failure shape as the fastmath constraint, one step milder.
+
+    Constraints that name no issue_type at all are fine and are not checked here: most
+    are rules to check against ("tile must divide"), not detection triggers.
+    """
+    from xe_forge.models import IssueType
+
+    agent = _agent()
+    valid = {m.value for m in IssueType}
+    cut = []
+    for bucket in _buckets(agent.knowledge_base):
+        for c in bucket:
+            desc, pre = c.description.strip(), (c.precondition or "").strip()
+            sent = desc[:300] + "\n" + pre[:300]
+            whole = desc + "\n" + pre
+            named_anywhere = {v for v in valid if v in whole}
+            if named_anywhere and not (named_anywhere & {v for v in valid if v in sent}):
+                cut.append((c.id, sorted(named_anywhere)))
+    assert not cut, f"issue_type named but cut out of the sent window: {cut}"
+
+
+def test_a_constraint_never_names_an_issue_type_that_does_not_exist():
+    """`_coerce_issue` drops an issue whose type is not in `IssueType`.
+
+    The fastmath constraint shipped naming `missing_fastmath` and
+    `slow_transcendental`. Neither exists, so it could never have routed anywhere.
+    """
+    import re
+
+    from xe_forge.models import IssueType
+
+    valid = {m.value for m in IssueType}
+    bad = []
+    for bucket in _buckets(_agent().knowledge_base):
+        for c in bucket:
+            whole = c.description + "\n" + (c.precondition or "")
+            for m in re.finditer(r"issue_type:\s*([a-z_]+)", whole):
+                if m.group(1) not in valid:
+                    bad.append((c.id, m.group(1)))
+    assert not bad, f"constraint names a non-existent IssueType: {bad}"
+
+
 def test_attempts_dir_is_per_run():
     # A single per-kernel directory meant the next run overwrote the evidence from
     # the run you were still reading.
