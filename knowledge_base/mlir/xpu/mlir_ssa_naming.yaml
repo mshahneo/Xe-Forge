@@ -72,5 +72,5 @@ constraints:
 
       Then the worse case: a `dtype_fix,algorithmic` run lost **10 of 10** attempts and
       wrote out a file identical to its input. 5 of the 10 were this error. One attempt
-      alone carried 18 digit-led names. So the whole f32-accumulator lever — worth 1.410x
+      alone carried 18 digit-led names. So the whole f32-accumulator lever — worth 1.317x
       — was blocked by a naming habit, not by anything about the optimization.

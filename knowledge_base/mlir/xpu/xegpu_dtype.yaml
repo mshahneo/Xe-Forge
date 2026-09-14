@@ -20,7 +20,7 @@ category: optimization
 
 constraints:
   - id: xegpu_f32_accumulator_softmax_recipe
-    name: Keep loop-carried accumulators and reduction state in f32, down-cast only where the hardware forces it — measured 1.410x, and it stacks on top of fastmath and the exp fold
+    name: Keep loop-carried accumulators and reduction state in f32, down-cast only where the hardware forces it — measured 1.317x on random input, and it stacks on top of fastmath and the exp fold
     severity: critical
     stages: [dtype_fix, algorithmic, device_specific]
     applies_to: [any_loop_carried_16bit_accumulator, any_16bit_reduction_state, fused_dpas_chains, gemm, matmul, attention, softmax, layernorm]
@@ -68,13 +68,21 @@ constraints:
       it. See xegpu_grf_budget_loop_accumulators and xegpu_prefetch_depth_is_tunable.
 
       MEASURED INSTANCE — BMG B580, 4096x4096 f16 flash attention, 500 runs, large-GRF,
-      3 interleaved reps, 0.06% spread, both variants ALLCLOSE TRUE. On a kernel that
-      already had `fastmath<afn>` and the exp-quotient fold: all-f16 loop 1.57082 ms →
-      f32 acc + f32 softmax with `arith.truncf` of P to f16 only for the PV DPAS
-      **1.11426 ms = 1.410x faster**. That is 3.189x over the unoptimized baseline and
-      **1.245x faster than a hand-tuned reference** at 1.38736 ms — which the f32 kernel
-      also beats on accuracy (the hand kernel reads ALLCLOSE FALSE, the f32 one TRUE).
-      So this lever stacks with fastmath and the fold rather than competing with them.
+      3 interleaved reps, **random input in (-1,1)**. On a kernel that already had
+      `fastmath<afn>` and the exp-quotient fold: all-f16 loop 1.83290 ms → f32 acc + f32
+      softmax with `arith.truncf` of P to f16 only for the PV DPAS **1.39142 ms =
+      1.317x faster**. That is 2.756x over the unoptimized baseline (3.83464 ms). So this
+      lever stacks with fastmath and the fold rather than competing with them. It does
+      NOT beat a hand-tuned reference: that kernel measures 1.38705 ms, a tie within
+      0.3%.
+
+      MEASURE THIS ON RANDOM INPUT, NOT THE UNIFORM "magic" FILL. The same four kernels
+      on a 0.625-everywhere fill read 1.57082 / 1.11426 / 3.55363 ms, which turns the
+      lever into a false 1.410x and the total into a false 3.189x. The fill does not
+      speed all kernels equally — baseline 1.079x, +fastmath+fold 1.167x, f32 acc
+      1.249x — so it corrupts RATIOS as well as absolute times, and it flatters the
+      optimized kernel most. Under that fill every QK dot is identical, so max abs error
+      is exactly 0 for any kernel and ALLCLOSE TRUE carries no accuracy information.
 
       Two things that do NOT stack with it. At default GRF the f32 variant measured
       4.2 ms (4.1x worse), so large-GRF is mandatory. Adding a K/V prefetch on top cost
