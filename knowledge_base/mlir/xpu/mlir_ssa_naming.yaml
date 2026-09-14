@@ -1,0 +1,70 @@
+# MLIR SSA naming — a parse rule, not a style rule
+#
+# This file exists because one naming habit cost a whole optimization stage. The
+# `algorithmic` stage on 4k flash attention used 4 of its 5 iterations on the SAME
+# parse error, three times in a row with identical text, while trying to introduce
+# f32 intermediates for the DPAS accumulator:
+#
+#   error: expected '=' after SSA name
+#     %35_f32 = arith.extf %34 : vector<128x64xf16> to vector<128x64xf32>
+#        ^
+#
+# The rewrite it wanted was correct. Only the name was illegal. Our kernels number
+# their values (%34, %35, ...), so deriving a new name from an old one is the natural
+# move, and the natural spelling of it does not parse.
+#
+# Belongs in mlir/xpu/ rather than mlir/common/: it is about how to express an edit,
+# and the xpu view is the only MLIR view that writes IR (the linalg view picks a tile
+# config). See the header of mlir/common/xegpu_hardware_contract.yaml.
+
+language: mlir
+
+constraints:
+  - id: mlir_new_ssa_name_must_not_start_with_a_digit
+    name: "A new SSA value name must start with a letter — %35_f32 does not parse"
+    severity: critical
+    stages: [dtype_fix, algorithmic, device_specific, memory_access, fusion]
+    scope: universal
+    tags: [syntax, ssa, naming, parse-error, extf, truncf, accumulator]
+    applies_to: [any_new_value_introduced_by_an_edit, dtype_conversion, f32_accumulator]
+    precondition: |
+      APPLIES whenever an edit INTRODUCES a new value, which is most often a dtype
+      conversion (arith.extf / arith.truncf) or a hoisted subexpression. It does not
+      apply to edits that only add an attribute to an existing op.
+    description: |
+      MLIR has TWO kinds of SSA name and they do not mix:
+        * numeric  — `%0`, `%35`. Everything after `%` must be a DIGIT.
+        * named    — `%acc`, `%v35_f32`, `%_tmp`. Must START with a letter, `_`, `$`,
+                     `.` or `-`.
+
+      So `%35_f32` is a parse ERROR, not a slow kernel: the parser reads the numeric
+      id `%35`, then finds `_f32` where it requires `=`. The message is
+      `error: expected '=' after SSA name` and it points at the digits, which reads
+      like a problem with `%35` rather than with the suffix.
+
+      A kernel whose values are numbered `%34`, `%35`, ... therefore CANNOT name a
+      derived value `%<n>_<suffix>`. Prefix a letter instead:
+
+        WRONG:  %35_f32 = arith.extf %35 : vector<128xf16> to vector<128xf32>
+        RIGHT:  %v35_f32 = arith.extf %35 : vector<128xf16> to vector<128xf32>
+
+      Renumbering (`%36`, `%37`, ...) also works but is far worse in an anchored edit:
+      every later use of every later value shifts, so a one-line change becomes a
+      whole-module rewrite, which is the failure mode anchored edits exist to avoid.
+    rationale: |
+      Straight from the MLIR language reference: `value-id ::= '%' suffix-id` and
+      `suffix-id ::= digit+ | ((letter|id-punct) (letter|digit|id-punct)*)`. A
+      suffix-id is EITHER all digits OR letter-led — never digits followed by letters.
+    fix: |
+      Prefix the derived name with a letter, keeping the origin readable:
+      `%v35_f32`, `%acc_f32`, `%p_f16`. Do not renumber existing values.
+    verification: |
+      Cheap and offline, no GPU: `mlir-opt <file> -o /dev/null`. A name error is
+      reported before any pass runs, so it costs a fraction of a second and does not
+      need the lowering pipeline.
+    measured_impact: |
+      4 of 5 iterations of one `algorithmic` stage on 4k flash attention, 2026-09-14.
+      Attempts 2 and 3 hit it via anchored edits (`%35_f32`, then `%48_f32`), then
+      attempts 4 and 5 fell back to whole-module and reproduced the identical error at
+      the identical line. The stage still shipped its attempt-1 win, so the cost was
+      budget, not correctness — but it is the difference between one lever and three.
