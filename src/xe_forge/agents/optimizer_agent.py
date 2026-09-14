@@ -710,14 +710,21 @@ class OptimizerAgent(Optimizer):
         verdict line, and every rejected module is kept.
         """
         tag = getattr(stage, "value", str(stage))
-        first = (verdict or "").strip().splitlines()
-        head = first[0][:200] if first else "(no verdict)"
+        lines = (verdict or "").strip().splitlines()
+        head = lines[0][:200] if lines else "(no verdict)"
+        # A compiler verdict's first line is only the headline —
+        # "LOWERING FAILED (imex-opt):". The reason is on a later line. Without it
+        # the log read the same for five different failures.
+        detail = next((ln.strip() for ln in lines[1:] if "error:" in ln), "")
+        if not detail:
+            detail = next((ln.strip() for ln in lines[1:] if ln.strip()), "")
         logger.info(
-            "  attempt %d [%s] via %s: %s%s",
+            "  attempt %d [%s] via %s: %s%s%s",
             n,
             tag,
             via,
             head,
+            f" {detail[:200]}" if detail else "",
             f" ({speedup:.3f}x)" if speedup else "",
         )
         if not self.attempts_dir or code is None:

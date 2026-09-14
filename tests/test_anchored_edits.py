@@ -14,6 +14,7 @@ place.
 """
 
 import json
+import logging
 
 import dspy
 
@@ -315,3 +316,48 @@ def test_a_win_does_become_the_next_base(monkeypatch):
     _res, runs = _stage_run(monkeypatch, [1.50, 0.99, 0.99, 0.99, 0.99])
     assert runs[1]["current_code"] != WG_MODULE
     assert "// v0" in runs[1]["current_code"]
+
+
+# --- a failure must not read the same as four other failures ------------------
+
+
+def _log_one_attempt(caplog, verdict):
+    """Return the `attempt N` log line `_attempt_log` writes for `verdict`."""
+    from xe_forge.models import DSL, OptimizationStage
+
+    agent = OptimizerAgent(dsl=DSL.MLIR)
+    with caplog.at_level(logging.INFO, logger="xe_forge.agents.optimizer_agent"):
+        agent._attempt_log(OptimizationStage.DEVICE_SPECIFIC, 4, "edits", verdict, None)
+    lines = [r.getMessage() for r in caplog.records if "attempt 4" in r.getMessage()]
+    assert lines, [r.getMessage() for r in caplog.records]
+    return lines[0]
+
+
+def test_the_log_line_carries_the_compiler_error(caplog):
+    # Five different lowering failures all logged the same headline, so the log said
+    # nothing about why. The reason is always on a later line.
+    line = _log_one_attempt(
+        caplog,
+        "FAILURE: Optimized kernel failed: LOWERING FAILED (imex-opt):\n"
+        "/tmp/x.mlir:107:12: error: expected '=' after SSA name\n",
+    )
+    assert "error: expected '=' after SSA name" in line
+
+
+def test_the_error_line_beats_an_earlier_note_line(caplog):
+    # imex-opt prints `note:` lines too, sometimes before the error. The error is
+    # what identifies the failure.
+    line = _log_one_attempt(
+        caplog,
+        "FAILURE: LOWERING FAILED (imex-opt):\n"
+        "/tmp/x.mlir:92:31: note: prior use here\n"
+        "/tmp/x.mlir:92:31: error: use of value '%cst' expects different type\n",
+    )
+    assert "error: use of value" in line
+    assert "note: prior use" not in line
+
+
+def test_a_one_line_verdict_is_unchanged(caplog):
+    # A success verdict has no second line and must not grow noise.
+    line = _log_one_attempt(caplog, SUCCESS_MESSAGE)
+    assert line.endswith(SUCCESS_MESSAGE)

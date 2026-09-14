@@ -1002,10 +1002,16 @@ class XeForgePipeline:
             # Keep every verify attempt, rejected ones included. A stage that burns
             # all 5 iterations used to report only "no valid result in budget", so
             # telling a syntax failure from a slower kernel meant re-running ~35 min.
+            # One directory per run. A single per-kernel directory meant the next run
+            # overwrote the evidence from the one you were still reading.
             if hasattr(self.optimizer, "attempts_dir"):
                 self.optimizer.attempts_dir = (
-                    Path(self.config.logging.log_dir) / "attempts" / str(display_name)
+                    Path(self.config.logging.log_dir)
+                    / "attempts"
+                    / str(display_name)
+                    / datetime.now().strftime("%Y%m%d_%H%M%S")
                 )
+                logger.info("Attempt artifacts: %s", self.optimizer.attempts_dir)
 
             for stage_idx, stage in enumerate(stages_to_apply):
                 logger.info("=" * 60 + f"\nSTAGE: {stage.value.upper()}\n" + "=" * 60)

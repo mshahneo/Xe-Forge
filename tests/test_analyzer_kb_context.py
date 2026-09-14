@@ -146,3 +146,16 @@ def test_the_fastmath_trigger_survives_the_300_char_window():
     window = target.description.strip()[:300]
     assert "TRIGGER" in window
     assert "sigmoid_slow_exp" in window
+
+
+def test_attempts_dir_is_per_run():
+    # A single per-kernel directory meant the next run overwrote the evidence from
+    # the run you were still reading.
+    import inspect
+
+    from xe_forge import pipeline
+
+    src = inspect.getsource(pipeline.XeForgePipeline.optimize)
+    idx = src.index("attempts_dir")
+    window = src[idx : idx + 400]
+    assert "strftime" in window, "attempts_dir must carry a per-run timestamp"
