@@ -15,6 +15,8 @@ place.
 
 import json
 
+import dspy
+
 from xe_forge.agents.optimizer_agent import (
     EDITS_SENTINEL,
     SUCCESS_MESSAGE,
@@ -226,3 +228,90 @@ def test_triton_path_ignores_edits():
     # Valid Python with edits set: the edits must not be consulted at all.
     out = tool.func(optimized_code="def f():\n    return 1\n", edits=_edits(("x", "y")))
     assert "ANCHOR" not in out and "EDITS REJECTED" not in out
+
+
+# --- the stage must spend its whole budget ------------------------------------
+
+
+def _stage_run(monkeypatch, speedups, max_iterations=5):
+    """Drive `optimize_stage` with canned per-run speedups; return runs made.
+
+    CoVeR and `_final_verify` are both stubbed, so no LLM and no GPU. Each entry
+    in `speedups` is what that run's candidate measures.
+    """
+    import xe_forge.agents.optimizer_agent as oa
+    from xe_forge.models import DSL, DetectedIssue, IssueType, KernelAnalysis, OptimizationStage
+
+    runs = []
+
+    class FakeCoVeR:
+        def __init__(self, **kw):
+            self.max_iters = kw.get("max_iters", 1)
+
+        def __call__(self, **kwargs):
+            i = len(runs)
+            runs.append(kwargs)
+            # A distinct module per run, so the "identical code" guard never fires.
+            return dspy.Prediction(
+                trajectory={"thought_0": "t"},
+                optimized_code=WG_MODULE.replace("gpu.return", f"gpu.return // v{i}"),
+                edits="NONE",
+            )
+
+    monkeypatch.setattr(oa, "CoVeR", FakeCoVeR)
+
+    agent = oa.OptimizerAgent(dsl=DSL.MLIR, max_iterations=max_iterations)
+    monkeypatch.setattr(
+        agent,
+        "_final_verify",
+        lambda *a, **k: (True, speedups[len(runs) - 1], {"time_ms": 1.0}, {"time_ms": 1.0}, None),
+    )
+
+    analysis = KernelAnalysis(
+        kernel_name="k",
+        detected_issues=[
+            DetectedIssue(
+                issue_type=IssueType.SUBOPTIMAL_TILE_SIZE,
+                severity=5,
+                description="tiles",
+                suggested_fix="use bigger tiles",
+                location="kernel",
+            )
+        ],
+    )
+    res = agent.optimize_stage(
+        code=WG_MODULE,
+        stage=OptimizationStage.DEVICE_SPECIFIC,
+        analysis=analysis,
+        xpu_config={},
+        kernel_name="k",
+    )
+    return res, runs
+
+
+def test_a_missed_run_does_not_end_the_stage(monkeypatch):
+    # The real failure: run 1 measured 0.99x on the knob the issue text named, the
+    # stage stopped, and the 1.83x float flags were never tried.
+    res, runs = _stage_run(monkeypatch, [0.99, 0.99, 1.50, 1.0, 1.0])
+    assert len(runs) == 5, f"stage quit after {len(runs)} of 5 runs"
+    assert res.success and res.speedup == 1.50
+
+
+def test_a_missed_run_is_reported_back_to_the_next_run(monkeypatch):
+    _res, runs = _stage_run(monkeypatch, [0.99, 0.99, 0.99, 0.99, 0.99])
+    assert len(runs) == 5
+    # Run 2 onwards must see what run 1 already measured.
+    assert "Previous attempts this stage" in runs[1]["issues"]
+    assert "0.990x" in runs[1]["issues"]
+
+
+def test_a_missed_run_does_not_become_the_next_base(monkeypatch):
+    # A slower candidate must not be what the next run edits.
+    _res, runs = _stage_run(monkeypatch, [0.99, 0.99, 0.99, 0.99, 0.99])
+    assert all(r["current_code"] == WG_MODULE for r in runs)
+
+
+def test_a_win_does_become_the_next_base(monkeypatch):
+    _res, runs = _stage_run(monkeypatch, [1.50, 0.99, 0.99, 0.99, 0.99])
+    assert runs[1]["current_code"] != WG_MODULE
+    assert "// v0" in runs[1]["current_code"]

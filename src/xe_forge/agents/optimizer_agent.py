@@ -1169,9 +1169,11 @@ class OptimizerAgent(Optimizer):
 
                 # Anchors resolve against exactly what the LLM is shown this run, and
                 # a module accepted by an earlier run must not be picked up as if it
-                # came from this one.
+                # came from this one. The cached timing goes too: it belongs to the
+                # previous run's candidate, which may have been rejected.
                 last_accepted["base"] = current_code_for_run
                 last_accepted["code"] = None
+                last_accepted["comparison"] = None
 
                 result = cover(**run_kwargs)
 
@@ -1249,9 +1251,6 @@ class OptimizerAgent(Optimizer):
                         traj,
                     )
                     current_code_for_run = candidate
-                    # Only clear cache if code genuinely changed
-                    # (keeps original measurement reuse across runs)
-                    last_accepted["comparison"] = None
                     # Rebuild performance_context with updated speedup
                     # so the next CoVeR iteration knows where it stands
                     if perf_context:
@@ -1264,26 +1263,37 @@ class OptimizerAgent(Optimizer):
                     updated_perf["speedup_so_far"] = spd
                     updated_perf["stage_best_so_far"] = spd
                     perf_ctx = _build_performance_context(updated_perf)
-                    # Update kwargs: fresh performance context + attempt history
-                    history_text = "\n".join(attempt_history[-3:])  # last 3 attempts
-                    _issues_with_history = issues_text + (
-                        f"\n\n=== Previous attempts this stage ===\n{history_text}\n"
-                        "Try a DIFFERENT approach to beat the current best."
-                        if attempt_history
-                        else ""
-                    )
-                    kwargs = {
-                        **kwargs,
-                        "performance_context": perf_ctx,
-                        "issues": _issues_with_history,
-                    }
                 else:
+                    # A measured miss is not a reason to quit with budget left. The
+                    # first run often spends itself on the knob the issue text names;
+                    # on flash-attention that was a layout tweak at 0.99x, and the
+                    # stage stopped with 3 of 5 iterations unspent, so the float
+                    # flags worth 1.83x were never tried. Keep the old base — a
+                    # slower candidate must not become what the next run edits — and
+                    # let the loop condition end the stage.
                     _best_str = f"{best_spd:.2f}x" if best_spd is not None else "none"
                     _spd_str = f"{spd:.2f}x" if spd is not None else "N/A"
                     logger.info(
-                        f"Stage {stage.value} no improvement ({_spd_str} vs best {_best_str}), stopping"
+                        f"Stage {stage.value} no improvement ({_spd_str} vs best "
+                        f"{_best_str}); {self.max_iterations - iters_used} iterations left"
                     )
-                    break
+
+                # Feed the attempt back either way, or the next run re-tries the knob
+                # that was just measured. Only the improving branch used to do this,
+                # so a miss taught the LLM nothing.
+                history_text = "\n".join(attempt_history[-3:])  # last 3 attempts
+                _issues_with_history = issues_text + (
+                    f"\n\n=== Previous attempts this stage ===\n{history_text}\n"
+                    "Try a DIFFERENT approach to beat the current best. Do not repeat "
+                    "an approach already measured above."
+                    if attempt_history
+                    else ""
+                )
+                kwargs = {
+                    **kwargs,
+                    "performance_context": perf_ctx,
+                    "issues": _issues_with_history,
+                }
 
             if best_code is not None:
                 logger.info(
