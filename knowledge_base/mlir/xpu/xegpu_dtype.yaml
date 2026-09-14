@@ -73,6 +73,33 @@ constraints:
       1.364x faster** (4 runs, 0.8% spread), which also BEAT a hand-tuned reference
       kernel at 1.0948 ms. At default GRF the same f32 variant measured 4.2 ms (4.1x
       worse), and adding a K/V prefetch on top of it cost 13% (1.0352 → 1.1883 ms).
+    fix: |
+      This is a MULTI-SITE retype. Every site below must change in the SAME edit, or
+      the module does not parse. Two stages on 4k flash attention burned 10 of 10
+      attempts on the two traps below, so work the checklist rather than editing the
+      types you happen to notice first.
+
+      1. DO NOT retype a shared `arith.constant` in place. A zero splat like
+         `%cst_1 = arith.constant dense<0.0> : vector<128x64xf16>` is often used TWICE:
+         as the loop's initial accumulator (wants f32) AND as the `C` operand of an
+         `xegpu.dpas` (still f16 until you convert that dpas too). Changing the one
+         declaration breaks the other use. ADD a second constant instead and leave the
+         original alone:
+           %cst_acc_f32 = arith.constant dense<0.0> : vector<128x64xf32>
+         Name it letter-led — see mlir_new_ssa_name_must_not_start_with_a_digit.
+      2. UPDATE THE `xegpu.dpas` TYPE SIGNATURE in the same edit. Its trailing types
+         are `: A, B, C -> D`. A and B stay 16-bit; C and D both become f32. If you
+         retype only the constant, MLIR reports
+           error: use of value '%cst_1' expects different type than prior uses
+         at the CONSTANT's line, not at the dpas — so the message points away from the
+         edit you still owe.
+      3. Update the `scf.for` in three places that must agree: the `iter_args`
+         initialisers, the result type list `-> (...)`, and every `scf.yield` operand.
+      4. Then place the down-casts: ONE `arith.truncf` before a dpas that needs a
+         16-bit A/B, and ONE in the epilogue if the output memref is 16-bit.
+
+      Verify offline before spending a GPU run — `mlir-opt <file> -o /dev/null` reports
+      both traps in well under a second.
 
   - id: xegpu_dpas_operand_dtype_promote
     name: Promote DPAS-unsupported operand dtypes to f16/bf16 before the dpas
