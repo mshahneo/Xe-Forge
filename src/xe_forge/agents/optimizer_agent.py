@@ -14,6 +14,7 @@ import dspy
 
 from xe_forge.agents.base import Optimizer
 from xe_forge.agents.cover import CoVeR
+from xe_forge.core.timing_confidence import confirm_marginal, min_gain
 from xe_forge.knowledge.loader import KnowledgeBase
 from xe_forge.models import (
     DSL,
@@ -1285,13 +1286,21 @@ class OptimizerAgent(Optimizer):
                     logger.debug(f"Run failed ({err}), stopping best-of loop")
                     break
 
-                # Require 2% improvement on ALL runs (first and subsequent)
-                # This eliminates noise-based false improvements from timing variance
-                _MIN_IMPROVEMENT = 1.02
+                # The bar is the executor's own noise band, not a hardcoded 1.02. The
+                # old constant sat BELOW the tolerance the executor uses to decide a
+                # kernel regressed (default 0.03), so it accepted "wins" the tool
+                # itself calls indistinguishable from no change — that is how the
+                # 0.983x prefetch was recorded as 1.025x. `_final_verify` has already
+                # re-timed anything in the undecided band above, so `spd` here is the
+                # confirmed number. One rule, shared with the ReAct path.
+                #
+                # Only MlirExecutor publishes a tolerance. Triton and SYCL keep the old
+                # 1.02 bar (default=0.02) rather than inherit a band measured on XeGPU.
+                _min_improvement = min_gain(self.executor, default=0.02)
                 _is_improvement = (
-                    spd is not None and spd > _MIN_IMPROVEMENT
+                    spd is not None and spd > _min_improvement
                     if best_spd is None
-                    else spd is not None and spd > best_spd * _MIN_IMPROVEMENT
+                    else spd is not None and spd > best_spd * _min_improvement
                 )
                 # Also stop if code is identical to previous best (LLM stuck)
                 _code_identical = best_code is not None and candidate == best_code
@@ -1681,6 +1690,12 @@ class OptimizerAgent(Optimizer):
                     # (noisy) measured time so a phantom speedup can't be recorded
                     # via the baseline_ms path below.
                     return False, None, None, None, "no-op (lowers to identical IR)"
+                # Re-time a claimed gain that is inside the executor's own noise band.
+                # This path used to accept on ONE measurement, which is how a 0.983x
+                # prefetch banked itself as 1.025x. Placed after the correctness and
+                # no-op checks so we never spend GPU time re-timing a rejected kernel.
+                if self.dsl == DSL.MLIR and not skip_speedup_check:
+                    c = confirm_marginal(c, opt, orig, self.executor, flop=flop)
                 if c.is_slower and not skip_speedup_check:
                     sd = 1.0 / c.speedup if c.speedup > 0 else float("inf")
                     return False, None, None, None, f"{sd:.2f}x slower"

@@ -115,10 +115,13 @@ def test_decisive_results_are_not_retimed():
         _verify_mlir(CANDIDATE, MLIR_KERNEL, executor)
         assert executor.repeats_per_call == [1]
 
-    # Already timing with 3 repeats: nothing to gain from re-running.
+    # Already timing with 3 repeats: re-time with MORE, never with the same count.
+    # This used to assert [3] — "nothing to gain from re-running" — and that was the
+    # bug. 3 is the staged path's default, so a helper that bails at reps >= 3 never
+    # re-times a staged candidate at all. A re-time must raise the repeat count.
     executor = FakeMlirExecutor([timed(1.02)], compare_repeats=3)
     _verify_mlir(CANDIDATE, MLIR_KERNEL, executor)
-    assert executor.repeats_per_call == [3]
+    assert executor.repeats_per_call == [3, 5]
 
 
 def test_untrustworthy_timing_keeps_correctness_only_acceptance():
