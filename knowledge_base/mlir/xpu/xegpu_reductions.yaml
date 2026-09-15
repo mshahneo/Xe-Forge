@@ -6,6 +6,9 @@ kb_schema_version: 1
 # their own concern: the question is always how much of the reduction can be done
 # in registers before data has to cross lanes.
 #
+# Two levers live here: HOW MUCH of the reduce is register-local (the split
+# pattern), and WHICH combining kind the reduce uses (maxnumf vs maximumf).
+#
 # The transcendental half of a softmax (exp, fastmath, exp2) is in
 # xegpu_transcendental_patterns.yaml; the layout that decides what each lane owns
 # is in xegpu_layout_and_tiling.yaml.
@@ -57,3 +60,125 @@ patterns:
       %m       = <cross-lane reduce of %partial over the subgroup>            // one size-16 shuffle tree
     expected_speedup: "1.1-1.4x on a reduction-bound row reduction"
     applies_to: ["any_lane_multivalued_reduce_axis", "shuffle_bound_reductions", "softmax", "layernorm", "reduction", "flash_attention"]
+
+  - id: xegpu_maxnumf_for_intra_subgroup_reduction
+    name: "Use maxnumf/minnumf for an INTRA-subgroup reduction; keep maximumf/minimumf across subgroups"
+    stage: device_specific
+    scope: sku_specific
+    skus: [bmg, pvc, arc_a770]
+    tags: [maxnumf, maximumf, minnumf, minimumf, nan, combining_kind, reduction, device_specific, spirv, igc, softmax, attention]
+    applies_to: [intra_subgroup_max_reduction, vector_multi_reduction_maximumf, softmax, attention, layernorm, reduction, flash_attention]
+    expected_speedup: "small; one op per reduce step. Reported by Intel GPU devs, NOT measured here"
+    precondition: |
+      APPLIES to a `vector.multi_reduction <maximumf>` / `<minimumf>` (or an
+      `arith.maximumf` / `arith.minimumf` used as a reduction step) whose reduce axis
+      stays INSIDE one subgroup.
+
+      Read intra vs inter off the layout, not the workload. For the tile feeding the
+      reduce, look at `sg_layout` in its `#xegpu.layout` and at the reduced dim d:
+        sg_layout[d] == 1  -> the whole axis lives in one subgroup. INTRA. Swap it.
+        sg_layout[d]  > 1  -> subgroups split the axis, so the pass will add a
+                              cross-subgroup stage through SLM. INTER. Leave it alone.
+      Example: `vector.multi_reduction <maximumf>, %t, %acc [1]` on a
+      `vector<128x64xf32>` with `sg_layout = [8, 1]` reduces dim 1, and
+      sg_layout[1] == 1, so it is intra-subgroup — swap it.
+
+      Do NOT apply when sg_layout on the reduced dim is > 1, when the kernel must
+      propagate NaN (see rationale), or when the reduce already uses maxnumf/minnumf.
+    description: |
+      On Intel GPU `arith.maxnumf` is cheaper than `arith.maximumf`. Same for
+      `minnumf` vs `minimumf`. For an intra-subgroup reduction the two give the same
+      answer on NaN-free data, so use the cheap one:
+
+        vector.multi_reduction <maximumf>  ->  vector.multi_reduction <maxnumf>
+        vector.multi_reduction <minimumf>  ->  vector.multi_reduction <minnumf>
+
+      Both are legal `vector::CombiningKind` values and the XeGPU workgroup pass
+      handles both, so this is a one-token edit with no other change needed.
+
+      Keep `maximumf` / `minimumf` for a reduction that crosses subgroups.
+      `WgToSgMultiDimReductionOp` reads ONE `op.getKind()` and uses it for all three
+      of the local reduce, the cross-subgroup reduce through SLM, and the accumulator
+      combine. There is no way to pick a different kind per level from source, so
+      changing the kind changes the cross-subgroup half too.
+    rationale: |
+      The two ops differ only in NaN and signed-zero handling:
+        arith.maximumf  NaN in -> NaN out;   -0.0 counts as less than +0.0
+        arith.maxnumf   NaN in -> the OTHER argument;   -0.0 / +0.0 either
+      So on NaN-free input they are identical, and a softmax row max is NaN-free
+      whenever its input is.
+
+      Why maximumf costs more: the NaN-propagating form has no single native op, so
+      the lowering adds guards. In upstream ArithToSPIRV, `arith.maxnumf` maps 1:1 to
+      `spirv.CL.fmax` (whose NaN rule already matches), while `arith.maximumf` emits
+      `CL.fmax` PLUS 2 `IsNan` and 2 `Select` — four extra ops per max, dropped only
+      under `fastmath<nnan>` (ArithToSPIRV.cpp:1356-1402 vs 1409-1457). Note that
+      Xe-Forge lowers through XeVM/LLVM (`llvm.intr.maximum` vs `llvm.intr.maxnum`),
+      not the SPIR-V dialect, so that file shows the shape of the asymmetry, not the
+      exact instruction count IGC emits. `arith-expand` is NOT the cause: it expands
+      both to 4 ops, and its min/max expansion is off by default.
+
+      Why the combining kind is the only lever here: `vector.multi_reduction` has no
+      fastmath attribute (VectorOps.td:309-321), unlike `vector.reduction`. So you
+      cannot buy the guard-free form with `fastmath<nnan>` on a multi_reduction the
+      way you can on a bare `arith.maximumf`. Changing `<maximumf>` to `<maxnumf>` is
+      the only way to reach the cheap form at that op.
+    pattern_before: |
+      // sg_layout = [8, 1] and dim 1 is reduced, so sg_layout[1] == 1:
+      // the reduce axis is inside one subgroup.
+      %m = vector.multi_reduction <maximumf>, %scores, %run_max [1] : vector<128x64xf32> to vector<128xf32>
+    pattern_after: |
+      %m = vector.multi_reduction <maxnumf>, %scores, %run_max [1] : vector<128x64xf32> to vector<128xf32>
+      // Same result on NaN-free data, one fewer guarded op per max step.
+      // If sg_layout[1] were > 1 this reduce would cross subgroups: keep <maximumf>.
+
+constraints:
+  - id: xegpu_intra_subgroup_max_should_be_maxnumf
+    name: "An intra-subgroup maximumf reduction should be maxnumf on Intel GPU"
+    severity: warning
+    stage: device_specific
+    scope: sku_specific
+    skus: [bmg, pvc, arc_a770]
+    tags: [maxnumf, maximumf, minnumf, minimumf, nan, combining_kind, reduction, device_specific, softmax, attention]
+    applies_to: [intra_subgroup_max_reduction, vector_multi_reduction_maximumf, softmax, attention, layernorm, reduction, flash_attention]
+    precondition: |
+      TRIGGER — report issue_type: sigmoid_slow_exp, stage: device_specific, when a
+      `vector.multi_reduction <maximumf>` (or `<minimumf>`) reduces an axis inside ONE
+      subgroup: sg_layout[reduced_dim] == 1 on the tile's #xegpu.layout. Fix: change
+      the kind to `<maxnumf>` (`<minnumf>`).
+
+      Worked example. `vector.multi_reduction <maximumf>, %t, %acc [1]` on a
+      `vector<128x64xf32>` whose layout is `sg_layout = [8, 1]` reduces dim 1, and
+      sg_layout[1] == 1, so the axis is intra-subgroup. Flag it.
+
+      Do NOT flag when sg_layout on the reduced dim is > 1 — that reduce crosses
+      subgroups and must keep `maximumf`. Do NOT flag a reduce that is already
+      maxnumf/minnumf, and do NOT flag a kernel that must propagate NaN.
+    description: |
+      `arith.maxnumf` is cheaper than `arith.maximumf` on Intel GPU (same for minnumf
+      vs minimumf). They differ only in NaN and signed-zero handling, so on NaN-free
+      data they give the same answer:
+        maximumf  NaN in -> NaN out
+        maxnumf   NaN in -> the other argument
+      The NaN-propagating form has no single native op, so the lowering adds guards
+      around the native max. Both kinds are legal for vector.multi_reduction and the
+      XeGPU workgroup pass handles both, so the fix is a one-token edit.
+
+      `vector.multi_reduction` carries NO fastmath attribute, so `fastmath<nnan>`
+      cannot buy the guard-free form the way it can on a bare `arith.maximumf`. The
+      combining kind is the only lever at that op.
+
+      SCOPE LIMIT — this holds only for a reduce that stays inside one subgroup.
+      `WgToSgMultiDimReductionOp` reads ONE `op.getKind()` and reuses it for the local
+      reduce, the cross-subgroup reduce through SLM, and the accumulator combine.
+      There is no way to pick a different kind per level from source, so on a
+      cross-subgroup reduce the swap changes both halves. Leave those on `maximumf`.
+    rationale: |
+      Reported by Intel GPU developers, not measured in this repo — treat the size of
+      the win as unknown and keep the edit only if the timing gate accepts it. What
+      was checked here: swapping the flash-attention 4k row max
+      (`vector<128x64xf32>`, `sg_layout = [8, 1]`, reduce dim 1) from `<maximumf>` to
+      `<maxnumf>` lowers cleanly through the workgroup pipeline and passes
+      `[ALLCLOSE: TRUE]` on 6 of 6 runs. No speedup number was obtained: the
+      level-zero profiling patch was not in the LLVM build at the time, so every run
+      reported no time.
