@@ -174,11 +174,37 @@ constraints:
       There is no way to pick a different kind per level from source, so on a
       cross-subgroup reduce the swap changes both halves. Leave those on `maximumf`.
     rationale: |
-      Reported by Intel GPU developers, not measured in this repo — treat the size of
-      the win as unknown and keep the edit only if the timing gate accepts it. What
-      was checked here: swapping the flash-attention 4k row max
-      (`vector<128x64xf32>`, `sg_layout = [8, 1]`, reduce dim 1) from `<maximumf>` to
-      `<maxnumf>` lowers cleanly through the workgroup pipeline and passes
-      `[ALLCLOSE: TRUE]` on 6 of 6 runs. No speedup number was obtained: the
-      level-zero profiling patch was not in the LLVM build at the time, so every run
-      reported no time.
+      Reported by Intel GPU developers. ALWAYS let the timing gate decide — on the one
+      kernel measured here the swap was a small LOSS, so do not assume a win.
+
+      Measured 2026-09-15 on BMG B580, large GRF, 500 runs x 8 interleaved reps, on the
+      flash-attention 4k row max (`vector<128x64xf32>`, `sg_layout = [8, 1]`, reduce
+      dim 1, so intra-subgroup):
+
+        <maximumf>  1.38613 ms   (spread 0.27%)
+        <maxnumf>   1.39992 ms   (spread 0.31%)   = 0.9902x, 1.0% SLOWER
+
+      All 8 interleaved pairs agreed in sign, and `[ALLCLOSE: TRUE]` on all 16 runs, so
+      it is a real perf difference on this kernel, not noise.
+
+      The ISA says why, and the reason is specific to REDUCTIONS. The `maxnumf` kernel
+      has 2 extra `sel (ge) rN, rN, 0xFF800000:f` — a max against -inf, which is the
+      reduction's neutral accumulator (`createReductionNeutralValue`). LLVM folds that
+      away for `maximumf` but not for `maxnumf`
+      (`llvm/lib/Analysis/InstructionSimplify.cpp:6882-6888`):
+
+        maxnum(X, -inf)  -> X only if nnan
+        maximum(X, -inf) -> X unconditionally
+
+      So -inf is an unconditional identity for `maximumf`, and `vector.multi_reduction`
+      has no fastmath attribute to supply the `nnan` that `maxnumf` would need. The
+      NaN-propagating semantics that look like a cost are what lets the compiler delete
+      an op here.
+
+      Note also that on this path IGC compiles `arith.maximumf` to a single
+      `sel (ge)` with no NaN guards at all, so the SPIR-V-dialect guard cost described
+      in the pattern's rationale does not appear in the XeVM/IGC lowering.
+
+      What is NOT covered by that measurement: a bare `arith.maxnumf` outside a
+      reduction (no neutral accumulator to fold, so the trade-off may differ), other
+      Xe generations, and other IGC versions.
