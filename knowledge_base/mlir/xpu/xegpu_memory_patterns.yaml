@@ -30,6 +30,13 @@ constraints:
       cannot express a real prefetch for the kernel in front of you, do not
       emit one — report no change instead.
 
+      Option (b) is necessary but not enough. An xegpu.prefetch_nd on a live
+      tensor_desc still does nothing useful if its OFFSET equals the offset of the
+      load_nd it shadows. That form is not dead code — prefetch_nd has no result, so
+      DCE keeps it and the lowered IR differs, which means the verifier's no-op check
+      passes it. It is the second way to write a prefetch that cannot help. Always
+      check the offset too: xegpu_prefetch_must_lead_the_load.
+
   - id: xegpu_contiguous_2d_block_load
     name: load_nd tiles should map to contiguous 2D block loads
     severity: high
@@ -188,7 +195,13 @@ constraints:
       CORRECT cooperative-disjoint layout (sg_layout=[2,4] sg_data=[32,16]):
         depth 1 -> 1.7317 ms (0.963x)   depth 2 -> 1.7367 ms (0.962x)
         depth 3 -> 1.7419 ms (0.958x)
-      Flat in depth and uniformly negative. The same kernel with the REPLICATED
+      Flat in depth and uniformly negative. IT GETS WORSE AS THE KERNEL GETS FASTER:
+      repeating the depth-1 measurement on the SAME kernel after the f32 accumulator
+      landed (1.38731 ms, no prefetch) gives 1.53353 ms — 0.905x, versus 0.963x at
+      1.6679 ms. Cheaper compute does NOT expose latency for prefetch to hide here; the
+      extra memory traffic and register pressure just cost a larger share of a smaller
+      runtime. Treat "the kernel got faster, so now prefetch will pay" as refuted on
+      this kernel class, twice. The same kernel with the REPLICATED
       compute layout on prefetch measures 2.0351 ms (0.819x), so getting the layout
       right (xegpu_dedicated_prefetch_layout) is worth 1.175x of pure overhead
       removal — but it only removes overhead, it never turns prefetch into a win
@@ -196,6 +209,99 @@ constraints:
       K/V, so those tiles are already L2-resident. On THAT kernel class, do not
       re-litigate prefetch — spend memory_access iterations on cache hints and on
       shortening live ranges instead.
+
+      WHY A REFERENCE KERNEL ON THE SAME WORKLOAD STILL GAINS 1.42x — read this before
+      concluding the numbers above are wrong. Three 4k flash-attention kernels, same
+      16x4096x64 f16 shapes, same 512 WGs x 128 threads, same L2 residency, all on BMG
+      B580 with random input in [-1,1] and large GRF. All THREE prefetches carry a real
+      lead, so the lead is not what separates them:
+        kernel                                   lead  load_nd/iter   with pf   no pf     gain
+        mlir-extensions flash_attention_fwd        3     8            1.19454   1.69577   1.42x
+        .._fwd_ov_with_arrray_len_4k               1     3            1.28721   1.29953   1.0096x
+        our tuned FA (leaded depth 1)              1     3            1.7317    1.6679    0.963x
+      The gain tracks the PER-ITERATION LOAD STRUCTURE, not the lead. flash_attention_fwd
+      splits K into 4 slices of 16 and loads them TRANSPOSED (K is column-major), so it
+      has 8 load_nd in flight per iteration instead of 3, and transposed block loads are
+      slow per byte. That is a lot of exposed latency for a prefetch to hide. The _ov_
+      variant is structurally identical to ours — 3 plain load_nd, 2 dpas, 128x64 by
+      64x64 — and its ENTIRE prefetch prize is 1%. So on the 3-load_nd attention shape,
+      1% is the ceiling, and prefetch overhead exceeds it.
+      Not separated by measurement: depth 3 vs depth 1 is confounded with the slicing in
+      the first row. But our own kernel measured FLAT in depth (0.963 / 0.962 / 0.958x),
+      which argues the slicing and the transpose are what buy the 1.42x, not the depth.
+      PRACTICAL RULE: count load_nd per loop iteration. Around 3 plain block loads on a
+      re-read operand means the prefetch prize is ~1% and not worth an iteration. Many
+      loads per iteration, or transposed loads, is where prefetch pays.
+      A lead is still MANDATORY whenever a prefetch is written at all — a zero-lead
+      prefetch cannot even reach the 1% (see xegpu_prefetch_must_lead_the_load).
+
+  - id: xegpu_prefetch_must_lead_the_load
+    name: A prefetch_nd at the SAME offset as the load_nd it shadows has zero lead and can never help
+    severity: critical
+    stage: memory_access
+    applies_to: [any_loop_with_prefetch_nd, gemm, matmul, attention, flash_attention, softmax]
+    precondition: |
+      TRIGGER — report issue_type: missing_tma, stage: memory_access, whenever a
+      xegpu.prefetch_nd and a xegpu.load_nd on the SAME tensor_desc use the SAME
+      offset operands. Pure structural check, no measurement needed: compare the two
+      offset lists token for token. If they match, the lead is ZERO and the prefetch
+      is dead weight. Report it even when the prefetch layout is already correct.
+      Zero lead is the single most common way an LLM-written prefetch fails.
+    description: |
+      A prefetch pays ONLY if its offset is AHEAD of the consuming load's offset by a
+      positive whole number of loop steps. `prefetch_nd %t[%i]` immediately followed by
+      `load_nd %t[%i]` warms nothing: the two messages target the same address and
+      issue back to back, so the load's own cache miss is already in flight before the
+      prefetched line can arrive. All you bought is one extra memory message.
+
+      WHY IT SLIPS THROUGH EVERY EXISTING CHECK — this is why it must be caught here:
+        * DCE keeps it. `xegpu.prefetch_nd` has no result, so it is not dead code.
+        * It lowers cleanly, so no compile error flags it.
+        * The verifier's no-op detector cannot flag it either, because the lowered IR
+          genuinely DIFFERS: there is one more `load_block2d` with a null destination.
+        * It is NOT what xegpu_no_dead_prefetch_reads covers. That constraint is about
+          an unused `load_nd`/`transfer_read` RESULT. This one is a real prefetch op
+          with a real effect on the memory pipeline and a useless address.
+      So a zero-lead prefetch measures as a wash or a small loss, banks as "applied",
+      and nothing in the pipeline says why. Check the offsets, not the op count.
+
+      THE FIX — see xegpu_add_prefetch_nd for the full recipe. For depth N: emit N
+      prefetches in the loop PROLOGUE at base+0 ... base+(N-1)*step, then inside the
+      loop prefetch at `k + N*step` while the load stays at `k`. Clamp the lead
+      (`arith.minsi` against the last valid offset) or leave boundary_check at its
+      default `true` so the tail iterations do not read past the tensor.
+
+      MEASURED — BMG B580, 4k flash attention, large GRF, random input in [-1,1],
+      median of 500 runs, variants interleaved (spread < 0.15%). A pipeline-generated
+      kernel emitted 3 prefetch_nd, every one at the load's own offset (zero lead):
+        3 zero-lead prefetches (Q compute layout, K/V dedicated layout) -> 1.40982 ms
+        all 3 deleted                                                   -> 1.38642 ms  (1.017x FASTER)
+        only the Q one deleted                                          -> 1.38648 ms  (1.017x FASTER)
+      So the two dedicated-layout zero-lead prefetches are an EXACT no-op (0.004%,
+      inside noise) and the single compute-layout one costs the whole 1.7%. The stage
+      reported this edit as a 1.025x win; re-timed, it is 0.983x. In-pipeline the same
+      zero-lead edit with the compute layout measured 1.12x and 1.14x SLOWER.
+
+      THE FIX IS A LEAD **OR** DELETION — and on a cache-resident stream it is DELETION.
+      Do not read this constraint as "always add a lead". Same kernel as above, same
+      conditions, three variants measured head to head:
+        no prefetch at all                                     -> 1.38731 ms   1.000x
+        3 zero-lead prefetches (what the pipeline wrote)        -> 1.40982 ms   0.983x
+        correct leaded depth-1, dedicated layout, clamped tail  -> 1.53353 ms   0.905x
+      Adding the correct lead made it WORSE than leaving the broken prefetch in, by
+      10.5%. That is not a contradiction: a zero-lead prefetch is cheap precisely
+      because it re-requests a line already in flight, while a leaded one issues real
+      new memory traffic that competes with the loads it is supposed to help. So when
+      you find a zero-lead prefetch, the correct edit is to DELETE it unless
+      xegpu_prefetch_depth_is_tunable says the stream can profit. Deleting all three
+      was worth 1.017x here.
+
+      A LEAD IS NECESSARY, NOT SUFFICIENT. Getting the lead right only makes the
+      prefetch CAPABLE of helping. Whether it DOES help is a property of the loop:
+      xegpu_prefetch_depth_is_tunable records correctly-leaded depth 1/2/3 prefetches
+      on this flash-attention kernel family measuring 0.905-0.963x, because the K/V
+      tiles are already L2-resident. Read both: this constraint rejects a broken edit,
+      that one rejects an unprofitable one.
 
   - id: xegpu_wg_loadnd_transpose_supported
     name: "The transpose attribute on xegpu.load_nd now works at WG level, but it is NOT a speed win and only a square subgroup tile is accepted"
@@ -324,14 +430,38 @@ patterns:
       the real fix is upstream: make its transfer_reads lower to contiguous
       load_nd block loads (a layout/contiguity change), THEN this pattern applies.
     description: |
-      Insert xegpu.prefetch_nd for the next K-iteration's A/B tiles before the
-      load_nd that consumes the current tiles, with
-      l1_hint/l2_hint/l3_hint = #xegpu.cache_hint<cached>. This overlaps global
-      memory latency with DPAS compute. Use a dedicated prefetch layout
-      (#k_prefetch) whose sg_layout spreads the prefetch across subgroups.
+      Insert xegpu.prefetch_nd for a LATER K-iteration's tile before the load_nd that
+      consumes the CURRENT tile, with l1_hint/l2_hint/l3_hint =
+      #xegpu.cache_hint<cached>. This overlaps global memory latency with DPAS compute.
+      Use a dedicated prefetch layout (#k_prefetch) whose sg_layout spreads the
+      prefetch across subgroups (xegpu_dedicated_prefetch_layout).
+
+      THE LEAD IS THE WHOLE POINT. A prefetch at the load's own offset is dead weight —
+      see xegpu_prefetch_must_lead_the_load. Depth-N recipe, and emit BOTH halves:
+        1. PROLOGUE, before the loop: N prefetches at base+0, base+1*step, ...,
+           base+(N-1)*step. Without these, the first N iterations are unprefetched.
+        2. IN-LOOP: prefetch at `k + N*step` while the load stays at `k`.
+      Depth 1 is the safe default. Deeper only helps a long DRAM-latency-bound stream,
+      and costs more in-flight cache lines.
+
+      THE TAIL MUST NOT READ PAST THE TENSOR. Pick one of two idioms; both are used by
+      working reference kernels and they are NOT interchangeable:
+        * IDIOM A — one descriptor over the WHOLE tensor, vary the OFFSET operand.
+          Leave `boundary_check` at its default, which is `true` (verified:
+          mlir/include/mlir/Dialect/XeGPU/IR/XeGPUAttrs.td, `CArg<"bool", "true">:
+          $boundary_check`), so the hardware clamps the last N iterations. Or clamp
+          yourself with `arith.minsi` against the last valid offset.
+          Used by mlir-extensions flash_attention_fwd.mlir at depth 3.
+        * IDIOM B — recompute a RAW POINTER each iteration and build a fresh tdesc at
+          it, offset always [0, 0]. Here you MUST clamp the pointer arithmetic, because
+          this idiom is normally paired with `block_tdesc_attr<boundary_check = false>`.
+          Used by mlir-extensions flash_attention_fwd_ov_with_arrray_len_4k.mlir at depth 1.
+      Do not mix them: a fresh-pointer tdesc with a nonzero offset double-counts the
+      lead, and a whole-tensor descriptor with offset [0,0] has no lead at all.
     rationale: |
       The DPAS array stalls waiting on global loads; software prefetch into the
-      cache hierarchy hides that latency behind compute.
+      cache hierarchy hides that latency behind compute. It can only do so if the line
+      is requested far enough ahead that it has arrived by the time the load issues.
     pattern_before: |
       scf.for %k = %c0 to %K step %BLOCK_K iter_args(%acc = %zero) -> (vector<128x16xf32>) {
         %a = xegpu.load_nd %a_tile[%row, %k] : !xegpu.tensor_desc<128x64xf16, #a> -> vector<128x64xf16>
@@ -340,17 +470,23 @@ patterns:
         scf.yield %acc2 : vector<128x16xf32>
       }
     pattern_after: |
-      %k_pf = xegpu.create_nd_tdesc %K_ptr, ... -> !xegpu.tensor_desc<64x64xf16, #k_prefetch>
-      xegpu.prefetch_nd %k_pf[%row, %c0] {l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>, layout = #k_prefetch} : !xegpu.tensor_desc<64x64xf16, #k_prefetch>
+      // Depth 1, idiom A: one descriptor over the whole B tensor, offset operand varies.
+      // %k_pf carries the DEDICATED prefetch layout, not #b.
+      %k_pf = xegpu.create_nd_tdesc %B_ptr, ... -> !xegpu.tensor_desc<64x64xf16, #k_prefetch>
+      %last_k = arith.subi %K, %BLOCK_K : index                       // last in-bounds offset
+      // (1) prologue: depth 1 => one prefetch, at the base offset the loop starts on
+      xegpu.prefetch_nd %k_pf[%c0, %col] {l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>, layout = #k_prefetch} : !xegpu.tensor_desc<64x64xf16, #k_prefetch>
       scf.for %k = %c0 to %K step %BLOCK_K iter_args(%acc = %zero) -> (vector<128x16xf32>) {
+        // (2) in-loop: LEAD by 1 step. The load below uses %k; this must NOT.
         %knext = arith.addi %k, %BLOCK_K : index
-        xegpu.prefetch_nd %k_pf[%row, %knext] {l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>, layout = #k_prefetch} : !xegpu.tensor_desc<64x64xf16, #k_prefetch>
+        %knext_ok = arith.minsi %knext, %last_k : index               // clamp the tail
+        xegpu.prefetch_nd %k_pf[%knext_ok, %col] {l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>, layout = #k_prefetch} : !xegpu.tensor_desc<64x64xf16, #k_prefetch>
         %a = xegpu.load_nd %a_tile[%row, %k] {l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>} : !xegpu.tensor_desc<128x64xf16, #a> -> vector<128x64xf16>
         %b = xegpu.load_nd %b_tile[%k, %col] {l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>} : !xegpu.tensor_desc<64x16xf16, #b> -> vector<64x16xf16>
         %acc2 = xegpu.dpas %a, %b, %acc : vector<128x64xf16>, vector<64x16xf16>, vector<128x16xf32> -> vector<128x16xf32>
         scf.yield %acc2 : vector<128x16xf32>
       }
-    expected_speedup: "1.3-2x on memory-bound GEMM / attention"
+    expected_speedup: "1.3-2x on a DRAM-latency-bound GEMM / attention stream. 1.0x (or slightly worse) if the streamed operand is already L2-resident — classify with xegpu_prefetch_depth_is_tunable first."
     applies_to: ["gemm", "matmul", "flash_attention"]
 
   - id: xegpu_dedicated_prefetch_layout
@@ -370,6 +506,13 @@ patterns:
       makes every subgroup redundantly prefetch the whole tile — multiplying prefetch
       traffic by the subgroup count. The prefetch layout is chosen for cache coverage,
       NOT to match any register/DPAS shape.
+
+      THE LAYOUT IS ONLY HALF THE EDIT. Fixing the layout on a prefetch whose offset
+      equals the load's offset just makes a zero-lead prefetch cheaper — measured an
+      EXACT no-op (0.004%) rather than a win. The offsets below are written out in full
+      for that reason: the prefetch offset MUST be the load offset plus a whole number
+      of loop steps. See xegpu_prefetch_must_lead_the_load, and
+      xegpu_prefetch_depth_is_tunable for whether the loop can profit at all.
     rationale: |
       Prefetch only needs the tile resident in cache; the cheapest way is one
       cooperative pass across the subgroups. Reusing the DPAS/load layout
@@ -377,18 +520,33 @@ patterns:
       thrashes the cache — a measured 1.17x slowdown that a dedicated wide layout
       turns back into a break-even / positive result.
     pattern_before: |
-      // WRONG: prefetch reuses the compute/load layout -> each of the 8 SGs fetches the whole 64x64 tile (8x traffic)
-      xegpu.prefetch_nd %k_pf[%off, %c0]
-        <{layout = #xegpu.layout<sg_layout = [8, 1], sg_data = [64, 64], inst_data = [16, 16]>,
-          l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>}>
-        : !xegpu.tensor_desc<64x64xf16, #xegpu.block_tdesc_attr<boundary_check = false>>
+      // WRONG on TWO counts, both visible in this one op:
+      //   1. layout reused from compute/load -> each of the 8 SGs fetches the whole 64x64 tile (8x traffic)
+      //   2. offset %k is the SAME offset the load_nd below uses -> zero lead, warms nothing
+      scf.for %k = %c0 to %c4096 step %c64 iter_args(%acc = %zero) -> (vector<128x64xf32>) {
+        xegpu.prefetch_nd %k_pf[%k, %c0]
+          <{layout = #xegpu.layout<sg_layout = [8, 1], sg_data = [64, 64], inst_data = [16, 16]>,
+            l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>}>
+          : !xegpu.tensor_desc<64x64xf16, #xegpu.block_tdesc_attr<boundary_check = false>>
+        %kv = xegpu.load_nd %k_tile[%k, %c0] {...} : !xegpu.tensor_desc<64x64xf16, ...> -> vector<64x64xf16>
+        ...
+      }
     pattern_after: |
-      // RIGHT: dedicated wide layout -> 8 SGs cover 64x64 disjointly (2*32 x 4*16 == 64x64), each byte once
-      xegpu.prefetch_nd %k_pf[%off, %c0]
-        <{layout = #xegpu.layout<sg_layout = [2, 4], sg_data = [32, 16], inst_data = [32, 16]>,
-          l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>}>
-        : !xegpu.tensor_desc<64x64xf16, #xegpu.block_tdesc_attr<boundary_check = false>>
-    expected_speedup: "removes an 8x-redundant-prefetch regression: ~1.2x vs a compute-layout prefetch (0.85x -> 1.02x on a BMG 64x64 K/V tile)"
+      // RIGHT on both counts:
+      //   1. dedicated wide layout -> 8 SGs cover 64x64 disjointly (2*32 x 4*16 == 64x64), each byte once
+      //   2. offset leads the load by one step (%k + 64), clamped so the last iteration stays in bounds
+      xegpu.prefetch_nd %k_pf[%c0, %c0] <{layout = #pf, l1_hint = ..., l2_hint = ..., l3_hint = ...}> : ...   // prologue: warm iteration 0
+      scf.for %k = %c0 to %c4096 step %c64 iter_args(%acc = %zero) -> (vector<128x64xf32>) {
+        %lead = arith.addi %k, %c64 : index
+        %lead_ok = arith.minsi %lead, %c4032 : index          // 4096 - 64: never read past the tensor
+        xegpu.prefetch_nd %k_pf[%lead_ok, %c0]
+          <{layout = #xegpu.layout<sg_layout = [2, 4], sg_data = [32, 16], inst_data = [32, 16]>,
+            l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>, l3_hint = #xegpu.cache_hint<cached>}>
+          : !xegpu.tensor_desc<64x64xf16, #xegpu.block_tdesc_attr<boundary_check = false>>
+        %kv = xegpu.load_nd %k_tile[%k, %c0] {...} : !xegpu.tensor_desc<64x64xf16, ...> -> vector<64x64xf16>
+        ...
+      }
+    expected_speedup: "removes an 8x-redundant-prefetch regression: ~1.2x vs a compute-layout prefetch (0.85x -> 1.02x on a BMG 64x64 K/V tile). With a zero-lead offset that is where it stops: 1.02x means break-even, not a win."
     applies_to: ["flash_attention", "gemm", "matmul", "softmax"]
 
   - id: xegpu_cache_hint_on_load
