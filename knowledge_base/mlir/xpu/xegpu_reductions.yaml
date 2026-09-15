@@ -174,23 +174,30 @@ constraints:
       There is no way to pick a different kind per level from source, so on a
       cross-subgroup reduce the swap changes both halves. Leave those on `maximumf`.
     rationale: |
-      Reported by Intel GPU developers. ALWAYS let the timing gate decide — on the one
-      kernel measured here the swap was a small LOSS, so do not assume a win.
+      Reported by Intel GPU developers. ALWAYS let the timing gate decide — on both
+      kernels measured here the swap was a small LOSS, so do not assume a win.
 
-      Measured 2026-09-15 on BMG B580, large GRF, 500 runs x 8 interleaved reps, on the
-      flash-attention 4k row max (`vector<128x64xf32>`, `sg_layout = [8, 1]`, reduce
-      dim 1, so intra-subgroup):
+      Measured 2026-09-15 on BMG B580, large GRF, 500 runs x 8 interleaved reps. Both
+      kernels are intra-subgroup by the rule above (`sg_layout` on the reduced dim == 1),
+      so both are cases this entry says to swap:
 
-        <maximumf>  1.38613 ms   (spread 0.27%)
-        <maxnumf>   1.39992 ms   (spread 0.31%)   = 0.9902x, 1.0% SLOWER
+      | kernel | `<maximumf>` | `<maxnumf>` | result |
+      |---|---|---|---|
+      | flash-attention 4k row max, `vector<128x64xf32>`, `sg_layout = [8, 1]`, dim 1 | 1.38613 ms (spread 0.27%) | 1.39992 ms (spread 0.31%) | 0.9902x, 1.0% SLOWER |
+      | softmax 4096x4096 row max, `vector<64x16xf32>`, `sg_layout = [8, 1]`, dim 1 | 0.772356 ms (spread 0.08%) | 0.777244 ms (spread 0.11%) | 0.9937x, 0.63% SLOWER |
 
-      All 8 interleaved pairs agreed in sign, and `[ALLCLOSE: TRUE]` on all 16 runs, so
-      it is a real perf difference on this kernel, not noise.
+      On both, all 8 interleaved pairs agreed in sign and `[ALLCLOSE: TRUE]` on every
+      run, so these are real perf differences, not noise. On the softmax the two
+      variants' ranges do not even overlap, and the gap is ~6x the within-variant
+      spread. Note the softmax is DRAM-bound (~261 GB/s of 4096x4096xf32 traffic) and
+      the ALU delta still showed up.
 
       The ISA says why, and the reason is specific to REDUCTIONS. The `maxnumf` kernel
-      has 2 extra `sel (ge) rN, rN, 0xFF800000:f` — a max against -inf, which is the
-      reduction's neutral accumulator (`createReductionNeutralValue`). LLVM folds that
-      away for `maximumf` but not for `maxnumf`
+      has extra `sel (ge) rN, rN, 0xFF800000:f` — a max against -inf, which is the
+      reduction's neutral accumulator (`createReductionNeutralValue`). On the softmax
+      that is the ONLY opcode difference: `sel` +8, total 1584 -> 1592 instructions, and
+      the `maximumf` ISA has zero `sel` against `0xFF800000`. On flash attention it was
+      `sel` +2. LLVM folds that op away for `maximumf` but not for `maxnumf`
       (`llvm/lib/Analysis/InstructionSimplify.cpp:6882-6888`):
 
         maxnum(X, -inf)  -> X only if nnan
@@ -205,6 +212,10 @@ constraints:
       `sel (ge)` with no NaN guards at all, so the SPIR-V-dialect guard cost described
       in the pattern's rationale does not appear in the XeVM/IGC lowering.
 
-      What is NOT covered by that measurement: a bare `arith.maxnumf` outside a
+      What is NOT covered by these measurements: a bare `arith.maxnumf` outside a
       reduction (no neutral accumulator to fold, so the trade-off may differ), other
       Xe generations, and other IGC versions.
+
+      For contrast, upstream lighthouse's own generated softmax emits `<maxnumf>` here
+      (`softmax_xegpu_wg_4096x4096.mlir:50`), so the swap is what some upstream
+      generators already do. It is still the slower of the two on this pipeline.
