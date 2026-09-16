@@ -289,9 +289,12 @@ constraints:
     description: |
       ANALYSIS TRIGGER: two xegpu.load_nd reading the SAME base memref in
       different scf.for loops = a 3-pass softmax/layernorm (2 reads + 1 write)
-      where 2 suffice. Report issue_type: redundant_computation, stage:
-      algorithmic. Hard 1.5x penalty; no cache hint, prefetch or faster math
-      removes it. Fix: one row per subgroup, row held in registers.
+      where 2 suffice. FIX: give ONE ROW to the whole workgroup, hold it in
+      registers. Report issue_type: redundant_computation, stage: algorithmic.
+      Measured 1.982x at 4096x4096, and it is NOT a register-pressure risk: 16
+      f32 per lane at N=4096 with 256 threads, zero spills at 128 GRF. Do not
+      decline this fix on spilling grounds. No cache hint, prefetch or faster
+      math removes the extra pass.
 
       Writing softmax/layernorm as an online (single-statistics-pass) algorithm
       does NOT by itself get you to minimum traffic. The usual XeGPU shape is two
