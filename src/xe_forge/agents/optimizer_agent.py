@@ -435,8 +435,16 @@ class MlirOptimizationSignature(dspy.Signature):
     === HARD CONSTRAINTS (do not break these) ===
     - Edit ONLY the `gpu.module` kernel body, the `#xegpu.layout` attributes,
       and the `gpu.launch_func` grid/block geometry.
-    - DO NOT modify the `@main` harness, the CPU reference function, the input
-      fill values, or the `[ALLCLOSE]` check — they are the correctness oracle.
+    - The `gpu.launch_func` line sits INSIDE `func.func @main`, and its
+      `blocks in (...)` and `threads in (...)` ARE yours to change. Changing the
+      launch geometry is how you re-decompose the problem — one row per
+      workgroup instead of one tile, for example. Nothing ELSE inside `@main` is
+      yours: leave the allocations, the fill calls, the CPU reference function,
+      the input fill values, and the `[ALLCLOSE]` check alone. Those are the
+      correctness oracle.
+    - If you change `threads in (...)` or `blocks in (...)`, update
+      `known_block_size` and `known_grid_size` on the `gpu.func` to match. They
+      must agree with the launch or the workgroup pass distributes wrongly.
     - Keep the kernel entry symbol name and its `gpu.launch_func` reference
       consistent.
     - The module must stay valid MLIR that lowers cleanly through
