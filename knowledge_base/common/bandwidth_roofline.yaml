@@ -93,6 +93,31 @@ constraints:
       This is why a size sweep can look non-monotonic: see the Xe-Forge softmax
       1k/2k/4k/8k sweep, where per-size verdicts disagreed.
 
+      CONFIRMED AGAIN 2026-09-16 with a much more extreme case. The tuned Xe-Forge
+      single-pass softmax at 1024x1024 (8.389 MB working set) measured
+      **768.2 GB/s = 168% of the 456 GB/s DRAM peak** — the largest over-peak reading
+      seen so far, and independent confirmation from a second kernel that this is
+      cache and not a harness bug. Same day, same harness:
+
+        | N | working set | Xe-Forge best | % of DRAM peak | honest? |
+        |---|---|---|---|---|
+        | 1024 | 8.4 MB | 0.010920 ms, 768.2 GB/s | 168% | NO — L2-resident |
+        | 2048 | 33.6 MB | 0.080496 ms, 416.8 GB/s | 91.4% | yes |
+        | 4096 | 134 MB | 0.335920 ms, 399.6 GB/s | 87.6% | yes |
+        | 8192 | 537 MB | 1.332550 ms, 402.9 GB/s | 88.4% | yes |
+
+      SECOND CONSEQUENCE, ALSO MEASURED — the L2-resident size is not just
+      misleading, it is NOISY. At N=1024 the kernel runs in ~11 microseconds. Even at
+      `RUNS=2000 WARMUPS=200`, the spread across 11 interleaved reps was 41-55% of the
+      median (e.g. 0.009048-0.014976 ms on one config). At 2K and above the same
+      harness gave 0.0-0.6% spread. So an L2-resident point needs far more reps for
+      the same confidence, and rankings there should be treated as directional only.
+
+      STILL UNEXPLAINED: torch.softmax reads 117-118% of peak at 2048x2048, whose
+      33.6 MB working set does NOT fit in 18 MiB L2. Two separate runs now show it.
+      Partial reuse across the two passes is the obvious guess, but it is a guess.
+      Do not treat "above peak" as proof of full residency without checking the size.
+
   - id: bw_do_not_credit_a_win_below_measurement_noise
     name: "Bandwidth-bound kernels sit in a narrow band; require median-of-N and a real margin"
     severity: warning

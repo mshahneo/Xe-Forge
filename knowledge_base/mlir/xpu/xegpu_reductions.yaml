@@ -219,3 +219,22 @@ constraints:
       For contrast, upstream lighthouse's own generated softmax emits `<maxnumf>` here
       (`softmax_xegpu_wg_4096x4096.mlir:50`), so the swap is what some upstream
       generators already do. It is still the slower of the two on this pipeline.
+
+      RESOLVED 2026-09-16 — THE REAL DISCRIMINATOR IS THE NEUTRAL ACCUMULATOR, NOT
+      INTRA VS INTER SUBGROUP. Triton's softmax uses `arith.maxnumf` and is fast; we
+      measured `maxnumf` slower on both of our kernels. Both are true. Triton's IR
+      shows why (`softmax_kernel.ttgir`): a `tt.reduce` region combines real data
+      pairwise and has NO identity operand, so there is no `-inf` to fold and
+      `maxnumf` is simply the cheaper op. `vector.multi_reduction` ALWAYS gets a
+      `-inf` accumulator from `createReductionNeutralValue`, and `maximumf` deletes
+      the max against it for free while `maxnumf` cannot.
+
+        | | Triton `tt.reduce` | MLIR `vector.multi_reduction` |
+        |---|---|---|
+        | neutral accumulator | none | `-inf`, always |
+        | `-inf` fold | nothing to fold | `maximum(X,-inf) -> X` free; `maxnum` needs `nnan` |
+        | cheaper kind | `maxnumf` | `maximumf` |
+
+      PRACTICAL RULE for this pipeline: on `vector.multi_reduction`, keep
+      `<maximumf>`. The intra/inter-subgroup test in the precondition is still worth
+      keeping for the SLM-stage reason, but it is not why the swap loses.

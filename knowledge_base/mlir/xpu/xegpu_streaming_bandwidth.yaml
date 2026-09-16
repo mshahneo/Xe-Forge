@@ -30,15 +30,50 @@ category: optimization
 
 constraints:
   - id: xegpu_streaming_lane_chunk_must_be_128_bit
-    name: "On a streaming access, each lane must own a contiguous 128-bit chunk of the stride-1 axis"
-    severity: critical
+    name: "On a streaming access, each lane should own a CONTIGUOUS run of the stride-1 axis; 128 bit is a good default, not a requirement"
+    severity: warning
     stages: [memory_access, analysis]
     description: |
-      For any load_nd / store_nd of a read-once or write-once tensor, the layout
-      must give each lane a CONTIGUOUS 16-byte (128-bit) run along the stride-1
-      dimension: lane_data = [1, 4] for f32, [1, 8] for f16/bf16 on a row-major
-      row. 16 B/lane x 32 lanes = one 512-byte message, which is two full 256 B
-      Xe2 cache lines.
+      CORRECTED 2026-09-16 — the requirement is CONTIGUITY, not message width. The
+      old text said 128-bit-per-lane was mandatory and rated this critical. Two A/B
+      measurements on BMG B580 say message width is close to neutral. Read
+      "MEASURED: WIDTH IS NOT THE LEVER" below before acting on this entry.
+
+      For any load_nd / store_nd of a read-once or write-once tensor, prefer to give
+      each lane a CONTIGUOUS 16-byte (128-bit) run along the stride-1 dimension:
+      lane_data = [1, 4] for f32, [1, 8] for f16/bf16 on a row-major row.
+      16 B/lane x 32 lanes = one 512-byte message, which is two full 256 B Xe2
+      cache lines. It is a sensible default. It is not a correctness or a
+      performance requirement.
+
+      MEASURED: WIDTH IS NOT THE LEVER (Arc B580, f32 softmax 4096x4096, 500 runs,
+      interleaved, `[ALLCLOSE: TRUE]` every run).
+
+      1. Forcing the wide message made it SLOWER. Adding
+         `inst_data = [8, 16]` to the reduction-source load_nd removed every 64 B
+         message (load destinations went 32x `rN:1` + 4x `rN:8` -> 8x `rN:8`) and
+         cut instCount 1682 -> 1583. Time went 0.6662 -> 0.6693 ms, i.e. 0.5%
+         SLOWER, with 6/6 interleaved pairs agreeing in sign.
+         WHY: a 2D block load of 8 rows x 16 columns is NOT contiguous. It gathers
+         8 separate 64 B lines 16 KB apart. Merging them into one message does not
+         change which DRAM lines are touched, so DRAM does the same work.
+
+      2. The fastest kernel we have issues ONLY 64 B messages. The single-pass
+         softmax `sm_4096_sg16` reaches 87.5% of DRAM peak (0.336 ms) with
+         lane_data = [1, 1] and `bkl2d.shape = 1x16x1` on every load and store.
+         That is one quarter of the "required" width and it ties Triton.
+
+      SO WHAT ACTUALLY MATTERS: how long a contiguous run a workgroup touches at
+      one instant. Independent evidence from the same study: widening the column
+      tile of the 3-pass kernel, which lengthens each per-row contiguous run and
+      changes nothing else, moved it 0.6660 -> 0.6423 ms at width 128 (1.036x).
+      Past that it regresses hard (width 256 = 0.739 ms, width 512 = 1.328 ms).
+
+      USE THIS RULE INSTEAD: make the run contiguous first, then stop. Reach for
+      lane_data = [1, 4] when it is free, but do not spend a `convert_layout`, a
+      relayout, or extra register pressure to buy it — on a reduction source the
+      layout pass will insert `xegpu.convert_layout` to get back to lane_data = 1
+      anyway, and we measured that as a net loss.
 
       HOW TO SCALE UP a bigger tile: grow sg_layout (more subgroups, up to the
       1024-thread workgroup limit), NOT lane_data. Per-lane width is a hardware
@@ -163,6 +198,61 @@ constraints:
       `math.inv` + 2 SIMD32 `mul` + `cmp`/`sel 1.0f` chain in the Xe2 ISA
       (lines 935-975). Triton did not strength-reduce it. UNMEASURED.
 
+  - id: xegpu_streaming_fix_contiguity_and_occupancy_not_message_width
+    name: "On a bandwidth-bound kernel, fix contiguity and thread count first; message width is close to neutral"
+    severity: warning
+    stages: [analysis, memory_access, algorithmic]
+    description: |
+      ANALYSIS TRIGGER: report issue_type: uncoalesced_access, stage: memory_access,
+      when a bandwidth-bound kernel is below ~80% of DRAM peak AND a workgroup's live
+      footprint is SCATTERED — that is, one iteration touches several short runs far
+      apart in memory rather than one long contiguous run. Compute the run length:
+      (elements a subgroup reads per instruction along the stride-1 axis) x
+      element_size. Compare it to the distance between runs. If instead the run is
+      already contiguous and the problem is the subgroup count, report
+      issue_type: suboptimal_warps, stage: memory_access.
+
+      ORDER THE LEVERS LIKE THIS. Measured on BMG B580, f32 softmax 4096x4096.
+
+        | lever | effect | measured |
+        |---|---|---|
+        | 1. cut array passes AND make the run contiguous | 1.982x | 0.6665 -> 0.3362 ms |
+        | 2. lengthen the contiguous run alone | 1.036x | 0.6660 -> 0.6423 ms (tile W 16 -> 128) |
+        | 3. use the default GRF, not large | 1.007x | 0.3386 -> 0.3362 ms |
+        | 4. widen the per-lane message | 0.995x, a LOSS | 0.6662 -> 0.6693 ms |
+
+      LEVER 4 IS A TRAP and it is the one people reach for first. Forcing
+      `inst_data = [8, 16]` on a reduction-source load removed every 64 B message
+      and cut instCount 1682 -> 1583, and it ran 0.5% SLOWER (6/6 interleaved pairs
+      agreeing). The reason is that an 8-row x 16-column 2D block load is not
+      contiguous: it gathers 8 separate 64 B lines 16 KB apart. One message or
+      eight, DRAM touches the same lines.
+
+      THE PROOF THAT WIDTH DOES NOT MATTER: the fastest kernel in the study issues
+      NOTHING but 64 B messages (`bkl2d.shape = 1x16x1`, lane_data = [1, 1]) and
+      reaches 87.5% of DRAM peak. A quarter of the "recommended" width, at peak.
+
+      WHAT THE 1.982x ACTUALLY BOUGHT, and why it is one change not two:
+
+        | | before | after |
+        |---|---|---|
+        | array passes over the input | 3 (2 reads + 1 write) | 2 |
+        | a workgroup's live footprint | 64 lines of 64 B spread over 1 MB | one contiguous 16 KB row |
+        | hardware threads | 512 | 65536 |
+
+      Do not model traffic and efficiency as separate levers to be multiplied. The
+      decomposition sets both.
+
+      HOW TO CHECK IN THE ISA: `grep 'bkl2d.shape'` gives the per-message tile.
+      A shape like `1x16x8` means 8 separate single-row messages with 8 Y offsets —
+      scattered. `1x16x1` repeated at consecutive offsets means one contiguous run.
+      Scattered is the problem; the number of messages is not.
+
+      SOURCE: `test/lightouse_softmax_tuning/triton-vs-xe-forge/REPORT.md`,
+      2026-09-16, 500 runs x 4-6 interleaved reps, `[ALLCLOSE: TRUE]` every run.
+      NOT CHECKED: other dtypes, gather/scatter (as opposed to 2D block) access,
+      and kernels with data reuse — this is a streaming rule only.
+
   - id: xegpu_cross_subgroup_reduction_slm_should_be_tiny
     name: "Cross-subgroup reduction SLM should be one element per subgroup, not one per row element"
     severity: warning
@@ -235,11 +325,28 @@ constraints:
       Triton is 2.04x / 2.40x faster. The gap factors as 1.5x (the extra pass)
       times ~1.38x (streaming efficiency), which reproduces the 2.04x at 4K.
 
-      COST TO WATCH: a register-resident row needs row_len/32 f32 per lane —
-      128 f32/lane at N=4096, 256 at N=8192. The second is likely to spill, so at
-      large N split the row into register-resident panels and keep only the last
-      one, or accept the re-read for the tail. Check for spills before believing a
-      win. See also xegpu_grf_budget_loop_accumulators.
+      FIX NOW MEASURED, 2026-09-16, BMG B580, 4096x4096 f32, 500 runs, interleaved:
+        3-pass, 64x16 column-tiled  : 0.666510 ms (66.2% of peak on 3-pass traffic)
+        single-pass, row-resident   : 0.336232 ms (87.5% of peak) -> 1.982x
+      Triton on the same day: 0.3384 ms. So the single-pass XeGPU kernel TIES the
+      Triton reference. Working kernel:
+      `test/lightouse_softmax_tuning/triton-vs-xe-forge/xe-forge/sweep/sm_4096_sg16.mlir`.
+      Full study: `.../triton-vs-xe-forge/REPORT.md`.
+
+      CORRECTION — "the gap factors as 1.5x x 1.38x, two independent levers" is
+      WRONG. Both factors come from the same decomposition and one change moved
+      both. Do NOT plan around "cutting the pass alone caps at 1.5x". Cutting the
+      pass also made the stream contiguous (a workgroup's live footprint went from
+      64 scattered 64 B lines spread over 1 MB to one contiguous 16 KB row) and
+      raised thread count from 512 to 65536, so the efficiency factor came along
+      for free.
+
+      COST TO WATCH: a register-resident row needs row_len / threads_per_wg f32 per
+      lane, and TWO live arrays (the row and exp(x-max)), so budget
+      2 * row_len / threads_per_wg GRF-equivalents. Note this scales with WORKGROUP
+      threads, not subgroup lanes — spread the row over many subgroups and even
+      N=8192 is cheap (8192/512 = 16 f32/lane). Measured: no GRF spills at 128 GRF
+      for N=4096 with 256 threads. See also xegpu_grf_budget_loop_accumulators.
 
   - id: xegpu_large_grf_is_not_a_lever_for_bandwidth_bound_kernels
     name: "Do not spend the large-GRF flag on a bandwidth-bound kernel; it measures as noise"
@@ -266,6 +373,91 @@ constraints:
       bound, skip the sweep and spend the budget on cutting min_bytes instead.
       Note the sweep verdict also goes STALE after any source change, so when you
       do run it, run it LAST.
+
+      STRENGTHENED 2026-09-16: on a bandwidth-bound kernel large GRF can be an
+      active LOSS, not just noise. Measured on the single-pass softmax 4096x4096,
+      500 runs, 4 interleaved reps:
+
+        | config | large GRF (256) | default GRF (128) |
+        |---|---|---|
+        | 1 row/WG, 16 subgroups | 0.338572 ms | **0.336232 ms** |
+        | 1 row/WG, 8 subgroups  | 0.341276 ms | 0.340808 ms |
+        | 2 rows/WG, 4 subgroups | 0.459524 ms | 0.492258 ms |
+
+      Default wins every row. WHY: large GRF halves the hardware thread slots
+      (1280 -> 640 on B580). If the kernel has no spills at 128 GRF, the larger
+      budget buys nothing and costs half the memory-level parallelism. So the check
+      is not "is it bandwidth bound" but "does it spill at 128" — if not, take the
+      default and keep the thread slots.
+
+      ALWAYS INCLUDE THE DEFAULT POINT in the sweep. A one-sided "try large GRF"
+      test cannot find this.
+
+      SWEPT ACROSS SIZES 2026-09-16 — default won 10 of the 11 configs where both GRF
+      modes ran. Single-pass softmax, medians in ms:
+
+        | N | subgroups | default | large | winner |
+        |---|---|---|---|---|
+        | 1024 | 32 | 0.017888 | 0.031512 | default, 1.76x |
+        | 2048 | 16 | 0.080496 | 0.081640 | default, 1.4% |
+        | 2048 | 32 | 0.080808 | 0.101192 | default, 25% |
+        | 4096 | 16 | 0.336232 | 0.338520 | default, 0.7% |
+        | 4096 | 32 | 0.335920 | 0.360464 | default, 7.3% |
+        | 8192 | 32 | 1.332550 | 1.343370 | default, 0.8% |
+        | 8192 | 16 | 1.347940 | 1.342120 | large, 0.4% |
+
+      The single exception (8192, 16 subgroups) wins by 0.4% and is not the best
+      config at that size. For this kernel family the answer is settled: take the
+      default. None of these kernels spill at 128.
+
+  - id: xegpu_1024_thread_workgroup_cannot_use_large_grf
+    name: "A 1024-thread workgroup and large GRF cannot be combined; the launch fails outright"
+    severity: critical
+    stages: [analysis, device_specific, autotuning]
+    precondition: |
+      TRIGGER — report issue_type: missing_grf_mode, stage: device_specific, when a
+      gpu.launch_func (or known_block_size) asks for MORE THAN 512 threads per
+      workgroup AND the pipeline is given
+      `igc-cmd-options=-ze-opt-large-register-file`. Read the thread count off
+      `known_block_size = array<i32: T, 1, 1>` or the `threads in (%t, ...)` operand.
+      Fix: drop the large-GRF flag, or halve the thread count.
+
+      Worked example: `known_block_size = array<i32: 1024, 1, 1>` with
+      `sg_layout = [1, 64]` on SIMD16 is 1024 threads. With large GRF that launch
+      aborts. With default GRF it runs.
+
+      Do NOT flag at 512 threads or below — those run in both modes.
+    description: |
+      This is a CORRECTNESS failure, not a slow path. The launch is rejected:
+
+        L0 error 2013265939  =  0x78000013  =  ZE_RESULT_ERROR_INVALID_GROUP_SIZE_DIMENSION
+
+      MEASURED 2026-09-16 on Arc B580, four for four. `sm_1024_sg64`,
+      `sm_2048_sg64`, `sm_4096_sg64` and `sm_8192_sg64` all ask for 1024 threads.
+      All four abort at large GRF. All four run clean at default GRF
+      (`[ALLCLOSE: TRUE]`). No 512-thread or smaller kernel failed in either mode.
+
+      WHY: `clinfo` reports `Max work group size 1024` for the B580. Large GRF gives
+      each thread two register banks instead of one, which halves the maximum
+      workgroup size to 512. So 1024 threads plus large GRF is not a bad tuning
+      choice, it is an invalid request that the driver refuses.
+
+      HOW THIS BITES AN AUTOTUNER: a GRF sweep that pairs "large GRF" with a
+      1024-thread config gets a launch abort, which a harness may record as a failed
+      correctness check rather than an invalid combination. Exclude the pair up front.
+      Note the point is academic for performance anyway — 1024-thread workgroups lost
+      at every size measured (see
+      xegpu_row_per_subgroup_single_read_softmax for the grid).
+    rationale: |
+      Device limit, read from `clinfo`: B580 `Max work group size 1024`,
+      `Global Memory cache size 18874368` (18 MiB L2). The large-GRF mode trades
+      thread slots for registers (1280 -> 640 hardware threads on B580), and the
+      per-workgroup ceiling halves with it.
+
+      Not checked: whether the exact ceiling is 512 on other Xe parts, or whether a
+      future IGC reports a clearer error.
+    tags: [large_grf, workgroup_size, launch_failure, level_zero, device_specific, bmg, autotuning]
+    applies_to: [any_xegpu_kernel, softmax, layernorm, reduction, flash_attention]
 
 patterns:
   - id: xegpu_streaming_128bit_lane_load
@@ -530,7 +722,7 @@ patterns:
       DRAM peak uses.
 
   - id: xegpu_row_per_subgroup_single_read_softmax
-    name: "Assign one row per subgroup and hold it in registers so the normalize pass does not re-read memory"
+    name: "Give ONE ROW to the whole WORKGROUP, split across its subgroups, and hold it in registers so the normalize pass does not re-read memory"
     stage: algorithmic
     precondition: |
       APPLIES to a row-wise normalization (softmax, layernorm, rmsnorm, logsumexp)
@@ -538,22 +730,78 @@ patterns:
       tile the first loop already read. Detect it by counting xegpu.load_nd ops
       that read the same base memref in different scf.for bodies.
 
-      REQUIRES the row to fit in registers: row_len / lanes_per_subgroup f32 per
-      lane. Safe at 128 f32/lane (N <= 4096 at SIMD32); at N = 8192 it is 256
-      f32/lane and will likely spill, so use the panel variant below or skip.
+      REQUIRES the row to fit in registers. Budget it off WORKGROUP threads, not
+      subgroup lanes, because the row is split across all the subgroups:
+
+        f32 per lane = row_len / threads_per_wg
+        GRF-equivalents per lane = 2 * row_len / threads_per_wg   (row + exp array)
+
+      With 256 threads that is 16 f32/lane at N=4096 and 32 at N=8192, and BOTH fit
+      with no spills at 128 GRF. Raise threads_per_wg before giving up on a long row,
+      but see the SIZING RULE below for the cap — it is 512, not 1024.
 
       Do NOT apply when the reduction axis is not the contiguous axis, or when the
       row is already register-resident (then there is only one load and nothing to
       remove).
     description: |
       Flip the decomposition. Instead of giving a workgroup many rows and stepping
-      the column axis, give each subgroup ONE row and cover the whole row at once.
-      Keep the loaded row in a vector value, compute max and sum from it, then
-      normalize and store that SAME value. The input is read exactly once.
+      the column axis, give ONE ROW to the whole workgroup and split it across all
+      the workgroup's subgroups. Keep the loaded row in a vector value, compute max
+      and sum from it, then normalize and store that SAME value. The input is read
+      exactly once.
 
-      When the row is too long for registers, split it into panels sized to the
-      register budget and keep only the LAST panel live; the earlier panels still
-      re-read, so an R-panel split costs (1 + (R-1)/R) reads instead of 2.
+      NAME IS MISLEADING, kept for stability: one row per WORKGROUP, not per
+      subgroup. One row per SUBGROUP does not fit on the XeGPU path, which is
+      SIMD16: a 4096-f32 row on 16 lanes is 256 f32/lane. MEASURED — pushing toward
+      that shape loses. At 4096x4096, 2 rows per workgroup with 4 subgroups per row
+      (64 f32/lane) ran 0.4595 ms against 0.3362 ms for 1 row per workgroup with 16
+      subgroups (16 f32/lane). That is 37% slower.
+
+      SIZING RULE, SWEPT 2026-09-16 — GIVE EACH LANE 8 f32:
+
+        threads_per_wg = min(row_len / 8, 512)
+        subgroups      = threads_per_wg / 16      (SIMD16)
+
+      That is 128 threads at N=1024, 256 at N=2048, 512 at N=4096, 512 at N=8192.
+      The 8-f32-per-lane point won at 1K, 2K and 4K and was within 0.5% of the
+      winner at 8K. Full grid, BMG B580, default GRF, medians in ms:
+
+        | f32/lane | threads | N=1024 | N=2048 | N=4096 | N=8192 |
+        |---|---|---|---|---|---|
+        | 1 | N/1 | 0.040144 | - | - | - |
+        | 2 | N/2 | 0.017888 | 0.112632 | - | - |
+        | 4 | N/4 | 0.014352 | 0.080808 | 0.361400 | - |
+        | 8 | N/8 | **0.010920** | **0.080496** | **0.335920** | 1.339830 |
+        | 16 | N/16 | 0.012168 | 0.082264 | 0.336232 | **1.332550** |
+        | 32 | N/32 | - | - | 0.340808 | 1.347940 |
+
+      At N=8192 the 8-f32-per-lane point needs 1024 threads, which the cap forbids,
+      and the 512-thread (16 f32/lane) point wins there anyway — 1.332550 against
+      1.339830. So the cap costs nothing.
+
+      BOTH TAILS ARE REAL. Too few f32 per lane starves the lane and multiplies
+      barrier work: 1 f32/lane at N=1024 is 3.7x SLOWER than the best. Too many
+      raises register pressure for nothing: 32 f32/lane costs 1.2-1.5%.
+
+      MORE SUBGROUPS PER ROW IS BETTER ONLY UP TO 8 f32 PER LANE, then it reverses.
+      Measured at 4096x4096, default GRF: 8 subgroups 0.340808, 16 subgroups
+      0.336232, 32 subgroups 0.335920, 64 subgroups 0.361400. The earlier version of
+      this entry said "more is better up to the workgroup limit" — that was
+      extrapolated from two points and the sweep shows it turns over.
+
+      NEVER USE 1024 THREADS PER WORKGROUP. It lost at all four sizes (3.7x worse at
+      1K, 1.40x at 2K, 1.08x at 4K, 1.005x at 8K) and it CANNOT LAUNCH at large GRF
+      at all — see xegpu_1024_thread_workgroup_cannot_use_large_grf.
+
+      The reduce axis now CROSSES subgroups, so the workgroup pass inserts an SLM
+      stage (128 B) and one barrier, and the combining kind must stay `<maximumf>`
+      (see xegpu_intra_subgroup_max_should_be_maxnumf for why). That cost is small:
+      2 `sync.bar` in the final ISA.
+
+      When the row is too long for registers even at 1024 threads, split it into
+      panels sized to the register budget and keep only the LAST panel live; the
+      earlier panels still re-read, so an R-panel split costs (1 + (R-1)/R) reads
+      instead of 2.
     rationale: |
       A two-loop online softmax moves 3*N*N*4 bytes where the algorithm needs
       2*N*N*4. For a kernel whose only limit is DRAM, that extra pass IS the
@@ -574,34 +822,60 @@ patterns:
         xegpu.store_nd %o, %out[0, %j] : ...
       }
     pattern_after: |
-      // 2 passes: one row per subgroup, held in registers across both phases
-      %row_v = xegpu.load_nd %in[%row, %c0]
-        <{layout = #xegpu.layout<sg_layout = [8, 1], sg_data = [1, 4096],
-                                 lane_layout = [1, 32], lane_data = [1, 4]>,
-          l1_hint = #xegpu.cache_hint<streaming>,
-          l2_hint = #xegpu.cache_hint<streaming>}>
-        : !xegpu.tensor_desc<8x4096xf32, #in> -> vector<8x4096xf32>
-      %mx  = vector.multi_reduction <maximumf>, %row_v, %ninf [1] : vector<8x4096xf32> to vector<8xf32>
-      %e   = math.exp %shifted : vector<8x4096xf32>            // reuses %row_v, no reload
-      %sum = vector.multi_reduction <add>, %e, %zero [1] : vector<8x4096xf32> to vector<8xf32>
-      %rcp = arith.divf %one, %sum : vector<8xf32>
-      %o   = arith.mulf %e, %rcpb : vector<8x4096xf32>
-      xegpu.store_nd %o, %out[%row, %c0] <{...}> : vector<8x4096xf32>, ...
-    expected_speedup: "up to 1.5x from traffic alone; 2.0x measured end-to-end at 4096x4096 when combined with a saturating stream"
+      // 2 passes: ONE ROW per WORKGROUP, split across 16 subgroups (256 threads),
+      // held in registers across both phases. This is the measured 1.982x kernel.
+      // Launch: 4096 workgroups x 256 work-items. 4096/256 = 16 f32 per lane.
+      %bid = gpu.block_id x
+      %in_tdesc  = xegpu.create_nd_tdesc %arg0 : memref<4096x4096xf32>
+        -> !xegpu.tensor_desc<1x4096xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+      %out_tdesc = xegpu.create_nd_tdesc %arg1 : memref<4096x4096xf32>
+        -> !xegpu.tensor_desc<1x4096xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+      // read the row ONCE and keep it live
+      %row_v = xegpu.load_nd %in_tdesc[%bid, %c0]
+        <{l1_hint = #xegpu.cache_hint<cached>, l2_hint = #xegpu.cache_hint<cached>}>
+        : !xegpu.tensor_desc<1x4096xf32, ...> -> vector<1x4096xf32>
+      %mx  = vector.multi_reduction <maximumf>, %row_v, %ninf [1] : vector<1x4096xf32> to vector<1xf32>
+      %mb  = vector.broadcast %mx : vector<1xf32> to vector<1x4096xf32>   // size-1 dim stretches
+      %sh  = arith.subf %row_v, %mb : vector<1x4096xf32>
+      %e   = math.exp %sh fastmath<fast> : vector<1x4096xf32>       // reuses %row_v, no reload
+      %sum = vector.multi_reduction <add>, %e, %zero [1] : vector<1x4096xf32> to vector<1xf32>
+      %sb  = vector.broadcast %sum : vector<1xf32> to vector<1x4096xf32>
+      %o   = arith.divf %e, %sb : vector<1x4096xf32>
+      xegpu.store_nd %o, %out_tdesc[%bid, %c0]
+        <{layout = #xegpu.layout<sg_layout = [1, 16], sg_data = [1, 256]>}>
+        : vector<1x4096xf32>, !xegpu.tensor_desc<1x4096xf32, ...>
+      // NOTE 1: only the STORE needs an explicit layout; propagation infers the rest.
+      // NOTE 2: `vector.broadcast` from vector<1xf32> to vector<1x4096xf32> is legal
+      //   because a size-1 dim stretches. With 2+ rows it is NOT, and you need the
+      //   broadcast-to-[N, rows] + vector.transpose form. Prefer 1 row anyway.
+    expected_speedup: "1.982x MEASURED at 4096x4096 f32 on BMG B580 (0.666510 -> 0.336232 ms), which ties the Triton reference"
     applies_to: ["softmax", "layernorm", "rmsnorm", "logsumexp", "row_normalization", "any_two_pass_reduction"]
     notes: |
-      PROVENANCE: the 3-pass problem is MEASURED on our own MLIR kernel; the fix is
-      OBSERVED in the Triton reference and NOT yet A/B measured in XeGPU.
+      PROVENANCE: MEASURED end-to-end on our own MLIR kernel, 2026-09-16, BMG B580,
+      f32, 500 runs x 5 interleaved reps, `[ALLCLOSE: TRUE]` on every run.
 
-      Measured, Arc B580, f32, device kernel time, median of 5 processes:
-        ours, 3-pass, 64x16 column-tiled : 4K 0.690 ms (42.6% of 2-pass peak)
-                                           8K 3.208 ms (36.7%)
-        Triton, 2-pass, row in registers : 4K 0.339 ms (86.8%)
-                                           8K 1.336 ms (88.1%)
-      2.04x and 2.40x apart. Triton used n_regs=128 with n_spills=0 at 4K, so the
-      register budget for a 4096-f32 row is demonstrably affordable on BMG.
+        4096x4096, 3-pass 64x16 column-tiled : 0.666510 ms  (66.2% of peak)
+        4096x4096, this pattern, 256 threads : 0.336232 ms  (87.5% of peak)  1.982x
+        Triton reference, same day           : 0.3384 ms    (87.0% of peak)
 
-      The 2.0x figure is the FULL gap and needs the streaming layout too
-      (xegpu_streaming_128bit_lane_load); traffic alone caps at 1.5x. Verify with
-      an ISA spill check, not just a timer — a spill turns this into a loss.
+      Treat the Triton comparison as a TIE: the 0.6% edge is inside the difference
+      between the two timing harnesses (kineto vs IMEX_ENABLE_PROFILING).
+
+      Kernel and full study:
+        test/lightouse_softmax_tuning/triton-vs-xe-forge/REPORT.md
+        .../xe-forge/sweep/sm_4096_sg16.mlir
+
+      THREE CORRECTIONS to the earlier version of this entry:
+      1. "one row per subgroup" was wrong -> one row per WORKGROUP. See description.
+      2. "traffic alone caps at 1.5x, you also need the 128-bit streaming layout"
+         was wrong. This kernel issues ONLY 64 B messages (lane_data = [1, 1],
+         `bkl2d.shape = 1x16x1`) and still gets the full 1.982x. See the measured
+         counter-evidence in xegpu_streaming_lane_chunk_must_be_128_bit.
+      3. "N = 8192 will likely spill" was wrong, because the budget scales with
+         workgroup threads, not subgroup lanes. 8192 with 512 threads is 16
+         f32/lane.
+
+      STILL VERIFY WITH AN ISA SPILL CHECK, not just a timer — a spill turns this
+      into a loss. Measured clean here: 0 GRF spill/fill instructions at 128 GRF,
+      instCount 687, `slm_size: 128`, `barrier_count: 1`.
       Related: xegpu_online_softmax_still_reads_twice_unless_the_row_is_register_resident.
