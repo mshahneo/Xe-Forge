@@ -238,3 +238,25 @@ constraints:
       PRACTICAL RULE for this pipeline: on `vector.multi_reduction`, keep
       `<maximumf>`. The intra/inter-subgroup test in the precondition is still worth
       keeping for the SLM-stage reason, but it is not why the swap loses.
+
+      CODE MAP, read 2026-09-16, for whoever wants to change the compiler instead of
+      the kernel. In llvm-project, the `-inf` is created at
+      `mlir/lib/Dialect/XeGPU/Utils/XeGPUUtils.cpp:773-778` via
+      `APFloat::getInf(sem, /*Negative=*/true)`, inside
+      `xegpu::createReductionNeutralValue` (starts at line 723). `MAXNUMF` and
+      `MAXIMUMF` share one case label, so BOTH kinds get the identical `-inf` — the
+      kind is the only lever. It is injected twice per workgroup reduce, by
+      `mlir/lib/Dialect/XeGPU/Transforms/XeGPUWgToSgDistribute.cpp:1137` (local
+      reduce) and `:1251` (cross-subgroup reduce over SLM); both pass the same
+      `op.getKind()`, so a source swap flips both halves. The pass has no choice: a
+      `vector.multi_reduction` REQUIRES an acc operand (`VectorOps.td:311`
+      `AllTypesMatch<["dest","acc"]>`), and the pass builds a new one for the
+      cross-subgroup stage. Triton avoids this structurally: `tt.reduce` has no acc
+      operand (`TritonOps.td:776`), its tree is seeded from the first real value
+      (`ReduceOpToLLVM.cpp:110-136`), and its cross-warp stage is a shared-memory data
+      move plus another warp reduce, not a new reduction op. Triton's own `-inf` is a
+      load fill (`other=-float("inf")`), not a reduction identity. Full writeup with
+      four untested fix options: section 8 of
+      `/home/gta/test/lightouse_softmax_tuning/triton-vs-xe-forge/REPORT.md`. The
+      prize is 0.63% on softmax 4096² and 1.0% on FA 4k, so "do nothing, keep
+      `<maximumf>`" is the recommendation.
