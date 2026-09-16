@@ -9,6 +9,7 @@ import json
 import logging
 import re
 from pathlib import Path
+from typing import ClassVar
 
 import dspy
 
@@ -1103,11 +1104,15 @@ class OptimizerAgent(Optimizer):
 
         kb_context = self._get_stage_patterns(stage)
         if kb_context:
+            kept_c, all_c, kept_p, all_p = self._last_kb_counts
             logger.info(
-                "KB context for %s: %d chars, %d patterns/constraints",
+                "KB context for %s: %d chars, %d/%d constraints, %d/%d patterns",
                 stage.value,
                 len(kb_context),
-                kb_context.count("###") + kb_context.count("CONSTRAINT"),
+                kept_c,
+                all_c,
+                kept_p,
+                all_p,
             )
         else:
             logger.debug("No KB context for stage %s (KB disabled or empty)", stage.value)
@@ -1473,19 +1478,112 @@ class OptimizerAgent(Optimizer):
         result = "\n\n".join(s for s in sections if s.strip())
         return result[:max_chars]
 
+    # Character budget for the per-stage KB context (~7000 tokens).
+    #
+    # Sized from what the KB actually holds, not guessed. The largest optimizer
+    # stage on mlir/xpu (device_specific) has 20572 chars of CRITICAL
+    # constraints alone; algorithmic has 13193. A budget under that cannot state
+    # the stage's own rules, let alone show a fix. 28000 fits every critical
+    # constraint for the worst stage plus several patterns.
+    KB_CONTEXT_BUDGET = 28000
+    # Constraints are offered to the budget in this order. Unknown -> last.
+    _KB_SEVERITY_ORDER: ClassVar[dict[str, int]] = {
+        "critical": 0,
+        "high": 1,
+        "warning": 2,
+        "info": 3,
+    }
+    # (constraints kept, constraints total, patterns kept, patterns total) from
+    # the last _get_stage_patterns call, so the caller can log real counts.
+    _last_kb_counts: tuple[int, int, int, int] = (0, 0, 0, 0)
+
+    def _select_kb_entries(self, constraints, patterns, budget):
+        """
+        Choose whole KB entries that fit in *budget* chars, alternating between
+        constraints and patterns.
+
+        Alternating is the point. A constraint and a pattern do different jobs:
+        the constraint says an issue exists, the pattern shows the edit that
+        fixes it. Taking constraints first until the budget runs out gives the
+        optimizer problems with no solutions.
+
+        An entry too big to fit is skipped, not treated as the end — one verbose
+        entry must not hide every smaller one behind it.
+        """
+        kb = self.knowledge_base
+        rendered_c = [
+            (c.id, kb.render_constraint(c))
+            for c in sorted(
+                constraints,
+                key=lambda c: self._KB_SEVERITY_ORDER.get(str(c.severity).lower(), 99),
+            )
+        ]
+        rendered_p = [(p.id, kb.render_pattern(p)) for p in patterns]
+
+        keep_c: list[str] = []
+        keep_p: list[str] = []
+        dropped: list[str] = []
+        spent = 0
+        ci = pi = 0
+        want_pattern = False  # constraints go first: correctness before speed
+
+        while ci < len(rendered_c) or pi < len(rendered_p):
+            if want_pattern and pi < len(rendered_p):
+                entry_id, text = rendered_p[pi]
+                pi += 1
+                bucket = keep_p
+            elif not want_pattern and ci < len(rendered_c):
+                entry_id, text = rendered_c[ci]
+                ci += 1
+                bucket = keep_c
+            else:
+                want_pattern = not want_pattern
+                continue
+            if spent + len(text) + 1 <= budget:
+                bucket.append(text)
+                spent += len(text) + 1
+            else:
+                dropped.append(entry_id)
+            want_pattern = not want_pattern
+
+        return keep_c, keep_p, dropped
+
     def _get_stage_patterns(self, stage: OptimizationStage) -> str:
-        """Return KB context: constraints + patterns + compact example summaries."""
+        """
+        Return KB context for *stage*: constraints + patterns + compact examples.
+
+        Entries are selected WHOLE inside KB_CONTEXT_BUDGET. Do not go back to
+        truncating format_for_stage() output: that string renders every
+        constraint before the first pattern, so a plain character cut silently
+        dropped ALL patterns for a stage whenever the constraints alone
+        overflowed. On mlir/xpu that was every stage.
+        """
         if self.knowledge_base is None:
             return ""
         try:
-            # 1. Get constraints + patterns (no full code) from format_for_stage
-            full = self.knowledge_base.format_for_stage(stage)
-            if not full:
+            kb = self.knowledge_base
+            constraints = kb.constraints_for_stage(stage)
+            patterns = kb.get_by_stage(stage)
+
+            # 1. Reserve the section banners, then fill with whole entries.
+            c_header = kb.constraints_header(stage) if constraints else ""
+            p_header = kb.patterns_header(stage) if patterns else ""
+            budget = self.KB_CONTEXT_BUDGET - len(c_header) - len(p_header)
+            keep_c, keep_p, dropped = self._select_kb_entries(constraints, patterns, budget)
+            self._last_kb_counts = (len(keep_c), len(constraints), len(keep_p), len(patterns))
+
+            parts: list[str] = []
+            if keep_c:
+                parts.append("\n".join([c_header, *keep_c]))
+            if keep_p:
+                parts.append("\n".join([p_header, *keep_p]))
+            elif not patterns:
+                parts.append(
+                    f"No YAML patterns loaded for {stage.value} — relying on LLM knowledge."
+                )
+            if not parts:
                 return ""
-            # Strip the full code section — replace with compact example summaries
-            split_marker = "FULL CODE EXAMPLES FOR"
-            if split_marker in full:
-                full = full[: full.index(split_marker)].rstrip()
+            full = "\n\n".join(parts)
 
             # 2. Append compact example summaries (name + optimizations, no code)
             examples = self.knowledge_base.examples_for_stage(stage)
@@ -1509,12 +1607,30 @@ class OptimizerAgent(Optimizer):
                             ex_lines.append("```python")
                             ex_lines.append(code_to_show)
                             ex_lines.append("```")
-                full += "\n".join(ex_lines)
+                # Examples are the lowest priority — only if there is room left.
+                ex_text = "\n".join(ex_lines)
+                if len(full) + len(ex_text) <= self.KB_CONTEXT_BUDGET:
+                    full += ex_text
 
-            # Hard cap at 14000 chars (~3500 tokens)
-            if len(full) > 14000:
-                full = full[:14000] + "\n... [KB content truncated]"
-            logger.debug("KB patterns for %s: %d chars", stage.value, len(full))
+            # Name what was dropped. A silent cut is how the 1.982x softmax fix
+            # stayed out of this prompt for weeks.
+            if dropped:
+                logger.info(
+                    "KB context for %s: dropped %d entr%s over budget: %s",
+                    stage.value,
+                    len(dropped),
+                    "y" if len(dropped) == 1 else "ies",
+                    ", ".join(dropped),
+                )
+            logger.debug(
+                "KB patterns for %s: %d chars, %d/%d constraints, %d/%d patterns",
+                stage.value,
+                len(full),
+                len(keep_c),
+                len(constraints),
+                len(keep_p),
+                len(patterns),
+            )
             return full
         except Exception as e:
             logger.debug("KB context retrieval failed: %s", e)

@@ -187,6 +187,67 @@ class KnowledgeBase:
     def example_count(self) -> int:
         return len(self._examples)
 
+    @staticmethod
+    def constraints_header(stage: OptimizationStage) -> str:
+        """The banner that opens the constraints section for *stage*."""
+        return "\n".join(
+            ["=" * 60, f"CRITICAL CONSTRAINTS FOR {stage.value.upper()}", "=" * 60, ""]
+        )
+
+    @staticmethod
+    def patterns_header(stage: OptimizationStage) -> str:
+        """The banner that opens the patterns section for *stage*."""
+        return "\n".join([f"OPTIMIZATION PATTERNS FOR {stage.value.upper()}", "=" * 60])
+
+    @staticmethod
+    def render_constraint(c) -> str:
+        """Render ONE constraint. Callers that budget context need per-entry sizes."""
+        lines = [f"### {c.name}", f"Severity: {c.severity}"]
+        if c.applies_to:
+            lines.append(f"Applies to: {', '.join(c.applies_to)}")
+        lines.append("")
+        if c.precondition.strip():
+            lines += [
+                f"PRECONDITION (this rule applies ONLY if this holds): {c.precondition.strip()}",
+                "",
+            ]
+        lines += [c.description.strip(), ""]
+        if c.rationale.strip():
+            lines += [f"Rationale: {c.rationale.strip()}", ""]
+        if c.fix.strip():
+            lines += ["The fix:", "```", c.fix.strip(), "```", ""]
+        return "\n".join(lines)
+
+    @staticmethod
+    def render_pattern(entry) -> str:
+        """Render ONE pattern. Callers that budget context need per-entry sizes."""
+        lines = [f"\n## {entry.name}"]
+        if entry.precondition.strip():
+            lines.append(f"PRECONDITION (apply ONLY if this holds): {entry.precondition.strip()}")
+        lines += [
+            f"Description: {entry.description}",
+            f"Rationale: {entry.rationale.strip()}",
+        ]
+        if entry.pattern_before.strip():
+            lines += ["", "### Before:", "```python", entry.pattern_before.strip(), "```"]
+        if entry.pattern_after.strip():
+            lines += ["", "### After:", "```python", entry.pattern_after.strip(), "```"]
+        if entry.expected_speedup:
+            lines.append(f"\nExpected speedup: {entry.expected_speedup}")
+        if entry.notes.strip():
+            lines += ["", f"Notes: {entry.notes.strip()}"]
+        if entry.examples:
+            lines.append("\n### Inline examples:")
+            for i, ex in enumerate(entry.examples, 1):
+                if "before" in ex or "after" in ex:
+                    lines.append(f"\nExample {i}:")
+                if "before" in ex:
+                    lines += ["Before:", "```python", ex["before"].strip(), "```"]
+                if "after" in ex:
+                    lines += ["After:", "```python", ex["after"].strip(), "```"]
+        lines.append("")
+        return "\n".join(lines)
+
     def format_for_stage(self, stage: OptimizationStage) -> str:
         """
         Return a context string containing only what is relevant for *stage*.
@@ -195,71 +256,28 @@ class KnowledgeBase:
         1. Stage-scoped critical constraints
         2. Optimization patterns (before/after pairs)
         3. Full code examples
+
+        This is the UNBUDGETED form. Callers with a context budget should select
+        whole entries via render_constraint/render_pattern instead of truncating
+        this string — a character cut silently drops whole sections, because
+        patterns are rendered after every constraint.
         """
         parts: list[str] = []
 
         # 1. Constraints
         constraints = self.constraints_for_stage(stage)
         if constraints:
-            lines = [
-                "=" * 60,
-                f"CRITICAL CONSTRAINTS FOR {stage.value.upper()}",
-                "=" * 60,
-                "",
-            ]
+            lines = [self.constraints_header(stage)]
             for c in constraints:
-                lines += [f"### {c.name}", f"Severity: {c.severity}"]
-                if c.applies_to:
-                    lines.append(f"Applies to: {', '.join(c.applies_to)}")
-                lines.append("")
-                if c.precondition.strip():
-                    lines += [
-                        f"PRECONDITION (this rule applies ONLY if this holds): "
-                        f"{c.precondition.strip()}",
-                        "",
-                    ]
-                lines += [c.description.strip(), ""]
-                if c.rationale.strip():
-                    lines += [f"Rationale: {c.rationale.strip()}", ""]
-                if c.fix.strip():
-                    lines += ["The fix:", "```", c.fix.strip(), "```", ""]
+                lines.append(self.render_constraint(c))
             parts.append("\n".join(lines))
 
         # 2. Patterns
         entries = self.get_by_stage(stage)
         if entries:
-            lines = [
-                f"OPTIMIZATION PATTERNS FOR {stage.value.upper()}",
-                "=" * 60,
-            ]
+            lines = [self.patterns_header(stage)]
             for entry in entries:
-                lines += [f"\n## {entry.name}"]
-                if entry.precondition.strip():
-                    lines.append(
-                        f"PRECONDITION (apply ONLY if this holds): {entry.precondition.strip()}"
-                    )
-                lines += [
-                    f"Description: {entry.description}",
-                    f"Rationale: {entry.rationale.strip()}",
-                ]
-                if entry.pattern_before.strip():
-                    lines += ["", "### Before:", "```python", entry.pattern_before.strip(), "```"]
-                if entry.pattern_after.strip():
-                    lines += ["", "### After:", "```python", entry.pattern_after.strip(), "```"]
-                if entry.expected_speedup:
-                    lines.append(f"\nExpected speedup: {entry.expected_speedup}")
-                if entry.notes.strip():
-                    lines += ["", f"Notes: {entry.notes.strip()}"]
-                if entry.examples:
-                    lines.append("\n### Inline examples:")
-                    for i, ex in enumerate(entry.examples, 1):
-                        if "before" in ex or "after" in ex:
-                            lines.append(f"\nExample {i}:")
-                        if "before" in ex:
-                            lines += ["Before:", "```python", ex["before"].strip(), "```"]
-                        if "after" in ex:
-                            lines += ["After:", "```python", ex["after"].strip(), "```"]
-                lines.append("")
+                lines.append(self.render_pattern(entry))
             parts.append("\n".join(lines))
         else:
             parts.append(f"No YAML patterns loaded for {stage.value} — relying on LLM knowledge.")
