@@ -438,7 +438,10 @@ class MlirOptimizationSignature(dspy.Signature):
     - The `gpu.launch_func` line sits INSIDE `func.func @main`, and its
       `blocks in (...)` and `threads in (...)` ARE yours to change. Changing the
       launch geometry is how you re-decompose the problem — one row per
-      workgroup instead of one tile, for example. Nothing ELSE inside `@main` is
+      workgroup instead of one tile, for example. It is also how you change the
+      layout the tile is distributed with, and how you trade register budget
+      against thread count: more threads each holding a smaller slice beats
+      fewer threads that spill. Nothing ELSE inside `@main` is
       yours: leave the allocations, the fill calls, the CPU reference function,
       the input fill values, and the `[ALLCLOSE]` check alone. Those are the
       correctness oracle.
@@ -533,8 +536,22 @@ class MlirAlgorithmicOptimizationSignature(dspy.Signature):
     4. Eliminating redundant loads / recomputation inside the scf.for loop.
 
     === HARD CONSTRAINTS ===
-    - Edit ONLY the `gpu.module` kernel and its `#xegpu.layout` attrs.
-    - DO NOT touch the `@main` harness, fill values, or CPU reference.
+    - Edit ONLY the `gpu.module` kernel, its `#xegpu.layout` attrs, and the
+      `gpu.launch_func` grid/block geometry.
+    - The `gpu.launch_func` line sits INSIDE `func.func @main`, and its
+      `blocks in (...)` and `threads in (...)` ARE yours to change. Re-deciding
+      the launch geometry is often the whole fix. It is how you re-decompose the
+      problem (one row per workgroup instead of one tile), how you change the
+      layout the tile is distributed with, and how you trade register budget
+      against thread count — more threads each holding a smaller slice beats
+      fewer threads that spill.
+    - Nothing ELSE inside `@main` is yours: leave the allocations, the fill
+      calls, the fill values, the CPU reference function, and the `[ALLCLOSE]`
+      check alone. Those are the correctness oracle.
+    - If you change `threads in (...)` or `blocks in (...)`, update
+      `known_block_size` and `known_grid_size` on the `gpu.func` to match, and
+      keep the `sg_layout` product equal to threads / 16. They must agree with
+      the launch or the workgroup pass distributes wrongly.
     - Must stay valid MLIR that lowers through the workgroup XeVM pipeline.
 
     === HOW TO SUBMIT A CHANGE ===
