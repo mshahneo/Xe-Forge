@@ -63,6 +63,50 @@ constraints:
       that: threads = min(row_len / 8, 512). See
       xegpu_row_per_subgroup_single_read_softmax for the measured grid.
 
+  - id: xegpu_sg_layout_must_cover_every_dim_not_just_the_product
+    name: "sg_layout .* sg_data must equal the tile shape in EVERY dim; the product rule alone passes a broken layout"
+    severity: critical
+    stages: [algorithmic, memory_access, device_specific]
+    description: |
+      CHECK PER DIMENSION, not just the product. For a tile of shape S:
+
+        for every dim d:  sg_layout[d] * sg_data[d] == S[d]
+
+      The product rule (sg_layout product == threads/16) is NECESSARY, NOT
+      SUFFICIENT. A layout can satisfy it and still be wrong in every dimension.
+
+      PUT THE SUBGROUPS ON THE DIMENSION YOU ARE SPLITTING. When a workgroup owns
+      ONE row, shape is 1xN, so dim 0 has size 1 and can hold exactly ONE
+      subgroup. All of them go on dim 1.
+
+        RIGHT: 1x4096 tile, 32 subgroups -> sg_layout = [1, 32], sg_data = [1, 128]
+        WRONG: 1x4096 tile, 32 subgroups -> sg_layout = [32, 1], sg_data = [1, 128]
+
+      The wrong one passes the product check (32 * 1 = 32 = 512 / 16) and claims
+      32 rows of a 1-row tile and 128 columns of 4096.
+
+      HOW IT FAILS, and it is not obvious. load_nd and store_nd tolerate it. The
+      lowering dies later, at the reduction, because slicing the layout over
+      dims=[1] leaves sg_layout=[32] over a shape of [1] and 32 subgroups cannot
+      split 1 element:
+
+        error: failed to legalize operation 'arith.mulf' that was explicitly
+        marked illegal: ... (vector<1xf32>, vector<1xf32>) -> vector<1xf32>
+        ... #xegpu.slice<#xegpu.layout<sg_layout = [32, 1], sg_data = [1, 1]>, dims = [1]>
+
+      An `arith` op on a `vector<1xf32>` "marked illegal" with a `slice` layout in
+      its attributes means THIS. Do not chase the arith op; fix the sg_layout on
+      the tile it came from.
+
+      MEASURED, both on Arc B580 f32, 4096x4096, the SAME row-resident rewrite:
+        * softmax wrote sg_layout = [1, 32] -> lowered, ALLCLOSE TRUE, 0.3354 ms.
+        * layernorm wrote sg_layout = [32, 1] -> the rewrite was thrown away on a
+          lowering error, and the run ended 0/4 stages. The kernel was otherwise
+          correct: grid 4096, threads 512, one row in registers.
+
+      So one transposed layout is the whole difference between the 1.77x win and
+      no win at all. Check the cover rule before proposing the rewrite.
+
   - id: xegpu_launch_must_fill_the_subgroup_slots
     name: "Compute the occupancy number and report it: grid_blocks * subgroups_per_block must reach cores * slots_per_core"
     severity: critical
