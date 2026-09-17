@@ -502,7 +502,10 @@ class MlirOptimizationSignature(dspy.Signature):
         desc="PREFERRED. JSON list of exact-anchor replacements: "
         '[{"old": "<text copied verbatim from the module>", "new": "<replacement>"}]. '
         "Each `old` must appear EXACTLY ONCE — include indentation and enough "
-        "surrounding text to be unique. Write NONE only if you truly need to "
+        "surrounding text to be unique. When the text is genuinely repeated and "
+        'you mean all of it, add "all": true; to pick one match, add '
+        '"occurrence": N (1-based). A bad anchor now skips only its own edit, so '
+        "the rest of the batch still lands. Write NONE only if you truly need to "
         "rewrite the whole module."
     )
     optimized_code: dspy.Code["mlir"] = dspy.OutputField(
@@ -538,6 +541,10 @@ class MlirAlgorithmicOptimizationSignature(dspy.Signature):
     Prefer `edits`: a JSON list of exact-anchor replacements. Copy `old` verbatim
     from the module, make it unique, and write `UNCHANGED` in `optimized_code`.
     Re-emitting the whole module corrupts unrelated syntax and wastes the attempt.
+
+    Removing duplicated work is a normal algorithmic fix, and the duplicate lines
+    make an anchor non-unique. Do not give up on the edit for that reason. Set
+    `"all": true` to change every match, or `"occurrence": N` to pick one.
     """
 
     original_code: str = dspy.InputField(desc="Original MLIR module for reference")
@@ -551,7 +558,10 @@ class MlirAlgorithmicOptimizationSignature(dspy.Signature):
     edits: str = dspy.OutputField(
         desc="PREFERRED. JSON list of exact-anchor replacements: "
         '[{"old": "<text copied verbatim from the module>", "new": "<replacement>"}]. '
-        "Each `old` must appear EXACTLY ONCE. Write NONE only if you truly need to "
+        "Each `old` must appear EXACTLY ONCE. When the text is genuinely repeated "
+        'and you mean all of it, add "all": true; to pick one match, add '
+        '"occurrence": N (1-based). A bad anchor now skips only its own edit, so '
+        "the rest of the batch still lands. Write NONE only if you truly need to "
         "rewrite the whole module."
     )
     optimized_code: dspy.Code["mlir"] = dspy.OutputField(
@@ -660,17 +670,91 @@ def _repair_digit_led_ssa_names(code: str) -> tuple[str, str]:
     return repaired, f"renamed {len(mapping)} digit-led SSA name(s): {sample}"
 
 
+def _replace_nth(text: str, old: str, new: str, n: int) -> str:
+    """Replace the nth (1-based) occurrence of `old`. Counts like `str.count` does.
+
+    The caller checks that `n` is in range, so the scan always finds a match.
+    """
+    start = 0
+    for _ in range(n):
+        idx = text.find(old, start)
+        if idx < 0:
+            return text
+        start = idx + len(old)
+    return text[: start - len(old)] + new + text[start:]
+
+
+def _apply_one_anchored_edit(out: str, i: int, ed: object) -> tuple[str | None, str]:
+    """Apply one anchor replacement to `out`.
+
+    Returns `(new_out, "")` on success, or `(None, reason)` if this one edit
+    cannot be applied. The reason is written for the LLM to read and retry
+    against.
+    """
+    if not isinstance(ed, dict) or "old" not in ed or "new" not in ed:
+        return None, f'edit {i}: needs both an "old" and a "new" key'
+    old, new = str(ed["old"]), str(ed["new"])
+    if not old:
+        return None, f'edit {i}: "old" is empty — it must be text copied from the module'
+    if old == new:
+        return None, f'edit {i}: "old" and "new" are identical — that is a no-op'
+
+    n = out.count(old)
+    if n == 0:
+        return None, (
+            f'edit {i}: ANCHOR NOT FOUND. Copy "old" verbatim from the module, '
+            f"including indentation. Got: {old[:120]!r}"
+        )
+
+    want_all = bool(ed.get("all"))
+    occurrence = ed.get("occurrence")
+    if want_all and occurrence is not None:
+        return None, f'edit {i}: use either "all" or "occurrence", not both'
+
+    if want_all:
+        return out.replace(old, new), ""
+
+    if occurrence is not None:
+        # bool is an int in Python, so reject it explicitly.
+        if isinstance(occurrence, bool) or not isinstance(occurrence, int) or occurrence < 1:
+            return None, f'edit {i}: "occurrence" must be an integer >= 1, got {occurrence!r}'
+        if occurrence > n:
+            return None, (
+                f'edit {i}: "occurrence" is {occurrence} but the anchor matches {n} time(s)'
+            )
+        return _replace_nth(out, old, new, occurrence), ""
+
+    if n > 1:
+        return None, (
+            f"edit {i}: ANCHOR AMBIGUOUS ({n} matches). Add surrounding lines to "
+            f'make it unique, or say which match you mean with "occurrence": '
+            f'1..{n}, or set "all": true to change every match. Got: {old[:120]!r}'
+        )
+
+    return out.replace(old, new, 1), ""
+
+
 def _apply_anchored_edits(code: str, edits_str: str) -> tuple[str | None, str]:
     """Apply a JSON list of exact-anchor replacements to `code`.
 
-    Returns `(new_code, "")` on success, or `(None, reason)` on failure. The
-    reason is written for the LLM to read and retry against.
+    Returns `(new_code, note)` when at least one edit applied. `note` is empty if
+    every edit applied, otherwise it names the ones that were skipped. Returns
+    `(None, reason)` when nothing applied.
 
     A whole 22KB MLIR module does not survive being re-emitted by an LLM: a
     one-attribute change arrives with unrelated syntax corrupted somewhere else.
-    So small changes travel as anchors instead. Every anchor must appear exactly
-    once, which makes a stale or ambiguous anchor a hard error rather than a
-    silent edit in the wrong place.
+    So small changes travel as anchors instead.
+
+    **One bad anchor skips only its own edit.** The rest of the batch still
+    applies. It used to fail the whole batch, so a single stale anchor threw away
+    every good edit sitting next to it and wasted the attempt.
+
+    **An ambiguous anchor is still refused by default**, so a vague anchor cannot
+    silently edit the wrong place. Say which match you mean with
+    `"occurrence": N` (1-based), or change every match with `"all": true`. Those
+    keys matter for edits that REMOVE duplicated code: the duplication is exactly
+    what makes the anchor non-unique, so without them the guard blocked the very
+    fix that would have removed the duplication.
     """
     raw = (edits_str or "").strip()
     if not raw or raw.upper() == "NONE":
@@ -692,29 +776,22 @@ def _apply_anchored_edits(code: str, edits_str: str) -> tuple[str | None, str]:
         return None, 'EDITS must be a non-empty JSON list of {"old": ..., "new": ...}'
 
     out = code
+    applied = 0
+    skipped: list[str] = []
     for i, ed in enumerate(parsed, 1):
-        if not isinstance(ed, dict) or "old" not in ed or "new" not in ed:
-            return None, f'edit {i}: needs both an "old" and a "new" key'
-        old, new = str(ed["old"]), str(ed["new"])
-        if not old:
-            return None, f'edit {i}: "old" is empty — it must be text copied from the module'
-        n = out.count(old)
-        if n == 0:
-            return None, (
-                f'edit {i}: ANCHOR NOT FOUND. Copy "old" verbatim from the module, '
-                f"including indentation. Got: {old[:120]!r}"
-            )
-        if n > 1:
-            return None, (
-                f"edit {i}: ANCHOR AMBIGUOUS ({n} matches). Add surrounding lines "
-                f"to make it unique. Got: {old[:120]!r}"
-            )
-        if old == new:
-            return None, f'edit {i}: "old" and "new" are identical — that is a no-op'
-        out = out.replace(old, new, 1)
+        patched, why = _apply_one_anchored_edit(out, i, ed)
+        if patched is None:
+            skipped.append(why)
+            continue
+        out = patched
+        applied += 1
 
+    if applied == 0:
+        return None, "; ".join(skipped)
     if out == code:
         return None, "edits applied but the module is unchanged"
+    if skipped:
+        return out, (f"{applied} edit(s) applied, {len(skipped)} skipped: " + "; ".join(skipped))
     return out, ""
 
 
@@ -836,6 +913,9 @@ class OptimizerAgent(Optimizer):
                 patched, why = _apply_anchored_edits(last_accepted["base"], edits)
                 if patched is not None:
                     code, via = patched, "edits"
+                    # A partly-applied batch still runs. Say so, or the skip is silent.
+                    if why:
+                        logger.info("  attempt %d edits: %s", _verify_call_count[0], why)
                 elif why != "no edits supplied":
                     attempt_log(stage, _verify_call_count[0], "edits", why, None)
                     return f"EDITS REJECTED: {why}"

@@ -9,8 +9,18 @@ module, plus its replacement.
 
 Every failure mode below returns a reason string instead of a patched module. The
 reason is written to be read by the LLM and retried against, so these tests also pin
-that a stale or ambiguous anchor is a hard error — never a silent edit in the wrong
-place.
+that an ambiguous anchor never becomes a silent edit in the wrong place.
+
+Two later rules are pinned here too, both from the 4096x4096 softmax run of
+2026-09-16:
+
+* **One bad anchor skips only its own edit.** The batch used to fail whole, so a
+  single stale anchor threw away every good edit beside it.
+* **An ambiguous anchor has a way out: ``occurrence`` and ``all``.** Without them
+  the guard blocked exactly the fixes that remove duplicated code, because the
+  duplication is what makes the anchor non-unique. That is how the 2.3x one-pass
+  softmax rewrite was lost: the model tried to retype the input descriptor, the
+  line existed twice (once per input pass), and the edit was thrown away.
 """
 
 import json
@@ -89,6 +99,188 @@ def test_ambiguous_anchor_is_rejected():
     new, why = _apply_anchored_edits(MODULE, _edits(("vector<128xf32>", "vector<128xf16>")))
     assert new is None
     assert "ANCHOR AMBIGUOUS (3 matches)" in why
+
+
+def test_the_ambiguous_message_offers_both_ways_out():
+    # The model cannot use `occurrence` or `all` unless the rejection names them.
+    _new, why = _apply_anchored_edits(MODULE, _edits(("vector<128xf32>", "vector<128xf16>")))
+    assert '"occurrence": 1..3' in why
+    assert '"all": true' in why
+
+
+# --- one bad anchor must not kill the batch (option A) ------------------------
+
+
+def test_one_bad_anchor_skips_only_itself():
+    new, why = _apply_anchored_edits(
+        MODULE,
+        _edits(
+            ("%0 = math.exp %a :", "%0 = math.exp %a fastmath<fast> :"),
+            ("math.exp %zzz :", "whatever"),
+            ("%2 = math.exp %d :", "%2 = math.exp %d fastmath<fast> :"),
+        ),
+    )
+    # The two good edits land. Previously all three were discarded.
+    assert new is not None
+    assert new.count("fastmath<fast>") == 2
+    # And the skip is reported, not swallowed.
+    assert "2 edit(s) applied, 1 skipped" in why
+    assert "ANCHOR NOT FOUND" in why
+
+
+def test_a_batch_of_only_bad_anchors_still_fails():
+    new, why = _apply_anchored_edits(
+        MODULE, _edits(("math.exp %zzz :", "a"), ("math.exp %qqq :", "b"))
+    )
+    assert new is None
+    # Both reasons come back, so the model can fix both at once.
+    assert why.count("ANCHOR NOT FOUND") == 2
+
+
+def test_an_ambiguous_anchor_beside_a_good_one_keeps_the_good_one():
+    new, why = _apply_anchored_edits(
+        MODULE,
+        _edits(
+            ("vector<128xf32>", "vector<128xf16>"),  # 3 matches, no occurrence/all
+            ("gpu.return", "gpu.return // done"),
+        ),
+    )
+    assert new is not None
+    assert "gpu.return // done" in new
+    # The ambiguous one changed nothing.
+    assert new.count("vector<128xf32>") == 3
+    assert "ANCHOR AMBIGUOUS" in why
+
+
+def test_the_note_is_empty_when_every_edit_applies():
+    new, why = _apply_anchored_edits(MODULE, _edits(("gpu.return", "gpu.return // done")))
+    assert new is not None
+    assert why == ""
+
+
+# --- occurrence and all (option C) -------------------------------------------
+
+
+def test_all_true_changes_every_match():
+    new, why = _apply_anchored_edits(
+        MODULE, json.dumps([{"old": "vector<128xf32>", "new": "vector<128xf16>", "all": True}])
+    )
+    assert why == ""
+    assert new.count("vector<128xf16>") == 3
+    assert "vector<128xf32>" not in new
+
+
+def test_occurrence_picks_exactly_that_match():
+    new, why = _apply_anchored_edits(
+        MODULE,
+        json.dumps([{"old": "vector<128xf32>", "new": "vector<128xf16>", "occurrence": 2}]),
+    )
+    assert why == ""
+    # The middle line changed; the first and third did not.
+    assert "%0 = math.exp %a : vector<128xf32>" in new
+    assert "%1 = arith.mulf %b, %c : vector<128xf16>" in new
+    assert "%2 = math.exp %d : vector<128xf32>" in new
+
+
+def test_occurrence_one_is_the_first_match():
+    new, _why = _apply_anchored_edits(
+        MODULE,
+        json.dumps([{"old": "vector<128xf32>", "new": "vector<128xf16>", "occurrence": 1}]),
+    )
+    assert "%0 = math.exp %a : vector<128xf16>" in new
+    assert new.count("vector<128xf32>") == 2
+
+
+def test_occurrence_past_the_end_is_rejected():
+    new, why = _apply_anchored_edits(
+        MODULE,
+        json.dumps([{"old": "vector<128xf32>", "new": "vector<128xf16>", "occurrence": 4}]),
+    )
+    assert new is None
+    assert "matches 3 time(s)" in why
+
+
+def test_occurrence_must_be_a_positive_int():
+    for bad in (0, -1, 1.5, "2", True):
+        new, why = _apply_anchored_edits(
+            MODULE, json.dumps([{"old": "vector<128xf32>", "new": "x", "occurrence": bad}])
+        )
+        assert new is None, f"{bad!r} was accepted"
+        assert "must be an integer >= 1" in why
+
+
+def test_all_and_occurrence_together_is_rejected():
+    new, why = _apply_anchored_edits(
+        MODULE,
+        json.dumps([{"old": "vector<128xf32>", "new": "x", "all": True, "occurrence": 1}]),
+    )
+    assert new is None
+    assert "not both" in why
+
+
+def test_all_on_a_unique_anchor_behaves_like_a_plain_edit():
+    new, why = _apply_anchored_edits(
+        MODULE, json.dumps([{"old": "gpu.return", "new": "gpu.return // done", "all": True}])
+    )
+    assert why == ""
+    assert new.count("gpu.return // done") == 1
+
+
+# --- the regression this was all for -----------------------------------------
+
+# A two-pass softmax in miniature: the input descriptor is built once per pass, so
+# the two lines are byte-identical. Retyping it is the core of the one-pass rewrite.
+TWO_PASS = """\
+gpu.func @payload_kernel(%arg0: memref<4096x4096xf32>) kernel {
+  scf.for %i = %c0 to %c256 step %c1 {
+    %2 = xegpu.create_nd_tdesc %arg0 : memref<4096x4096xf32> -> !xegpu.tensor_desc<64x16xf32>
+    %3 = xegpu.load_nd %2[%i, %c0] : !xegpu.tensor_desc<64x16xf32> -> vector<64x16xf32>
+  }
+  scf.for %j = %c0 to %c256 step %c1 {
+    %2 = xegpu.create_nd_tdesc %arg0 : memref<4096x4096xf32> -> !xegpu.tensor_desc<64x16xf32>
+    %3 = xegpu.load_nd %2[%j, %c0] : !xegpu.tensor_desc<64x16xf32> -> vector<64x16xf32>
+  }
+  gpu.return
+}
+"""
+
+DESC_LINE = (
+    "    %2 = xegpu.create_nd_tdesc %arg0 : memref<4096x4096xf32> "
+    "-> !xegpu.tensor_desc<64x16xf32>\n"
+)
+
+
+def test_the_duplicated_descriptor_retype_used_to_be_impossible():
+    # Guards against a vacuous test below: without `all`/`occurrence` this is the
+    # exact rejection that lost the 2.3x rewrite on the 4K run.
+    assert TWO_PASS.count(DESC_LINE) == 2
+    new, why = _apply_anchored_edits(
+        TWO_PASS, _edits((DESC_LINE, DESC_LINE.replace("64x16", "1x4096")))
+    )
+    assert new is None
+    assert "ANCHOR AMBIGUOUS (2 matches)" in why
+
+
+def test_the_duplicated_descriptor_retype_transports_with_all():
+    new, why = _apply_anchored_edits(
+        TWO_PASS,
+        json.dumps([{"old": DESC_LINE, "new": DESC_LINE.replace("64x16", "1x4096"), "all": True}]),
+    )
+    assert why == ""
+    assert new.count("!xegpu.tensor_desc<1x4096xf32>") == 2
+    assert "!xegpu.tensor_desc<64x16xf32>" in new  # the load types are untouched
+
+
+def test_only_the_second_pass_can_be_targeted():
+    # Deleting the second read is the other shape the fix takes.
+    new, why = _apply_anchored_edits(
+        TWO_PASS, json.dumps([{"old": DESC_LINE, "new": "", "occurrence": 2}])
+    )
+    assert why == ""
+    assert new.count(DESC_LINE) == 1
+    # The surviving one is the first pass, not the second.
+    assert new.index("scf.for %i") < new.index(DESC_LINE.strip())
+    assert DESC_LINE.strip() not in new.split("scf.for %j")[1]
 
 
 def test_invalid_json_is_rejected_with_a_position():
