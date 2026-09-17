@@ -103,6 +103,53 @@ def test_softmax_single_read_fix_reaches_the_optimizer():
         assert needle in context, f"missing from algorithmic KB context: {needle!r}"
 
 
+def test_grf_thread_ceiling_reaches_every_stage_that_edits_the_geometry():
+    """The GRF mode sets the thread ceiling, so both must be in the same prompt.
+
+    On Xe2 the default GRF allows 64 subgroups (1024 work-items) and large GRF
+    only 32 (512). A stage told it may rewrite `threads in (...)` but not told
+    the ceiling cannot pick a number. Layer-norm 2026-09-17 is the case: its
+    route was algorithmic + memory_access, the geometry rule was scoped to
+    device_specific + autotuning, and all four shapes kept `threads = 128` — an
+    eighth of the available budget.
+    """
+    agent = _agent()
+    for stage in (
+        OptimizationStage.ALGORITHMIC,
+        OptimizationStage.MEMORY_ACCESS,
+        OptimizationStage.DEVICE_SPECIFIC,
+        OptimizationStage.AUTOTUNING,
+    ):
+        context = agent._get_stage_patterns(stage)
+        for needle in (
+            "THE GRF MODE SETS THE CEILING",  # the rule itself
+            "| default (128) | 64 | 1024 |",  # the numbers
+            "| large (256)   | 32 |  512 |",
+            "RE-DECIDE IT",  # it is a procedure, not just a warning
+        ):
+            assert needle in context, f"{stage.value}: missing from KB context: {needle!r}"
+
+
+def test_both_halves_of_the_one_pass_rewrite_fit_together():
+    """The geometry rule and the register-residency rule must not evict each other.
+
+    Adding the GRF/thread ceiling to the algorithmic stage at the old 28000-char
+    budget pushed out
+    xegpu_online_softmax_still_reads_twice_unless_the_row_is_register_resident,
+    which is the entry that says the row has to stay in registers for the
+    rewrite to pay. Two halves of one fix, and only one fit.
+    """
+    agent = _agent()
+    context = agent._get_stage_patterns(OptimizationStage.ALGORITHMIC)
+    _, total_constraints, kept_patterns, total_patterns = agent._last_kb_counts
+    assert "THE GRF MODE SETS THE CEILING" in context
+    assert "Two-loop online softmax reads the input twice" in context
+    assert kept_patterns == total_patterns, (
+        f"algorithmic dropped {total_patterns - kept_patterns} of {total_patterns} "
+        "patterns; the stage that owns the launch-geometry rewrite should see all of them"
+    )
+
+
 def test_critical_constraints_are_offered_before_warnings():
     """A dropped critical constraint can break the kernel; a dropped warning costs perf."""
     agent = _agent()

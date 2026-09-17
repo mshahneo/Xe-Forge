@@ -25,9 +25,9 @@ category: optimization
 
 constraints:
   - id: xegpu_sg_layout_matches_launch_threads
-    name: sg_layout product must match subgroups-per-workgroup in gpu.launch_func
+    name: sg_layout product must match subgroups-per-workgroup in gpu.launch_func, and the GRF mode sets the ceiling
     severity: critical
-    stages: [device_specific, autotuning]
+    stages: [algorithmic, memory_access, device_specific, autotuning]
     description: |
       The XeGPU spelling of mlir_subgroup_count_and_grf_budget: in
       #xegpu.layout<sg_layout=[a, b], ...> the product a*b IS the number of
@@ -36,8 +36,32 @@ constraints:
       If gpu.launch_func declares `threads in (%c128, %c1, %c1)` that is
       128 / 16 = 8 subgroups, so sg_layout must satisfy a*b == 8
       (e.g. [8, 1], [4, 2], [2, 4], [1, 8]). A mismatch causes a lowering
-      failure or wrong results. Remember the large-GRF cap of 32 subgroups
-      applies to this same product.
+      failure or wrong results.
+
+      THE GRF MODE SETS THE CEILING ON a*b. On Xe2 an Xe core has 8 vector
+      engines; each runs 8 hardware threads at the default GRF and 4 at large
+      GRF, and one hardware thread is one SIMD16 subgroup:
+
+        | GRF mode      | max a*b | max threads in (...) |
+        |---|---|---|
+        | default (128) | 64 | 1024 |
+        | large (256)   | 32 |  512 |
+
+      SO THE GEOMETRY IS NOT FIXED — RE-DECIDE IT. Three numbers move together:
+      `threads in (...)`, the sg_layout product, and the GRF mode. Changing any
+      one means changing the others.
+        * On the default GRF you may spend up to 1024 work-items = 64 subgroups.
+          If a kernel launches 128 threads (8 subgroups) it is using an eighth of
+          the thread budget, whatever the GRF mode. That is a lever, not a given.
+        * Large GRF halves the ceiling to 32 subgroups / 512 work-items. A kernel
+          already at 1024 cannot take the flag; the launch is refused.
+        * When you change `threads in (...)`, also update `known_block_size` and
+          `known_grid_size` on the gpu.func and every sg_data, so
+          sg_layout .* sg_data still tiles the operand exactly.
+
+      For a row-wise kernel, aim for 8 f32 per lane and read the thread count off
+      that: threads = min(row_len / 8, 512). See
+      xegpu_row_per_subgroup_single_read_softmax for the measured grid.
 
   - id: xegpu_propagate_dpas_layout_epilogue
     name: Keep the DPAS accumulator layout through the elementwise epilogue — no intermediate relayouts
@@ -93,8 +117,12 @@ constraints:
           COMPETING, not stacking: the accumulator promotion is worth more (measured
           1.364x, xegpu_f32_accumulator_softmax_recipe) and once it is in place the
           prefetch on top costs 13% (1.0352 -> 1.1883 ms on 4k FA)
-        * remember large-GRF halves the subgroup budget to <=32 per workgroup, so
-          buying registers costs parallelism
+        * the GRF mode trades registers against threads, BOTH WAYS. Large GRF
+          halves the subgroup budget to <=32 per workgroup (512 work-items), so
+          buying registers costs parallelism. The default GRF allows 64 subgroups
+          (1024 work-items), so declining the flag BUYS parallelism — and you only
+          collect it by raising `threads in (...)` and shrinking sg_data to match.
+          Never leave the geometry alone after settling the GRF mode.
       If the total does not fit, cut a consumer rather than accepting spills: a spill
       inside the innermost loop converts a register access into memory traffic.
 

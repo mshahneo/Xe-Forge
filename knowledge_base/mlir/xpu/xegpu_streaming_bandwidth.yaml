@@ -445,6 +445,17 @@ constraints:
       workgroup size to 512. So 1024 threads plus large GRF is not a bad tuning
       choice, it is an invalid request that the driver refuses.
 
+      The count comes straight off the hardware. An Xe2 core has 8 vector engines.
+      Each runs 8 hardware threads at the default GRF and 4 at large GRF, and one
+      hardware thread is one SIMD16 subgroup:
+
+        default GRF: 8 x 8 = 64 subgroups = 1024 work-items
+        large GRF:   4 x 8 = 32 subgroups =  512 work-items
+
+      Read it the other way round too: the default GRF is the mode that GIVES you
+      1024. If the GRF sweep keeps the default, the thread budget just doubled, and
+      the launch geometry should be re-decided to use it.
+
       HOW THIS BITES AN AUTOTUNER: a GRF sweep that pairs "large GRF" with a
       1024-thread config gets a launch abort, which a harness may record as a failed
       correctness check rather than an invalid combination. Exclude the pair up front.

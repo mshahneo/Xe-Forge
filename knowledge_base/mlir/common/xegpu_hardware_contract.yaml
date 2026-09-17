@@ -77,6 +77,36 @@ constraints:
       fewer, heavier subgroups is exactly the register-pressure regime where the
       extra GRF pays off.
 
+      WHERE THOSE TWO NUMBERS COME FROM (Xe2 / BMG). An Xe core has 8 vector
+      engines. Each vector engine runs 8 hardware threads at the default GRF and
+      only 4 at large GRF. One hardware thread IS one SIMD16 subgroup. So the
+      ceiling is threads-per-engine times engines:
+
+        | GRF mode      | hw threads per vector engine | subgroups per WG | work-items per WG |
+        |---|---|---|---|
+        | default (128) | 8 | 8 x 8 = 64 | 1024 |
+        | large (256)   | 4 | 4 x 8 = 32 |  512 |
+
+      GRF MODE AND LAUNCH GEOMETRY ARE ONE DECISION, NOT TWO. Never pick one and
+      keep the other:
+        * Choosing large GRF CAPS the launch at 512 work-items. A kernel already
+          launching 1024 cannot take the flag at all — the driver refuses the
+          launch with ZE_RESULT_ERROR_INVALID_GROUP_SIZE_DIMENSION.
+        * Choosing the default GRF BUYS 2x the threads. If the large-GRF sweep
+          loses, do not stop there: re-decide the geometry with the bigger budget.
+          Doubling the work-items halves the work per lane, and on a
+          bandwidth-bound kernel that is usually worth more than the registers.
+        * Whichever you change, change the other with it, plus every sg_layout:
+          the product of sg_layout must stay equal to threads_per_wg / 16, and
+          known_block_size / known_grid_size must match the launch.
+
+      MEASURED, both directions, so neither mode is a default. Softmax 4096x4096
+      wants 512 work-items (32 subgroups, 8 f32 per lane) at the DEFAULT GRF:
+      0.335400 ms, which beats the hand-written kernel; large GRF costs it 4.6%.
+      Layer-norm 1024x4096 at 128 work-items goes the other way: large GRF gains
+      7.1% (0.112216 -> 0.104728 ms). Measure the mode together with the geometry
+      that belongs to it.
+
       Large-GRF is a COMPILE FLAG, not an IR edit, so it is correctness-neutral:
       identical results, just fewer spills. That makes it the cheapest thing to try
       on any kernel carrying large loop-carried f32 state, and it should be measured
@@ -96,7 +126,9 @@ constraints:
     fix: |
       // lowering pipeline options:
       --gpu-lower-to-xevm-pipeline="xegpu-op-level=workgroup igc-cmd-options=-ze-opt-large-register-file"
-      // and keep subgroups_per_wg <= 32 when it is set.
+      // and keep subgroups_per_wg <= 32 when it is set (<= 64 without it).
+      // If the flag loses, spend the freed thread slots: raise threads in (...)
+      // toward 1024 and shrink sg_data to match, keeping sg_layout = threads/16.
 
   - id: mlir_dpas_tile_shape_alignment
     name: Per-instruction tiles must be multiples of the DPAS shape (A=[8,16], B=[16,16]) on SIMD16

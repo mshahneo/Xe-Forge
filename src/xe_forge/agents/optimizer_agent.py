@@ -1583,14 +1583,26 @@ class OptimizerAgent(Optimizer):
         result = "\n\n".join(s for s in sections if s.strip())
         return result[:max_chars]
 
-    # Character budget for the per-stage KB context (~7000 tokens).
+    # Character budget for the per-stage KB context (~11500 tokens).
     #
-    # Sized from what the KB actually holds, not guessed. The largest optimizer
-    # stage on mlir/xpu (device_specific) has 20572 chars of CRITICAL
-    # constraints alone; algorithmic has 13193. A budget under that cannot state
-    # the stage's own rules, let alone show a fix. 28000 fits every critical
-    # constraint for the worst stage plus several patterns.
-    KB_CONTEXT_BUDGET = 28000
+    # Sized from what the KB actually holds, not guessed. Measured on mlir/xpu,
+    # 2026-09-17, constraints + patterns per stage:
+    #
+    #   algorithmic      44675 chars   (10 constraints, 4 patterns)
+    #   memory_access    65406         (15, 10)
+    #   device_specific  83737         (22, 8)
+    #   dtype_fix        18710         (6, 2)
+    #
+    # 46000 shows ALGORITHMIC ITS WHOLE SHELF. That stage owns the two biggest
+    # levers — re-deciding the launch geometry and cutting a pass over the input
+    # — and at the old 28000 they competed: adding the GRF/thread-ceiling rule
+    # pushed out xegpu_online_softmax_still_reads_twice..., which is the entry
+    # that says the row must be register-resident for the rewrite to pay. Two
+    # halves of one fix must not evict each other.
+    #
+    # memory_access and device_specific still get cut; they hold many entries
+    # that are alternatives to each other, not halves of one fix.
+    KB_CONTEXT_BUDGET = 46000
     # Constraints are offered to the budget in this order. Unknown -> last.
     _KB_SEVERITY_ORDER: ClassVar[dict[str, int]] = {
         "critical": 0,
@@ -1673,7 +1685,22 @@ class OptimizerAgent(Optimizer):
             # 1. Reserve the section banners, then fill with whole entries.
             c_header = kb.constraints_header(stage) if constraints else ""
             p_header = kb.patterns_header(stage) if patterns else ""
-            budget = self.KB_CONTEXT_BUDGET - len(c_header) - len(p_header)
+            # A stage with no patterns gets a one-line note where the pattern
+            # section would go. That note and the blank line joining the two
+            # sections are part of the string, so reserve them too — without
+            # this, analysis (34 constraints, 0 patterns) overran by 66 chars.
+            no_patterns_note = (
+                ""
+                if patterns
+                else f"No YAML patterns loaded for {stage.value} — relying on LLM knowledge."
+            )
+            budget = (
+                self.KB_CONTEXT_BUDGET
+                - len(c_header)
+                - len(p_header)
+                - len(no_patterns_note)
+                - 2  # the "\n\n" between the constraint and pattern sections
+            )
             keep_c, keep_p, dropped = self._select_kb_entries(constraints, patterns, budget)
             self._last_kb_counts = (len(keep_c), len(constraints), len(keep_p), len(patterns))
 
@@ -1683,9 +1710,7 @@ class OptimizerAgent(Optimizer):
             if keep_p:
                 parts.append("\n".join([p_header, *keep_p]))
             elif not patterns:
-                parts.append(
-                    f"No YAML patterns loaded for {stage.value} — relying on LLM knowledge."
-                )
+                parts.append(no_patterns_note)
             if not parts:
                 return ""
             full = "\n\n".join(parts)
