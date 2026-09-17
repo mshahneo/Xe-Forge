@@ -1393,8 +1393,27 @@ class OptimizerAgent(Optimizer):
                 attempt_history.append(_attempt_summary)
 
                 if not ok:
-                    logger.debug(f"Run failed ({err}), stopping best-of loop")
-                    break
+                    # A REJECTED candidate is not a reason to quit with budget left.
+                    # This is the same rule the no-improvement branch below already
+                    # follows; this break sat above it and short-circuited it, so the
+                    # rule only ever applied to a candidate that measured >= 1.0x.
+                    #
+                    # What it cost: a layer-norm 4096x4096 run stopped after ONE
+                    # attempt at 0.959x with 4 of 5 iterations unspent, and reported
+                    # only "no valid result in budget". The reason was logged at
+                    # DEBUG, so the log gave no hint the stage had quit early. The
+                    # previous run of the same input spent all 5 and reached the
+                    # whole-kernel rewrite on attempt 4.
+                    #
+                    # An executor exception is different. A broken harness will not
+                    # fix itself, and every further attempt pays GPU time to learn
+                    # the same thing, so that one still stops.
+                    if err and err.startswith("Verify failed:"):
+                        logger.warning(f"Stage {stage.value} stopping, harness error: {err}")
+                        break
+                    # Otherwise fall through. The no-improvement branch below already
+                    # handles spd=None and logs the iterations left; it reports `err`
+                    # as the reason, so one line covers this.
 
                 # The bar is the executor's own noise band, not a hardcoded 1.02. The
                 # old constant sat BELOW the tolerance the executor uses to decide a
@@ -1451,7 +1470,11 @@ class OptimizerAgent(Optimizer):
                     # slower candidate must not become what the next run edits — and
                     # let the loop condition end the stage.
                     _best_str = f"{best_spd:.2f}x" if best_spd is not None else "none"
-                    _spd_str = f"{spd:.2f}x" if spd is not None else "N/A"
+                    # spd is None for a REJECTED candidate (slower, wrong, no-op).
+                    # Those used to break out above, so this only ever printed "N/A"
+                    # for an unmeasurable one. Print `err` instead: "2.13x slower" and
+                    # "Incorrect results" need different next moves from the model.
+                    _spd_str = f"{spd:.2f}x" if spd is not None else (err or "rejected")
                     logger.info(
                         f"Stage {stage.value} no improvement ({_spd_str} vs best "
                         f"{_best_str}); {self.max_iterations - iters_used} iterations left"
