@@ -1,11 +1,11 @@
 {
  "gluon/xpu": {
-  "constraints": 11,
+  "constraints": 12,
   "examples": 0,
   "patterns": 6,
   "stage_context_sha256": {
-   "algorithmic": "ae7e9f049695b0d3dfc92b9cfe8f2f8b271d31a75c1cdc212c488d1367d0bcef",
-   "analysis": "9da2b337f3c7ad51af4c300c20810e51b636cece59015f855a00daa5d2f94464",
+   "algorithmic": "2a2523cf7a89e4c2cc7df1d2d480e34520140c00e0060decedcb47eb0e91bc1c",
+   "analysis": "164ff1c8a018cc93c6794fcf14844721bb7fc5e52ca1e825750f5bc1611ccda3",
    "autotuning": "fde715b5bd7f6523d9f295cf6505435a0ae246268244411cfa58f90ec51fa30f",
    "block_pointers": "e9c4bab5f5e4bb823c8cee1d029ef1181b26d20b70e7f6f6998626e88a5d9ada",
    "device_specific": "e482df894e82a8e54a34f09e7037c9fb8d923927d8cb5037ea59a94abad0b61c",
@@ -26,20 +26,20 @@
   }
  },
  "mlir/linalg": {
-  "constraints": 18,
+  "constraints": 19,
   "examples": 0,
   "patterns": 6,
   "stage_context_sha256": {
-   "algorithmic": "ecb7ff653f45652dde4d27e852bc7a67f4908728b66633d82fd9e2af3358d115",
-   "analysis": "64c543c96286bb6c05cf202dbb5cb345fdde40734cb578948999223fe1a8727e",
-   "autotuning": "49c2919eeac1c0b8d85326f639e976cfb21eec84e7e2071001a997371df1575a",
+   "algorithmic": "f6b4a6ad0a853cf21ff489eef4245364cb6c01aeb26e2a89c66b03fe6032f8ba",
+   "analysis": "bd7ffd4631da2901921d1b2f36e6fbceeceff6408f374a370d798490dc9608f8",
+   "autotuning": "84ee7249492c742d0074fc6b1b253af52077a4d20c3014dbd957e217b2c58493",
    "block_pointers": "08796845a41229d66e7964799359b8e1605fa171562c7118901a08b5e8222992",
-   "device_specific": "e1136739e1bc2f41cb9459203c48a786422bfcf46c6d195d00d4f311c141a75c",
+   "device_specific": "fd6d71f88d666934e1d5a795f37200855b97f7cf2594cf384bc2130eccd5a6fb",
    "discovery": "dc617fd1a696744c39f8f72ba40beb706b486a9d74b876d746030754320ead5b",
    "dtype_fix": "450ab4e7f90c4db1e52f1a4688f92210f3eb304b024d309e09eeac8a7ee7767c",
    "fusion": "fc460430496e5bb3cd00126a59d024f5ab3ee1707e0b58315e4549cbfaafadb7",
    "grf_sweep": "03cb69d51d44942fdbe28eef70731b1a8bf8d72524917b58e3920b2860f29a25",
-   "linalg_lowering": "9e23ea0cf567dc76853557708ab74210270b91aec4d34469f5634bedc9d7bb48",
+   "linalg_lowering": "caa94cfd52e51986a7b5730e60681b5c4df988086a8d29395bcadd05d93c005b",
    "memory_access": "cce3ee5f3167055992f39940830b363a25fbc5eadd970dc931210661bf568203",
    "persistent_kernel": "60851618a4b2dadd2085d8ce1d1bbaa1fddf068225c2ef144f100df1a7f9285a"
   },
@@ -48,21 +48,21 @@
   }
  },
  "mlir/xpu": {
-  "constraints": 35,
+  "constraints": 39,
   "examples": 1,
   "patterns": 24,
   "stage_context_sha256": {
-   "algorithmic": "491c16a419e9882213e1829becf95b4589915f09a5c17fb587a9df9d3845cdf5",
-   "analysis": "72c9076aa1f12cbef66f976ee5b26f38cf115835c6dd2a23251f4365e7178d84",
-   "autotuning": "d3a99f60c4514f13201882ec542a725c63f6524edcc4ea6d3094654696b35e62",
+   "algorithmic": "e6d5bfc6398e84f7c79a67e3472135aedb006e7c83f94c8351a3c5e4bcd16c74",
+   "analysis": "6cb9f31e17c5f0da7fa9bbbbbcc9e3962ed296dfb0df39c8d13d28e58e6a7438",
+   "autotuning": "5ae0750eb52794c1d1416b8b890f0384b17792962288d173be28ceed52764fb7",
    "block_pointers": "249dc66db276d21a4de59574320f2065b1589e426632e1d2ddd8cf434bd8d00c",
-   "device_specific": "44ddca9185d3b3fc5e900722f29205626f579e21b9318a70706e8eef8ca8eb0d",
+   "device_specific": "18e122750881e9257c0dfdf05f20b596e5533a6565cbb101920ef270ab4be2e7",
    "discovery": "31288646fc65a45094f3cb5bb7c09b1f2a7db4be4c83858fd1a21d0f4a95ade0",
    "dtype_fix": "619701678a7352854216951167f75fc22299d1bde63343a81384d7a47a4772c1",
    "fusion": "994ac98813f98bbb792b835d80d52777af623186f072038bf6db766c6e8c3c10",
    "grf_sweep": "c3cd70110fa445a7661a284f7c31eec3898573c7cf5fabad78cb13d8639e9a87",
-   "linalg_lowering": "94c3e04eac2aeace24d670c51ab6a68e715050583719a554e005494494a96eb4",
-   "memory_access": "b90f123459e687682f3dbbb8a0299fa0d4c9cd1596df103dd55eed93625a2b88",
+   "linalg_lowering": "b0b02dc1ba04466604cc9540fbd9c394ef1f4b11cf9f6076a9cf894fe24e5ed4",
+   "memory_access": "36d4ded9f85df08e23325dc794f9a74f53bf7755defcbeac137ee3138ee0f518",
    "persistent_kernel": "cf77a448d46a6ff65ed11e8da9b2f41bf68edc03b9167c0e32eb817f73ceefc5"
   },
   "stage_pattern_counts": {
@@ -73,12 +73,12 @@
   }
  },
  "sycl/xpu": {
-  "constraints": 19,
+  "constraints": 20,
   "examples": 0,
   "patterns": 36,
   "stage_context_sha256": {
-   "algorithmic": "cb04d656986b2a2a8ace669f4d77140c59eac7adf5d3d4b5ae9149543024c9e4",
-   "analysis": "28bfe890d5fc17b25e37d24200230f53965dc1a26e7440dccbff904a2f725119",
+   "algorithmic": "1123f447878c2c7bfbf33f1bde95ef098007aed1408c57834ad09dfb3b4ff06c",
+   "analysis": "7f50dfb30cda626ccfc8a513cc0dae63febc20fe950477ae836d4f94cfe41725",
    "autotuning": "2d448bcea785b3520ee173cd517260c497e9aa8b41dbe8298ef1f4ff3214fa32",
    "block_pointers": "effedfc51a9468687ae864247ad99cb3dd3490b28c15c00a1a22465d921d8958",
    "device_specific": "39520241fcbdffe81b096467d3672689f43255f9fb70d719fcf55b719a0d21d8",
@@ -99,12 +99,12 @@
   }
  },
  "triton/cuda": {
-  "constraints": 8,
+  "constraints": 9,
   "examples": 0,
   "patterns": 2,
   "stage_context_sha256": {
-   "algorithmic": "03e52e2c06ab3e467a5c7e3498eff62ac2fbd9c49c060993972941fc7968dcb2",
-   "analysis": "203980987c4c9ec362624c524c39c0601433f28e0822f53e01528be709180207",
+   "algorithmic": "0208642030d4b119173004b053590090378b43914efde993c57cfc4b863239c5",
+   "analysis": "49fa7b18034a0219cb1a97972dfaa8b47f4816e38397b1b68d8817fcbafb7b52",
    "autotuning": "a4c7041791fbc88fe60c525901a3d4366b873b7c4335713e463a32fb28bbfb57",
    "block_pointers": "ad572019e118b3e153fc73b5d4279734809cbf854b62e31f10b249a6a5253556",
    "device_specific": "56f2afee8bb3c10371867cd26691a4efb4dbdf6470ee021464b5337702f3d619",
@@ -121,12 +121,12 @@
   }
  },
  "triton/xpu": {
-  "constraints": 38,
+  "constraints": 39,
   "examples": 15,
   "patterns": 88,
   "stage_context_sha256": {
-   "algorithmic": "71ef22a2ef0b40196ee6abf9232e1a7848a537fe47a8925b4cb24b5d67583cbf",
-   "analysis": "da854347d5ec31cb233b1297274f838a57210e456fffcac3595dd4d6c9e9ea7e",
+   "algorithmic": "abf18ea9032ab2f41c91cef442911f48d478476898d8a9bef539f1042e194f87",
+   "analysis": "962cae074560bb9e37377348a1e4ef39ff2cd90cd1130483fd01fda5158cacc9",
    "autotuning": "e8add226a00a5a0beb7b02fd5272d8188fa4677f68602d019537eaba965ba157",
    "block_pointers": "504e10483880cf060d321331245fdd50ca5533d2385891b7807bac1793eb88eb",
    "device_specific": "5dd6dc45c4a0c4ffb13143f8d868db665fe28dcb73aaf3d99de57dc0922afeb3",
