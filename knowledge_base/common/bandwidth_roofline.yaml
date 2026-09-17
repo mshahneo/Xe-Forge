@@ -118,6 +118,56 @@ constraints:
       Partial reuse across the two passes is the obvious guess, but it is a guess.
       Do not treat "above peak" as proof of full residency without checking the size.
 
+  - id: bw_redundant_passes_are_free_inside_the_l2_resident_set
+    name: "A redundant pass over the input costs nothing if the RESIDENT set fits L2, and a full DRAM stream if it does not"
+    severity: critical
+    stages: [analysis, algorithmic]
+    description: |
+      Do not count passes. Count the RESIDENT working set, which is a different
+      number from the total footprint:
+
+        resident_bytes = workgroups_resident * bytes_per_workgroup_tile
+
+        workgroups_resident = min(grid_blocks,
+                                  cores * subgroup_slots_per_core / subgroups_per_wg)
+
+      On BMG B580: 20 cores, 64 subgroup slots per core at default GRF (32 at
+      large), 18 MiB L2. If `resident_bytes` fits comfortably in L2, a second or
+      third read of the same tile is an L2 hit and costs almost nothing. If it does
+      not fit, that read is a second full DRAM stream and it is the dominant cost.
+
+      SO THE SAME "3-pass kernel" is either free or 1.5x too slow depending only on
+      the tile size per workgroup. This is what makes pass-counting a bad metric on
+      its own, and it is why the fix for a redundant pass is usually to SHRINK THE
+      TILE PER WORKGROUP rather than to remove the pass.
+
+      MEASURED, three ways, Arc B580 f32 layernorm 4096x4096 (2026-09-17):
+
+      1. Triton's tutorial kernel reads the row THREE times and is not CSE'd — 5
+         `tt.load` in TTGIR, 5 `load.ugm` in the Xe2 ISA, two of them on literally
+         the same address and destination registers. Its one-pass twin has 3 and 3.
+         They time within 0.6%: 0.3397 vs 0.3377 ms. The tile is 16 KB per
+         workgroup, ~40 workgroups resident, ~640 KB resident against 18 MiB. Every
+         re-read hits L2.
+
+      2. THE CONTROL. At 1024x1024 the whole problem is L2-resident, so DRAM is no
+         longer the limit and the extra passes cost real L2 bandwidth right away:
+         tutorial 0.0245 ms vs one-pass 0.0092 ms, a 2.7x difference. Same two
+         kernels, opposite conclusion, only the size changed.
+
+      3. THE FAILURE CASE. The XeGPU layernorm gives 64 rows to one workgroup =
+         1 MB per tile, and all 64 of its workgroups are resident, so ~64 MB is
+         live against 18 MiB. Its second pass over the input is a genuine second
+         DRAM stream. It runs at 49% of peak against Triton's 87%.
+
+      HOW TO USE IT. Before proposing to remove a redundant read, compute
+      `resident_bytes`. If it already fits L2, removing the read will buy almost
+      nothing and the real problem is elsewhere. If it does not fit, prefer the fix
+      that shrinks the per-workgroup tile — that removes the extra DRAM stream AND
+      makes the access contiguous AND raises occupancy, all from one change.
+
+      Full writeup: /data/gta/upstream/triton-layernorm-study/REPORT.md.
+
   - id: bw_do_not_credit_a_win_below_measurement_noise
     name: "Bandwidth-bound kernels sit in a narrow band; require median-of-N and a real margin"
     severity: warning

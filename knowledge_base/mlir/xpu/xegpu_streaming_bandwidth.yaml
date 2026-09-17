@@ -103,10 +103,17 @@ constraints:
       because reads and writes each carry half the traffic.
 
   - id: xegpu_streaming_needs_explicit_cache_hints
-    name: "No pass adds cache hints for you; a read-once stream must say streaming / write_through"
-    severity: warning
+    name: "Cache hints are a LAST resort on a streaming kernel; L1 bypass measured 1.3% SLOWER"
+    severity: info
     stages: [memory_access, device_specific]
     description: |
+      CORRECTED 2026-09-17 — downgraded from warning to info. This entry used to
+      urge explicit hints on every streaming access, on a mechanism argument with
+      no measurement. It has now been A/B timed and it LOST. Read
+      "MEASURED: L1 BYPASS IS A LOSS" below before emitting any cache hint.
+      Do not spend an optimization attempt here. Fix the pass count and the
+      accumulator first.
+
       Do not expect the compiler to classify your traffic. Annotate load_nd /
       store_nd on read-once and write-once data explicitly:
 
@@ -129,15 +136,48 @@ constraints:
       evicts data that would have been. On a kernel that streams more than L2 the
       hint costs nothing and protects any co-resident reuse.
 
-      OBSERVED (Triton/Arc B580): `TritonIntelGPUAnnotateCacheControl` runs in the
-      pipeline and was a complete NO-OP for this kernel — the tt.load/tt.store are
-      byte-identical before and after it, and the final ISA issues
-      `load.ugm.d32x4.a64` / `store.ugm.d32x4.a64` with default caching. Only the
-      kernel-argument loads got hints. So the most bandwidth-relevant annotation
-      on a bandwidth-bound kernel was simply never applied. UNMEASURED: the study
-      did not A/B the hints, because that kernel was already at 87-88% of peak and
-      had no headroom to show a win. Expect the payoff on a kernel that is BELOW
-      the roofline stop line, or that shares L2 with something else.
+      MEASURED: L1 BYPASS IS A LOSS (Arc B580, f32 layernorm 4096x4096, the tuned
+      2-pass XeGPU kernel at 49% of DRAM peak — so it had plenty of headroom, which
+      is exactly the case this entry predicted a win for). Added
+      `l1_hint = <uncached>, l2_hint = <uncached>, l3_hint = <cached>` to both
+      load_nd and `<write_back>` to the store_nd, changed nothing else, 5
+      interleaved reps:
+
+        | variant                   | median      | spread                |
+        |---|---|---|
+        | as-is (no hints)          | 0.597480 ms | 0.597168 - 0.598104   |
+        | + L1-bypass hints         | 0.605280 ms | 0.605228 - 0.605280   |
+
+      1.3% SLOWER, `[ALLCLOSE: TRUE]` 5/5 both ways. Spreads are under 0.001 ms, so
+      this is signal, not noise.
+
+      WHY IT LOST, and when the mechanism argument above still holds. A
+      `load_nd` of `vector<64x16xf32>` takes 16 f32 = 64 B from each of 64 rows.
+      The Xe2 line is 256 B, so each of those 64 B is a QUARTER of a line, and the
+      next three iterations (`%arg4` + 16, + 32, + 48) consume the rest of the same
+      lines. The tile DEPENDS on L1 to amortize one line over four iterations.
+      Bypassing L1 removes exactly that and quadruples the L2 request count. So the
+      rule is narrower than it looked:
+
+        * a tile whose per-row run is SHORTER than a cache line needs L1 -> do NOT
+          bypass, whatever the total footprint;
+        * only a fully contiguous, line-multiple access per lane can afford
+          `<streaming>`/`<uncached>` on L1.
+
+      What I measured was the L1UC_L2UC_L3C policy (Triton's `.cg` equivalent). The
+      `<streaming>` L1 policy was NOT measured separately.
+
+      CONTEXT (Triton/Arc B580, why this looked like a free win). On the softmax
+      study `TritonIntelGPUAnnotateCacheControl` was a byte-for-byte no-op and the
+      ISA kept default caching. That is softmax-specific. On the layernorm kernels
+      the SAME pass fires and stamps `cacheModifier = cg` on EVERY load, reaching
+      the ISA as `load.ugm.d32x4.a64.uc.ca`. Its rule is a reuse analysis whose
+      no-reuse default is `.cg`
+      (`third_party/intel/lib/TritonIntelGPUTransforms/AnnotateCacheControl.cpp`).
+      So Triton does choose L1 bypass deliberately — and it can afford to, because
+      its lanes read 16 contiguous bytes each and its whole workgroup reads one
+      contiguous 16 KB row. Copying the hint without copying the access shape is
+      what loses.
 
   - id: xegpu_streaming_boundary_check_false_on_both_load_and_store
     name: "When the tile divides the shape, turn boundary_check off on the STORE too, not just the load"
@@ -282,6 +322,53 @@ constraints:
       shapes — i.e. exactly num_warps * 4 B, flat in the row length (1024 to 8192
       elements). Barrier count was 12 at every size. SLM never limited occupancy.
 
+  - id: xegpu_loop_accumulator_must_not_round_trip_slm
+    name: "A loop-carried accumulator belongs in an iter_arg, not in an SLM alloca re-read every iteration"
+    severity: critical
+    stages: [analysis, algorithmic, memory_access]
+    description: |
+      ANALYSIS TRIGGER: an `xegpu.load_matrix` and an `xegpu.store_matrix` on the
+      SAME `memref.alloca(...) : memref<..., 3>` inside the SAME scf.for body is a
+      loop-carried accumulator living in shared local memory. Report
+      issue_type: redundant_computation, stage: algorithmic.
+
+      FIX: make it an `iter_args` on the scf.for and delete the alloca, the
+      load_matrix and the store_matrix. One `store_matrix` after the loop, if the
+      value still has to cross subgroups at all. This is the streaming-kernel twin
+      of the DPAS register-accumulator rule.
+
+      HOW TO CHECK IT FITS, mechanically. Per-subgroup registers held by an
+      accumulator of type `vector<RxC x f32>` under
+      `#xegpu.layout<sg_layout=[a,b], sg_data=[r,c]>` is `r*c` f32 = `r*c/16`
+      SIMD16 registers. Compare against 128 (default GRF) or 256 (large GRF), and
+      against the rest of the loop's live state — see
+      xegpu_grf_budget_loop_accumulators. If it fits, SLM is pure overhead.
+
+      MEASURED INSTANCE (Arc B580, f32 layernorm 4096x4096, the tuned 2-pass
+      kernel). Loop 1 carried BOTH running sums in `memref<64x16xf32, 3>` allocas
+      and re-read them every iteration:
+
+        xegpu.load_nd      %7[%0, %arg4]         -> vector<64x16xf32>   4 KB global
+        xegpu.load_matrix  %9[0, 0]              -> vector<64x16xf32>   4 KB SLM
+        xegpu.store_matrix %11, %9[0, 0]                               4 KB SLM
+        xegpu.load_matrix  %sum_sq_desc[0, 0]    -> vector<64x16xf32>   4 KB SLM
+        xegpu.store_matrix %sum_sq_new, ...                            4 KB SLM
+
+      256 iterations x 16 KB = 4 MB of SLM traffic PER WORKGROUP, 256 MB across the
+      grid — as much as the DRAM traffic, to carry two scalars per row. And it fit
+      in registers all along: `sg_data = [8, 16]` is 8*16 = 128 f32 = 8 SIMD16
+      registers per subgroup per accumulator, against a 128-register budget.
+
+      Same kernel's Triton counterpart carries the identical two sums in registers
+      and touches SLM ONCE, for the cross-subgroup combine only: 4
+      `store.slm.d32.a32` + 2 `load.slm.d32.a32`, `shared_bytes = 128` (32 warps
+      x 4 B), flat in the row length. Triton is 1.77x faster on this shape.
+
+      WHY IT HAPPENS: the base Linalg->XeGPU-WG lowering emits a memory-carried
+      accumulator. It is not a choice anyone made — it is the default shape that
+      arrives, so it has to be looked for explicitly. Full writeup:
+      /data/gta/upstream/triton-layernorm-study/REPORT.md.
+
   - id: xegpu_online_softmax_still_reads_twice_unless_the_row_is_register_resident
     name: "Two-loop online softmax reads the input twice; only a register-resident row cuts it to one"
     severity: critical
@@ -350,6 +437,39 @@ constraints:
       threads, not subgroup lanes — spread the row over many subgroups and even
       N=8192 is cheap (8192/512 = 16 f32/lane). Measured: no GRF spills at 128 GRF
       for N=4096 with 256 threads. See also xegpu_grf_budget_loop_accumulators.
+
+      CONFIRMED ON LAYERNORM, 2026-09-17, Arc B580. Same finding, second kernel,
+      so this is a shape rule and not a softmax quirk. The tuned 2-pass XeGPU
+      layernorm still column-tiles 64 rows and loops, and Triton with one row per
+      workgroup beats it everywhere:
+
+        | shape      | Triton best | XeGPU 2-pass | Triton is | Triton %peak | XeGPU %peak |
+        |---|---|---|---|---|---|
+        | 1024x1024  | 0.0092 ms   | 0.031616 ms  | 3.45x | L2-resident | 58% |
+        | 1024x4096  | 0.0783 ms   | 0.107848 ms  | 1.38x | 88% | 68% |
+        | 1024x16384 | 0.3386 ms   | 0.721240 ms  | 2.13x | 87% | 41% |
+        | 4096x4096  | 0.3377 ms   | 0.597792 ms  | 1.77x | 87% | 49% |
+
+      REGISTER PRESSURE, stronger evidence than before: Triton holds 16 f32 PER LANE
+      at N=16384 (1024 threads, SIMD32) with n_regs=128 and n_spills=0. A whole row
+      in registers does not spill even at 16K. Stop declining this fix on spill
+      grounds.
+
+      NEW AND IMPORTANT — THIS IS ALSO THE NUMERICALLY STABLE WAY TO SAVE THE PASS.
+      For layernorm there are two ways to get from 3 passes to 2:
+        (a) switch the variance formula to `var = E[x^2] - E[x]^2` — one pass over
+            the input, and UNSTABLE in f32. It fails ALLCLOSE on off-center input.
+        (b) keep the row in registers and do BOTH statistics off the registers —
+            `mean = sum(x)/N` then `var = sum((x-mean)^2)/N`. Same single global
+            read, no cancellation.
+      (b) is the fix. (a) is the trap, and a hard-coded shift constant read out of
+      the harness fill range is the same trap wearing a disguise. Triton's
+      one-pass kernel does (b) and measures max_abs_err 1.24e-05 to 1.31e-05 against
+      an f64 reference at all four shapes — indistinguishable from torch. So
+      register residency buys the pass AND the accuracy at once; do not trade one
+      for the other.
+
+      Full layernorm writeup: /data/gta/upstream/triton-layernorm-study/REPORT.md.
 
   - id: xegpu_large_grf_is_not_a_lever_for_bandwidth_bound_kernels
     name: "Do not spend the large-GRF flag on a bandwidth-bound kernel; it measures as noise"
@@ -528,11 +648,25 @@ patterns:
     name: "Tag read-once loads <streaming> and write-once stores <write_through> so the stream does not evict L2"
     stage: memory_access
     precondition: |
-      APPLIES when the kernel's total footprint (bytes read + bytes written)
-      EXCEEDS L2 (18 MiB on BMG) and the data has no reuse. Check the footprint
-      first — see bw_working_set_must_exceed_l2_or_measurement_is_not_dram. If the
-      whole working set fits in L2, <cached> is correct and this pattern is WRONG:
-      you want the second pass to hit.
+      MEASURED A LOSS ON THE ONE KERNEL A/B'd — 1.3% slower on layernorm 4096x4096.
+      Read xegpu_streaming_needs_explicit_cache_hints first. Try this LAST, after
+      the pass count, the accumulator and the launch geometry are settled, and only
+      when BOTH conditions below hold.
+
+      CONDITION 1 — footprint. The kernel's total footprint (bytes read + bytes
+      written) EXCEEDS L2 (18 MiB on BMG) and the data has no reuse. Check the
+      footprint first — see bw_working_set_must_exceed_l2_or_measurement_is_not_dram.
+      If the whole working set fits in L2, <cached> is correct and this pattern is
+      WRONG: you want the second pass to hit.
+
+      CONDITION 2 — per-lane run length, and this is the one that killed it.
+      Each lane's contiguous run must be at least one 256 B cache line's worth
+      across the subgroup, i.e. the access must consume whole lines in one send. If
+      the tile takes a SHORT run from each of many rows — `vector<64x16xf32>` takes
+      64 B from each of 64 rows, a quarter line each — then L1 is what merges the
+      next three iterations into those same lines, and bypassing it quadruples the
+      L2 request count. Do NOT apply. Fix the tile shape first; then this pattern
+      becomes safe and roughly neutral.
 
       Do NOT apply to an operand that other subgroups re-read (use
       xegpu_cache_hint_on_load with <cached>), and do NOT apply a read-only policy
@@ -559,16 +693,25 @@ patterns:
       xegpu.store_nd %out, %out_tile[%row, %c0]
         <{l1_hint = #xegpu.cache_hint<write_through>, l2_hint = #xegpu.cache_hint<write_through>}>
         : vector<8x64xf32>, !xegpu.tensor_desc<8x64xf32, #out>
-    expected_speedup: "1.0-1.15x; largest when the kernel shares L2 with reused data, ~1.0x at the roofline"
+    expected_speedup: "0.987x MEASURED on layernorm 4096x4096 (a loss); at best ~1.0x when both preconditions hold"
     applies_to: ["any_read_once_load", "any_write_once_store", "softmax", "layernorm", "elementwise", "copy"]
     notes: |
-      PROVENANCE: OBSERVED-AS-MISSING, not measured. Triton's
-      TritonIntelGPUAnnotateCacheControl pass was a byte-for-byte no-op on the
-      softmax data path, leaving default caching in the Xe2 ISA. The study did not
-      A/B the hints because that kernel was already at 87-88% of DRAM peak, where
-      no cache change can show up. So this is a HYPOTHESIS with a clear mechanism,
-      not a confirmed win — the verifier must time it, and it is expected to be
-      neutral on any kernel already at the roofline.
+      PROVENANCE: MEASURED AND IT LOST. 2026-09-17, Arc B580, the tuned 2-pass
+      XeGPU layernorm at 4096x4096: 0.597480 ms without hints, 0.605280 ms with
+      L1UC_L2UC_L3C on the loads and write_back on the store. 5 interleaved reps,
+      spreads under 0.001 ms, `[ALLCLOSE: TRUE]` 5/5. The kernel was at 49% of DRAM
+      peak, so lack of headroom is NOT the explanation — the tile shape is. Full
+      writeup and the mechanism: /data/gta/upstream/triton-layernorm-study/REPORT.md.
+
+      The earlier text called this a hypothesis with a clear mechanism, based on
+      Triton's AnnotateCacheControl pass being a no-op on softmax. That pass is NOT
+      a no-op on layernorm: it stamps `cacheModifier = cg` on every load. So Triton
+      does pick L1 bypass on purpose, and it still lost when copied here, because
+      Triton pairs it with a fully contiguous 16 KB per-workgroup read.
+
+      RANK IT LAST. On this kernel the pass count was worth 1.2-1.5x and the
+      accumulator round-trip was worth 4 MB of SLM traffic per workgroup. A 1.3%
+      cache-hint loss is not where the attempt budget should go.
 
   - id: xegpu_unpredicated_stream_via_loop_versioning
     name: "Version the kernel on divisibility and drop boundary_check on BOTH the load and the store"

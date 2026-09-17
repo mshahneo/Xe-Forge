@@ -63,6 +63,51 @@ constraints:
       that: threads = min(row_len / 8, 512). See
       xegpu_row_per_subgroup_single_read_softmax for the measured grid.
 
+  - id: xegpu_launch_must_fill_the_subgroup_slots
+    name: "Compute the occupancy number and report it: grid_blocks * subgroups_per_block must reach cores * slots_per_core"
+    severity: critical
+    stages: [analysis, algorithmic, device_specific]
+    description: |
+      ANALYSIS TRIGGER: read grid_blocks and threads_per_block off gpu.launch_func.
+      supplied = grid_blocks * threads_per_block / 16. slots = 1280 (BMG B580,
+      default GRF; 640 at large GRF). REPORT AN ISSUE WHEN supplied < 1150, as
+      issue_type: suboptimal_warps, stage: algorithmic, quoting supplied and slots.
+
+      Do NOT skip this because the geometry "looks deliberate" — it is the
+      lowering's default, not a decision.
+
+      A ceiling rule tells you what you MAY spend. This is the check that says what
+      you ARE spending, which is the part that gets skipped. Two ways to fail it,
+      and they need different fixes:
+
+        * threads_per_block too small -> raise `threads in (...)`, raise the
+          sg_layout product to match, shrink sg_data.
+        * grid_blocks too small (a fat per-workgroup tile) -> shrink the tile.
+          Raising threads alone leaves the tile fat, which costs L2 residency —
+          see bw_redundant_passes_are_free_inside_the_l2_resident_set.
+      Prefer shrinking the tile. It fixes occupancy, contiguity and L2 residency at
+      once.
+
+      MEASURED INSTANCE (Arc B580, f32 layernorm 4096x4096, 2026-09-17):
+
+        | | XeGPU 2-pass | Triton one-pass |
+        |---|---|---|
+        | grid_blocks | 64 (= M/64) | 4096 (= M) |
+        | threads per block | 128 | 1024 |
+        | subgroups per block | 8 | 32 (SIMD32) |
+        | supplied subgroups | 512 | 131072 |
+        | occupancy | **40%** | **100%** |
+        | elements per work-item | 2048 | 4 |
+        | time | 0.597792 ms, 49% of peak | 0.3377 ms, 87% of peak |
+
+      60% of the machine sat idle. This kernel had already been through a full
+      Xe-Forge sweep with the GRF/thread ceiling rule present in the prompt
+      (verified in the log: nothing evicted), and it still shipped 128 threads at
+      every one of four shapes. The ceiling was read and declined. A number to
+      compute and compare is harder to decline than a limit to respect.
+
+      Full writeup: /data/gta/upstream/triton-layernorm-study/REPORT.md.
+
   - id: xegpu_propagate_dpas_layout_epilogue
     name: Keep the DPAS accumulator layout through the elementwise epilogue — no intermediate relayouts
     severity: warning

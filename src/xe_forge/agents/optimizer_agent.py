@@ -1602,7 +1602,20 @@ class OptimizerAgent(Optimizer):
     #
     # memory_access and device_specific still get cut; they hold many entries
     # that are alternatives to each other, not halves of one fix.
-    KB_CONTEXT_BUDGET = 46000
+    #
+    # RAISED 46000 -> 56000 on 2026-09-17, for the same reason as last time. The
+    # layernorm-vs-Triton study added two critical constraints the algorithmic
+    # stage has to see — xegpu_loop_accumulator_must_not_round_trip_slm and
+    # xegpu_launch_must_fill_the_subgroup_slots — and at 46000 both were dropped,
+    # so the lesson could never reach the stage that does the rewrite. algorithmic
+    # renders 53442 chars in full, so 56000 fits it whole with margin.
+    #
+    # This cannot keep working. Entries average ~2700 chars because each one
+    # carries its full measurement history, and the totals are now algorithmic
+    # 53442, memory_access 73052, device_specific 87715. The next raise should be
+    # a TRIM instead: move provenance tables out of `description` so the prompt
+    # gets the rule and the humans keep the record.
+    KB_CONTEXT_BUDGET = 56000
     # Constraints are offered to the budget in this order. Unknown -> last.
     _KB_SEVERITY_ORDER: ClassVar[dict[str, int]] = {
         "critical": 0,
