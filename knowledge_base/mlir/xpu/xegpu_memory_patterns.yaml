@@ -37,6 +37,50 @@ constraints:
       passes it. It is the second way to write a prefetch that cannot help. Always
       check the offset too: xegpu_prefetch_must_lead_the_load.
 
+  - id: xegpu_load_a_1d_operand_as_a_1xn_rank2_tile
+    name: "A 1-D operand must be loaded as a 1xN rank-2 tile — a rank-1 tensor_desc CRASHES the compiler"
+    severity: critical
+    stages: [algorithmic, memory_access, device_specific, fusion]
+    tags: [rank, tensor_desc, load_nd, layer-norm, gamma, beta, bias, compiler-crash]
+    precondition: |
+      APPLIES when the kernel loads a 1-D `memref<Nxf32>` — a per-column gamma,
+      beta or bias vector — and you want it as a block load instead of a gather.
+    description: |
+      Do NOT build a rank-1 tile. This aborts imex-opt:
+
+        %d = xegpu.create_nd_tdesc %arg2 : memref<4096xf32>
+             -> !xegpu.tensor_desc<4096xf32, ...>
+        %v = xegpu.load_nd %d[%c0] : !xegpu.tensor_desc<4096xf32, ...>
+             -> vector<4096xf32>
+
+      It is not a diagnostic. It is an assertion failure inside
+      `setupLoadNdAnchorLayout`, reached from `XeGPUPropagateLayoutPass`:
+      `SmallVector.h:300 ... Assertion idx < size()`. The pass indexes the tile's
+      second dimension without checking that there is one.
+
+      Expand to rank 2 instead, and load straight into the shape you need:
+
+        %g2 = memref.expand_shape %arg2 [[0, 1]] output_shape [1, 4096]
+              : memref<4096xf32> into memref<1x4096xf32>
+        %d  = xegpu.create_nd_tdesc %g2 : memref<1x4096xf32>
+              -> !xegpu.tensor_desc<1x4096xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+        %v  = xegpu.load_nd %d[%c0, %c0] : !xegpu.tensor_desc<1x4096xf32, ...>
+              -> vector<1x4096xf32>
+
+      Loading `vector<1x4096xf32>` directly also DROPS the `vector.broadcast` that
+      a rank-1 load needs to reach the row shape. Fewer ops, and it matches the
+      row tile a row-resident kernel already works in.
+    verification: |
+      Offline, no GPU:
+      `imex-opt <file> --gpu-lower-to-xevm-pipeline="xegpu-op-level=workgroup"`.
+      The assert fires before any code is generated.
+    measured_impact: |
+      Blocked the row-resident 4096x4096 layer-norm rewrite, 2026-09-17. The
+      rewrite was otherwise correct and is worth 2.28x-2.35x over the 3-pass
+      baseline. Changing only the two gamma/beta loads to rank-2 made it compile
+      and pass [ALLCLOSE: TRUE]. Softmax never hit this because it has no
+      gamma/beta.
+
   - id: xegpu_contiguous_2d_block_load
     name: load_nd tiles should map to contiguous 2D block loads
     severity: high

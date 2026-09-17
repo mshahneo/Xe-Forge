@@ -484,6 +484,17 @@ class MlirOptimizationSignature(dspy.Signature):
     from the module, make it unique, and write `UNCHANGED` in `optimized_code`.
     Re-emitting the whole module corrupts unrelated syntax and wastes the attempt.
     Use `optimized_code` only for a restructuring too large to express as anchors.
+
+    === REPLACING THE WHOLE KERNEL BODY ===
+    To remove code, DELETE it. Two ways of neutralizing it in place both fail:
+    - `/* ... */` is not MLIR. The dialect has NO block comments. A comment needs
+      its own `//` on every line. A `/*` makes the module unparseable.
+    - `scf.if %false { <old body> }` does not hide anything. The XeGPU passes
+      still walk the dead region and still need a layout for every op inside it.
+      A dead `vector.multi_reduction` in there aborts the compiler.
+    Swapping the body IS one anchored edit. Set `old` to the first line of the
+    body through the last line before `gpu.return`, and `new` to the whole new
+    body. One edit, no leftovers, nothing to hide.
     """
 
     original_code: str = dspy.InputField(desc="Original MLIR module for reference")
@@ -562,6 +573,22 @@ class MlirAlgorithmicOptimizationSignature(dspy.Signature):
     Removing duplicated work is a normal algorithmic fix, and the duplicate lines
     make an anchor non-unique. Do not give up on the edit for that reason. Set
     `"all": true` to change every match, or `"occurrence": N` to pick one.
+
+    === REPLACING THE WHOLE KERNEL BODY ===
+    Re-decomposing a kernel usually means the old body goes away entirely. To
+    remove code, DELETE it. Two ways of neutralizing it in place both fail:
+    - `/* ... */` is not MLIR. The dialect has NO block comments. A comment needs
+      its own `//` on every line. A `/*` makes the module unparseable.
+    - `scf.if %false { <old body> }` does not hide anything. The XeGPU passes
+      still walk the dead region and still need a layout for every op inside it.
+      A dead `vector.multi_reduction` in there aborts the compiler.
+    Swapping the body IS one anchored edit. Set `old` to the first line of the
+    body through the last line before `gpu.return`, and `new` to the whole new
+    body. One edit, no leftovers, nothing to hide.
+
+    A rewrite this size is worth the attempt. The row-resident layer-norm that
+    reached 2.35x was written as exactly this edit, and both failures above are
+    what stopped it landing.
     """
 
     original_code: str = dspy.InputField(desc="Original MLIR module for reference")

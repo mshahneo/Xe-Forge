@@ -48,21 +48,21 @@
   }
  },
  "mlir/xpu": {
-  "constraints": 39,
+  "constraints": 40,
   "examples": 1,
   "patterns": 24,
   "stage_context_sha256": {
-   "algorithmic": "e6d5bfc6398e84f7c79a67e3472135aedb006e7c83f94c8351a3c5e4bcd16c74",
-   "analysis": "6cb9f31e17c5f0da7fa9bbbbbcc9e3962ed296dfb0df39c8d13d28e58e6a7438",
+   "algorithmic": "528b964cc1696ba577bcca790a0bb6affbf488671d9c155a4452e6d9d1282c42",
+   "analysis": "0e37f89ae697a53916430701460f7448ed944f320ef054c85f1e6dca1c58bb68",
    "autotuning": "5ae0750eb52794c1d1416b8b890f0384b17792962288d173be28ceed52764fb7",
    "block_pointers": "249dc66db276d21a4de59574320f2065b1589e426632e1d2ddd8cf434bd8d00c",
-   "device_specific": "18e122750881e9257c0dfdf05f20b596e5533a6565cbb101920ef270ab4be2e7",
+   "device_specific": "d60a39ecaef2a4468dce2a1f9bac883d312c27e5461e7e95e92955f7010db2ee",
    "discovery": "31288646fc65a45094f3cb5bb7c09b1f2a7db4be4c83858fd1a21d0f4a95ade0",
    "dtype_fix": "619701678a7352854216951167f75fc22299d1bde63343a81384d7a47a4772c1",
-   "fusion": "994ac98813f98bbb792b835d80d52777af623186f072038bf6db766c6e8c3c10",
+   "fusion": "80b7977ef38faceb01004415277b7257171d4fd761f39dbeded6efd45a0367d3",
    "grf_sweep": "c3cd70110fa445a7661a284f7c31eec3898573c7cf5fabad78cb13d8639e9a87",
    "linalg_lowering": "b0b02dc1ba04466604cc9540fbd9c394ef1f4b11cf9f6076a9cf894fe24e5ed4",
-   "memory_access": "36d4ded9f85df08e23325dc794f9a74f53bf7755defcbeac137ee3138ee0f518",
+   "memory_access": "68797287e99edb1369d8b030cb38b11217a6d8b642de5b45ae667930c09955ba",
    "persistent_kernel": "cf77a448d46a6ff65ed11e8da9b2f41bf68edc03b9167c0e32eb817f73ceefc5"
   },
   "stage_pattern_counts": {
