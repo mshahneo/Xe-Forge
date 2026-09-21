@@ -103,81 +103,84 @@ constraints:
       because reads and writes each carry half the traffic.
 
   - id: xegpu_streaming_needs_explicit_cache_hints
-    name: "Cache hints are a LAST resort on a streaming kernel; L1 bypass measured 1.3% SLOWER"
-    severity: info
+    name: "Choose the L1 cache hint PER OPERAND: bypass the streamed input, keep L1 on any re-read operand"
+    severity: warning
     stages: [memory_access, device_specific]
+    precondition: |
+      APPLIES when the kernel's loads have DIFFERENT reuse but all carry the SAME
+      cache hint, or none at all. Report it as issue_type: cache_eviction_risk,
+      stage memory_access.
+
+      The shape to look for: one big streamed input read once, plus one or more
+      small operands that many workgroups re-read (gamma/beta, a shared table, a
+      bias vector). Flag it either way round — no hints anywhere, or one blanket
+      policy stamped on every load. The blanket policy is the mistake, not the fix.
+
+      Do NOT apply until the access consumes whole cache lines — see the SHAPE
+      PRECONDITION below. On a tile that takes a short run from each of many rows,
+      bypassing L1 loses.
     description: |
-      CORRECTED 2026-09-17 — downgraded from warning to info. This entry used to
-      urge explicit hints on every streaming access, on a mechanism argument with
-      no measurement. It has now been A/B timed and it LOST. Read
-      "MEASURED: L1 BYPASS IS A LOSS" below before emitting any cache hint.
-      Do not spend an optimization attempt here. Fix the pass count and the
-      accumulator first.
+      Pick the L1 hint separately for each load, from that operand's reuse. One
+      policy for the whole kernel is wrong in one direction or the other.
 
-      Do not expect the compiler to classify your traffic. Annotate load_nd /
-      store_nd on read-once and write-once data explicitly:
+        | operand                              | l1_hint          | l2_hint  |
+        |---|---|---|
+        | streamed input, read once            | <uncached>       | <cached> |
+        | re-read by other workgroups          | <cached>         | <cached> |
+        | write-once output store              | <write_through> or <uncached> |
 
-        read-once  input  -> l1_hint = <streaming>, l2_hint = <streaming>
-                             (or <uncached>; `streaming` is READ-ONLY in XeGPU)
-        write-once output  -> l1_hint = <write_through>, l2_hint = <write_through>
-                             (or <uncached>; both are WRITE-ONLY policies)
-        reused     operand -> l1_hint = <cached>, l2_hint = <cached>
-                             (that is the DIFFERENT rule xegpu_cache_hint_on_load;
-                              do not apply <cached> to streaming data)
+      On the streaming load only, that is one line:
+        <{l1_hint = #xegpu.cache_hint<uncached>, l2_hint = #xegpu.cache_hint<cached>}>
+
+      CORRECTED 2026-09-21. This entry used to say "L1 bypass measured 1.3%
+      SLOWER, treat it as a last resort". That was too broad. The 1.3% was real but
+      BLENDED — it came from stamping one policy on every operand at once, so a
+      gain on one operand and a loss on another cancelled. Measured per operand,
+      the sign flips.
+
+      MEASURED (Arc B580, f32 layernorm 4096x4096, row-resident kernel, median of
+      21 reps, DRAM peak 456 GB/s, `[ALLCLOSE: TRUE]` on every variant):
+
+        | variant                              | median    | % peak |
+        |---|---|---|
+        | input L1-bypass ONLY                 | 0.3180 ms | 92.6%  |
+        | no hints (default, all L1-cached)    | 0.3283 ms | 89.7%  |
+        | gamma/beta L1-bypass                 | 0.3493 ms | 84.3%  |
+        | all three bypassed                   | 0.3479 ms | 84.6%  |
+
+      Bypassing the input is worth +3.1%. Bypassing gamma/beta costs -6.4%.
+
+      WHY THE SIGN FLIPS. gamma and beta are 16 KB each and every one of the 4096
+      rows re-reads them, so in L1 they are hits; marked <uncached> every read goes
+      to L2. The input is pure streaming, so holding it in L1 only evicts the
+      gamma/beta lines worth keeping. Same argument one level down: an 18 MiB L2
+      full of never-re-read data evicts data that would have been reused.
+
+      SHAPE PRECONDITION — this is what made the OLD kernel lose. Only bypass L1
+      when the access consumes whole cache lines. A `vector<64x16xf32>` tile takes
+      16 f32 = 64 B from each of 64 rows, a quarter of the 256 B Xe2 line, and L1
+      is what merges the next three iterations into those same lines; bypassing it
+      quadruples the L2 request count. A row-resident kernel reading one whole
+      contiguous row does not have this problem. Fix the tile shape first, then the
+      hint pays.
 
       Legal XeGPU cache_hint values and their direction:
         cached (r/w), uncached (r/w), streaming (read only),
         read_invalidate (read only), write_back (write only),
         write_through (write only).
-      Using a read-only policy on a store, or a write-only policy on a load, is
-      invalid IR — check the direction before emitting.
+      A read-only policy on a store, or a write-only policy on a load, is invalid
+      IR. `<streaming>` has never been A/B'd against `<uncached>` on L1.
 
-      WHY IT MATTERS: an 18 MiB L2 filled with data that will never be re-read
-      evicts data that would have been. On a kernel that streams more than L2 the
-      hint costs nothing and protects any co-resident reuse.
-
-      MEASURED: L1 BYPASS IS A LOSS (Arc B580, f32 layernorm 4096x4096, the tuned
-      2-pass XeGPU kernel at 49% of DRAM peak — so it had plenty of headroom, which
-      is exactly the case this entry predicted a win for). Added
-      `l1_hint = <uncached>, l2_hint = <uncached>, l3_hint = <cached>` to both
-      load_nd and `<write_back>` to the store_nd, changed nothing else, 5
-      interleaved reps:
-
-        | variant                   | median      | spread                |
-        |---|---|---|
-        | as-is (no hints)          | 0.597480 ms | 0.597168 - 0.598104   |
-        | + L1-bypass hints         | 0.605280 ms | 0.605228 - 0.605280   |
-
-      1.3% SLOWER, `[ALLCLOSE: TRUE]` 5/5 both ways. Spreads are under 0.001 ms, so
-      this is signal, not noise.
-
-      WHY IT LOST, and when the mechanism argument above still holds. A
-      `load_nd` of `vector<64x16xf32>` takes 16 f32 = 64 B from each of 64 rows.
-      The Xe2 line is 256 B, so each of those 64 B is a QUARTER of a line, and the
-      next three iterations (`%arg4` + 16, + 32, + 48) consume the rest of the same
-      lines. The tile DEPENDS on L1 to amortize one line over four iterations.
-      Bypassing L1 removes exactly that and quadruples the L2 request count. So the
-      rule is narrower than it looked:
-
-        * a tile whose per-row run is SHORTER than a cache line needs L1 -> do NOT
-          bypass, whatever the total footprint;
-        * only a fully contiguous, line-multiple access per lane can afford
-          `<streaming>`/`<uncached>` on L1.
-
-      What I measured was the L1UC_L2UC_L3C policy (Triton's `.cg` equivalent). The
-      `<streaming>` L1 policy was NOT measured separately.
-
-      CONTEXT (Triton/Arc B580, why this looked like a free win). On the softmax
-      study `TritonIntelGPUAnnotateCacheControl` was a byte-for-byte no-op and the
-      ISA kept default caching. That is softmax-specific. On the layernorm kernels
-      the SAME pass fires and stamps `cacheModifier = cg` on EVERY load, reaching
-      the ISA as `load.ugm.d32x4.a64.uc.ca`. Its rule is a reuse analysis whose
-      no-reuse default is `.cg`
-      (`third_party/intel/lib/TritonIntelGPUTransforms/AnnotateCacheControl.cpp`).
-      So Triton does choose L1 bypass deliberately — and it can afford to, because
-      its lanes read 16 contiguous bytes each and its whole workgroup reads one
-      contiguous 16 KB row. Copying the hint without copying the access shape is
-      what loses.
+      THIS HINT IS WHY XE-FORGE BEAT TRITON at layernorm 4096x4096 — 0.3180 ms
+      against 0.3377 ms. At a MATCHED cache policy Triton is still 3.0% ahead, so
+      the whole margin is this one choice. Triton's
+      `tritonintelgpu-annotate-cache-control` runs ONE reuse analysis and applies
+      one answer (`.uc.ca`) to every operand
+      (`third_party/intel/lib/TritonIntelGPUTransforms/AnnotateCacheControl.cpp`),
+      so it collects the input gain and pays the gamma/beta cost. Per-operand hints
+      are a win neither compiler takes today. That pass is a byte-for-byte no-op on
+      softmax, which is why the softmax study saw no hints at all — softmax has no
+      re-read operand.
 
   - id: xegpu_streaming_boundary_check_false_on_both_load_and_store
     name: "When the tile divides the shape, turn boundary_check off on the STORE too, not just the load"
@@ -645,73 +648,80 @@ patterns:
       saturate BMG DRAM; the speedup range above is the cost of NOT doing it.
 
   - id: xegpu_streaming_cache_hints_read_once_write_once
-    name: "Tag read-once loads <streaming> and write-once stores <write_through> so the stream does not evict L2"
+    name: "Bypass L1 on the streamed input ONLY; leave every re-read operand L1-cached"
     stage: memory_access
     precondition: |
-      MEASURED A LOSS ON THE ONE KERNEL A/B'd — 1.3% slower on layernorm 4096x4096.
-      Read xegpu_streaming_needs_explicit_cache_hints first. Try this LAST, after
-      the pass count, the accumulator and the launch geometry are settled, and only
-      when BOTH conditions below hold.
+      MEASURED +3.1% when applied to the streamed input alone, and -6.4% when
+      applied to the re-read operands too. Read
+      xegpu_streaming_needs_explicit_cache_hints for the numbers. Apply it ONLY to
+      the load of the big read-once input, and only when BOTH conditions hold.
 
       CONDITION 1 — footprint. The kernel's total footprint (bytes read + bytes
-      written) EXCEEDS L2 (18 MiB on BMG) and the data has no reuse. Check the
+      written) EXCEEDS L2 (18 MiB on BMG) and that input has no reuse. Check the
       footprint first — see bw_working_set_must_exceed_l2_or_measurement_is_not_dram.
       If the whole working set fits in L2, <cached> is correct and this pattern is
       WRONG: you want the second pass to hit.
 
-      CONDITION 2 — per-lane run length, and this is the one that killed it.
-      Each lane's contiguous run must be at least one 256 B cache line's worth
-      across the subgroup, i.e. the access must consume whole lines in one send. If
-      the tile takes a SHORT run from each of many rows — `vector<64x16xf32>` takes
-      64 B from each of 64 rows, a quarter line each — then L1 is what merges the
-      next three iterations into those same lines, and bypassing it quadruples the
-      L2 request count. Do NOT apply. Fix the tile shape first; then this pattern
-      becomes safe and roughly neutral.
+      CONDITION 2 — per-lane run length. The access must consume whole 256 B cache
+      lines in one send. If the tile takes a SHORT run from each of many rows —
+      `vector<64x16xf32>` takes 64 B from each of 64 rows, a quarter line each —
+      then L1 is what merges the next three iterations into those same lines, and
+      bypassing it quadruples the L2 request count. Do NOT apply; fix the tile
+      shape first. A row-resident kernel that loads one whole contiguous row passes
+      this condition.
 
-      Do NOT apply to an operand that other subgroups re-read (use
-      xegpu_cache_hint_on_load with <cached>), and do NOT apply a read-only policy
-      (<streaming>, <read_invalidate>) to a store or a write-only policy
-      (<write_through>, <write_back>) to a load — that is invalid IR.
+      NEVER apply it to an operand other workgroups re-read (gamma, beta, a shared
+      table) — that is the -6.4% case; leave those <cached>. Never apply a
+      read-only policy (<streaming>, <read_invalidate>) to a store or a write-only
+      policy (<write_through>, <write_back>) to a load — that is invalid IR.
     description: |
-      Annotate the streaming ends of the kernel explicitly. Loads of read-once
-      input get l1/l2 `<streaming>`; stores of write-once output get
-      `<write_through>` (or `<uncached>`). Leave `<cached>` for genuinely reused
-      tiles. Prefetches, if any, should carry the same policy as the load they
-      feed.
+      Annotate the streamed input load with `l1_hint = <uncached>, l2_hint =
+      <cached>`: skip the L1 that cannot help it, still let L2 absorb it. Leave
+      every re-read operand on the default `<cached>`. Stores of write-once output
+      get `<write_through>` (or `<uncached>`). Prefetches, if any, carry the same
+      policy as the load they feed.
+
+      The point is the CONTRAST between operands. One blanket policy across all
+      loads is what loses.
     rationale: |
-      Default caching pulls every streamed line into L1/L2 and holds it, so a
-      kernel larger than L2 spends the whole cache on data it will never read
-      again. Marking the stream lets the hierarchy keep whatever DOES have reuse,
-      and costs nothing on the streamed path itself.
+      L1 is small and shared. Filling it with a stream that is never re-read evicts
+      the small operands every workgroup does re-read. Bypassing L1 on the stream
+      keeps those lines resident, which is why the win shows up on the OTHER loads
+      rather than on the annotated one. L2 still buffers the stream, so the stream
+      itself loses nothing.
     pattern_before: |
-      %in = xegpu.load_nd  %in_tile[%row, %c0]  : !xegpu.tensor_desc<8x64xf32, #in> -> vector<8x64xf32>
-      xegpu.store_nd %out, %out_tile[%row, %c0] : vector<8x64xf32>, !xegpu.tensor_desc<8x64xf32, #out>
+      // one policy everywhere, or none: both leave the contrast unexploited
+      %x  = xegpu.load_nd %x_tile[%row, %c0]  : !xegpu.tensor_desc<1x4096xf32, #in> -> vector<1x4096xf32>
+      %g  = xegpu.load_nd %g_tile[%c0, %c0]   : !xegpu.tensor_desc<1x4096xf32, #in> -> vector<1x4096xf32>
     pattern_after: |
-      %in = xegpu.load_nd %in_tile[%row, %c0]
-        <{l1_hint = #xegpu.cache_hint<streaming>, l2_hint = #xegpu.cache_hint<streaming>}>
-        : !xegpu.tensor_desc<8x64xf32, #in> -> vector<8x64xf32>
+      // streamed input: skip L1. re-read gamma: keep L1 (no hint = <cached>).
+      %x  = xegpu.load_nd %x_tile[%row, %c0]
+        <{l1_hint = #xegpu.cache_hint<uncached>, l2_hint = #xegpu.cache_hint<cached>}>
+        : !xegpu.tensor_desc<1x4096xf32, #in> -> vector<1x4096xf32>
+      %g  = xegpu.load_nd %g_tile[%c0, %c0]   : !xegpu.tensor_desc<1x4096xf32, #in> -> vector<1x4096xf32>
       xegpu.store_nd %out, %out_tile[%row, %c0]
         <{l1_hint = #xegpu.cache_hint<write_through>, l2_hint = #xegpu.cache_hint<write_through>}>
-        : vector<8x64xf32>, !xegpu.tensor_desc<8x64xf32, #out>
-    expected_speedup: "0.987x MEASURED on layernorm 4096x4096 (a loss); at best ~1.0x when both preconditions hold"
+        : vector<1x4096xf32>, !xegpu.tensor_desc<1x4096xf32, #out>
+    expected_speedup: "1.031x MEASURED on the row-resident layernorm 4096x4096 (input only); 0.936x if you also bypass the re-read operands"
     applies_to: ["any_read_once_load", "any_write_once_store", "softmax", "layernorm", "elementwise", "copy"]
     notes: |
-      PROVENANCE: MEASURED AND IT LOST. 2026-09-17, Arc B580, the tuned 2-pass
-      XeGPU layernorm at 4096x4096: 0.597480 ms without hints, 0.605280 ms with
-      L1UC_L2UC_L3C on the loads and write_back on the store. 5 interleaved reps,
-      spreads under 0.001 ms, `[ALLCLOSE: TRUE]` 5/5. The kernel was at 49% of DRAM
-      peak, so lack of headroom is NOT the explanation — the tile shape is. Full
-      writeup and the mechanism: /data/gta/upstream/triton-layernorm-study/REPORT.md.
+      PROVENANCE: MEASURED 2026-09-17, Arc B580, row-resident XeGPU layernorm at
+      4096x4096, median of 21 reps, `[ALLCLOSE: TRUE]` on every variant:
+      0.3283 ms no hints, 0.3180 ms input-only bypass, 0.3493 ms gamma/beta bypass,
+      0.3479 ms all three. The input-only form is 92.6% of the 456 GB/s DRAM peak
+      and BEATS Intel Triton's 0.3377 ms. Full writeup:
+      /data/gta/upstream/triton-layernorm-study/REPORT.md.
 
-      The earlier text called this a hypothesis with a clear mechanism, based on
-      Triton's AnnotateCacheControl pass being a no-op on softmax. That pass is NOT
-      a no-op on layernorm: it stamps `cacheModifier = cg` on every load. So Triton
-      does pick L1 bypass on purpose, and it still lost when copied here, because
-      Triton pairs it with a fully contiguous 16 KB per-workgroup read.
+      SUPERSEDES the earlier "0.987x, a loss" reading. That number came from the
+      2-pass `vector<64x16xf32>` kernel with one policy on every operand and 5 reps.
+      Two things were wrong with it: the tile failed CONDITION 2 above, and the
+      per-operand gain and loss cancelled. Both are fixed by a row-resident tile
+      plus a per-operand hint.
 
-      RANK IT LAST. On this kernel the pass count was worth 1.2-1.5x and the
-      accumulator round-trip was worth 4 MB of SLM traffic per workgroup. A 1.3%
-      cache-hint loss is not where the attempt budget should go.
+      STILL RANK IT AFTER THE BIG WINS. On this kernel the pass count was worth
+      1.2-1.5x and the accumulator round-trip was worth 4 MB of SLM traffic per
+      workgroup. 3% is real and it is the margin over Triton, but it is the last
+      3%, not the first.
 
   - id: xegpu_unpredicated_stream_via_loop_versioning
     name: "Version the kernel on divisibility and drop boundary_check on BOTH the load and the store"

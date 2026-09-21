@@ -53,16 +53,16 @@
   "patterns": 24,
   "stage_context_sha256": {
    "algorithmic": "528b964cc1696ba577bcca790a0bb6affbf488671d9c155a4452e6d9d1282c42",
-   "analysis": "0e37f89ae697a53916430701460f7448ed944f320ef054c85f1e6dca1c58bb68",
+   "analysis": "c99af97a50940c30414b0620cc36010bfa80bb52453d8210f697614e5f0c17d3",
    "autotuning": "5ae0750eb52794c1d1416b8b890f0384b17792962288d173be28ceed52764fb7",
    "block_pointers": "249dc66db276d21a4de59574320f2065b1589e426632e1d2ddd8cf434bd8d00c",
-   "device_specific": "d60a39ecaef2a4468dce2a1f9bac883d312c27e5461e7e95e92955f7010db2ee",
+   "device_specific": "587afeaaf59183b90c6ce1a2a6e23e70531391d89925add6c7b1b134f2d1e45e",
    "discovery": "31288646fc65a45094f3cb5bb7c09b1f2a7db4be4c83858fd1a21d0f4a95ade0",
    "dtype_fix": "619701678a7352854216951167f75fc22299d1bde63343a81384d7a47a4772c1",
    "fusion": "80b7977ef38faceb01004415277b7257171d4fd761f39dbeded6efd45a0367d3",
    "grf_sweep": "c3cd70110fa445a7661a284f7c31eec3898573c7cf5fabad78cb13d8639e9a87",
    "linalg_lowering": "b0b02dc1ba04466604cc9540fbd9c394ef1f4b11cf9f6076a9cf894fe24e5ed4",
-   "memory_access": "68797287e99edb1369d8b030cb38b11217a6d8b642de5b45ae667930c09955ba",
+   "memory_access": "be2ff7f326d1b8271324415ca9450b80e077920ab6fcdfb7daad3ba813d26e0f",
    "persistent_kernel": "cf77a448d46a6ff65ed11e8da9b2f41bf68edc03b9167c0e32eb817f73ceefc5"
   },
   "stage_pattern_counts": {
