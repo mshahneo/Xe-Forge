@@ -336,6 +336,47 @@ class MlirExecutor:
         stderr = run.stderr.decode(errors="replace")
         return self._parse_output(stdout, flop=flop, stderr=stderr)
 
+    def parse_check(self, kernel_code: str) -> str | None:
+        """Parse and verify *kernel_code*. No lowering, no GPU.
+
+        Runs ``imex-opt <file> -o /dev/null`` with no pass flags. That parses the
+        IR and runs the op verifiers, which is where most bad edits die. Returns
+        ``None`` when the module is well formed, else the error text.
+
+        Why this exists. On a layer-norm 4096x4096 run, 11 of 20 attempts died on
+        bad IR, and 9 of those 11 were parse or verifier errors. Three of those
+        nine were the same mistake: a cache hint written in an attr-dict instead
+        of the ``<{...}>`` properties form. Three more were a half-applied retype
+        whose value no longer matched its uses. One was a dropped comma.
+
+        Measured cost, median of 7 runs on the 1024x4096 layer-norm module:
+        0.017 s, whether it passes or fails. A measured attempt in that run cost
+        49 s, because it lowers and times both the baseline and the candidate. So
+        the check is ~2900x cheaper than learning the same thing on the GPU, and
+        it adds 0.017 s to an attempt that was going to run anyway. (The first
+        call after boot takes ~0.2 s -- cold page cache, not real work.)
+
+        Two of the 11 are out of reach, because they only appear during lowering:
+        an unresolved materialization, and a missing store_nd layout.
+
+        It uses imex-opt, not mlir-opt, so every dialect the real pipeline knows
+        is registered.
+        """
+        src_path = Path(self.build_dir) / "parse_check.mlir"
+        src_path.write_text(kernel_code)
+        r = self._run_opt([str(src_path), "-o", "/dev/null"], use_imex=True)
+        if r.ok:
+            return None
+        err = r.error
+        # A timeout tells us nothing about the IR. Do not reject on it -- a false
+        # reject throws away a real optimization.
+        if "timed out" in err:
+            logger.warning("parse_check timed out; letting the attempt through")
+            return None
+        # The temp path means nothing to the reader. The line:col does: the file is
+        # the candidate module, written out verbatim.
+        return _tail(err.replace(f"{src_path}:", "module line "))
+
     def lower_only(
         self, kernel_code: str, pipeline_options: str | None = None
     ) -> str | None:

@@ -77,6 +77,17 @@ def _verify_sycl(code, original_code, executor, input_shapes, spec_dims=None):
 
 SUCCESS_MESSAGE = "Success! Optimization verified and kernel is faster."
 
+#: Headline for a candidate that is not valid MLIR. Kept as a constant because the
+#: stage loop reads it back to decide the attempt was cheap (see PARSE_FREE_RETRIES).
+INVALID_IR_MESSAGE = "INVALID IR: the module does not parse or does not verify."
+
+#: How many parse/verify rejections a stage may take without spending an attempt.
+#: A bad edit that never reached the GPU costs 0.017 s, so billing it the same as a
+#: 49 s measured attempt threw away a fifth of the budget for a dropped comma. The
+#: cap has to exist: without it a model that keeps writing the same broken syntax
+#: would loop forever.
+PARSE_FREE_RETRIES = 3
+
 
 def _verify_mlir(code, original_code, executor, flop=None):
     """Verify an XeGPU WG-level MLIR kernel: structure check + runtime compare.
@@ -99,6 +110,19 @@ def _verify_mlir(code, original_code, executor, flop=None):
             )
 
     if executor:
+        # Parse and verify offline before paying for lowering + two timed runs.
+        # Most bad edits are bad IR, not slow kernels: on a layer-norm 4096x4096
+        # run 11 of 20 attempts died on bad IR, and 9 of those 11 were parse or
+        # verifier errors. This catches them in 0.017 s instead of 49 s.
+        _parse_check = getattr(executor, "parse_check", None)
+        if callable(_parse_check):
+            ir_err = _parse_check(code)
+            if ir_err:
+                return (
+                    f"{INVALID_IR_MESSAGE}\n{ir_err}\n"
+                    "Fix the IR itself. Nothing was measured, so this tells you "
+                    "nothing about speed."
+                )
         try:
             comparison = executor.compare_kernels(
                 original_code=original_code,
@@ -938,7 +962,16 @@ class OptimizerAgent(Optimizer):
         # "base" is what anchors resolve against. It advances as the stage improves
         # the module, so a later edit anchors on the text the LLM was actually shown
         # and edits stack instead of reverting the previous win.
-        last_accepted = {"comparison": None, "code": None, "base": original_code}
+        # "ir_rejects_run" counts this run's parse/verify rejections, so the stage
+        # loop can refund them. "ir_free_spent" is the stage-wide total, capped at
+        # PARSE_FREE_RETRIES so a refund can never become an endless loop.
+        last_accepted = {
+            "comparison": None,
+            "code": None,
+            "base": original_code,
+            "ir_rejects_run": 0,
+            "ir_free_spent": 0,
+        }
         attempt_log = self._attempt_log
 
         _verify_call_count = [0]
@@ -995,6 +1028,15 @@ class OptimizerAgent(Optimizer):
                 if _repair:
                     logger.info("  repaired attempt %d: %s", _verify_call_count[0], _repair)
                 result = _verify_mlir(code, original_code, executor, flop=flop)
+                if result.startswith(INVALID_IR_MESSAGE):
+                    # Nothing was lowered and nothing was run. Refund the attempt,
+                    # up to the cap, so a dropped comma does not cost the same as a
+                    # measured kernel.
+                    if last_accepted["ir_free_spent"] < PARSE_FREE_RETRIES:
+                        last_accepted["ir_free_spent"] += 1
+                        last_accepted["ir_rejects_run"] += 1
+                    attempt_log(stage, _verify_call_count[0], via, result, None, code=code)
+                    return result
                 _spd = None
                 if result == SUCCESS_MESSAGE and executor:
                     try:
@@ -1372,14 +1414,32 @@ class OptimizerAgent(Optimizer):
                 last_accepted["base"] = current_code_for_run
                 last_accepted["code"] = None
                 last_accepted["comparison"] = None
+                last_accepted["ir_rejects_run"] = 0
 
                 result = cover(**run_kwargs)
 
                 traj = result.trajectory if hasattr(result, "trajectory") else {}
                 thoughts_this_run = sum(1 for k in traj if k.startswith("thought_"))
-                iters_used += max(1, thoughts_this_run)
+                # Refund the iterations that died on invalid IR. They never reached
+                # the GPU, so they cost 0.017 s each, not the ~49 s a measured
+                # attempt costs. The refund is capped inside the verify tool, so
+                # this loop still makes progress.
+                _refund = last_accepted["ir_rejects_run"]
+                if _refund:
+                    iters_used += max(0, thoughts_this_run - _refund)
+                    logger.info(
+                        "  refunded %d attempt(s): invalid IR, nothing measured "
+                        "(%d of %d free retries used)",
+                        _refund,
+                        last_accepted["ir_free_spent"],
+                        PARSE_FREE_RETRIES,
+                    )
+                else:
+                    iters_used += max(1, thoughts_this_run)
 
                 if not hasattr(result, "optimized_code") or result.optimized_code is None:
+                    if _refund and iters_used < self.max_iterations:
+                        continue
                     break
 
                 code_obj = result.optimized_code
@@ -1394,6 +1454,10 @@ class OptimizerAgent(Optimizer):
                     if _patched and (not candidate or candidate.strip().upper() == EDITS_SENTINEL):
                         candidate = _patched
                     elif not candidate:
+                        # A run that only produced invalid IR left nothing to verify.
+                        # Go round again on the refunded budget instead of quitting.
+                        if _refund and iters_used < self.max_iterations:
+                            continue
                         break
 
                 ok, spd, mb, ma, err = self._final_verify(
