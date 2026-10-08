@@ -596,6 +596,76 @@ constraints:
     tags: [large_grf, workgroup_size, launch_failure, level_zero, device_specific, bmg, autotuning]
     applies_to: [any_xegpu_kernel, softmax, layernorm, reduction, flash_attention]
 
+  - id: xegpu_cross_subgroup_reduction_must_stay_outside_scf_for
+    name: "A cross-subgroup vector.multi_reduction inside an scf.for returns WRONG results; keep an element-wise accumulator in the loop and reduce ONCE after it"
+    severity: critical
+    stages: [algorithmic, memory_access, analysis]
+    applies_to: ["softmax", "layernorm", "rmsnorm", "any_row_reduction_over_a_loop"]
+    precondition: |
+      APPLIES when the row is split across subgroups (sg_layout = [1, S], S > 1)
+      AND a vector.multi_reduction over that row sits inside an scf.for body —
+      a per-iteration "local reduction", an online max/sum that reduces every
+      chunk, or a scalar reduction carried through iter_args.
+      Does NOT apply when each subgroup owns whole rows (sg_layout = [S, 1]):
+      that reduction is intra-subgroup and safe in a loop (that is why
+      WG/softmax_intra_sg_cross_lane.mlir may reduce per iteration).
+    description: |
+      MEASURED (layer-norm 4096x4096, bound 2e-3, IMEX PR 1965 review): the
+      in-loop form is WRONG — max abs error 5.19e-03 at chunk 512 and 6.15e-02 at
+      chunk 2048, [ALLCLOSE: FALSE]. One gpu.barrier per iteration restores
+      3e-04 but costs 37% at chunk 512. The accumulator form (reduce once after
+      the loop) is correct, needs no barrier, and is the fastest of the five:
+      0.290992 ms. Not rounding: without fastmath the error stays 5.82e-02.
+      SOFTMAX CANNOT SEE THIS BUG: its error is ~1.5e-9 in every form because
+      normalization cancels it. A passing softmax [ALLCLOSE] is NOT evidence that
+      an in-loop reduction is correct. Full table: see `evidence` in the YAML.
+    rationale: |
+      One row per workgroup is the 2.3x on streaming row kernels, and it makes
+      every row reduction cross-subgroup (SLM + barrier). The chunk loop that
+      keeps registers independent of N puts the loads in an scf.for. Where the
+      two meet, the SLM scratch is re-used before every subgroup has read it.
+    fix: |
+      %pmax = scf.for %k = %c0 to %cN step %cC iter_args(%acc = %neg_inf_tile) -> vector<1x1024xf32> {
+        %tile = xegpu.load_nd %in[%row, %k] <{layout = #xegpu.layout<sg_layout = [1, 32], sg_data = [1, 32]>}> : ... -> vector<1x1024xf32>
+        %next = arith.maximumf %acc, %tile : vector<1x1024xf32>   // element-wise, NOT multi_reduction
+        scf.yield %next : vector<1x1024xf32>
+      }
+      %row_max = vector.multi_reduction <maximumf>, %pmax, %neg_inf [1] : vector<1x1024xf32> to vector<1xf32>
+      // Online form that needs a running max/sum: keep BOTH element-wise too and
+      // combine once at the end (measured +0.15% vs 3-pass at 4096x4096, a tie).
+    evidence: |
+      NOT RENDERED INTO THE PROMPT. Layer-norm 4096x4096, BMG B580, one interleaved
+      batch, 2026-09-29, ~/test/pr_perf_reports/results/ln_*.json:
+        form                                       chunk  median ms  max abs err  ALLCLOSE
+        reduction inside the loop body               512   0.354276   5.19e-03     FALSE
+        reduction inside the loop body              2048   0.291304   6.15e-02     FALSE
+        same + one gpu.barrier per iteration         512   0.398008   3.76e-04     TRUE
+        same + one gpu.barrier per iteration        2048   0.292760   3.07e-04     TRUE
+        ACCUMULATOR, one reduction after the loop    512   0.290992   3.39e-04     TRUE
+      Softmax, same forms: 1.3e-9..1.7e-9 max abs error for all of them.
+
+  - id: xegpu_reduction_chunk_loop_must_run_at_least_twice
+    name: "A reduction-dim scf.for whose chunk equals the row length (one trip) fails xegpu layout propagation; use >= 2 iterations"
+    severity: warning
+    stages: [algorithmic, memory_access]
+    applies_to: ["softmax", "layernorm", "rmsnorm", "any_row_reduction_over_a_loop"]
+    precondition: |
+      APPLIES when a kernel walks the reduction dimension with an scf.for whose
+      step equals the extent, so the body runs once (chunk == N).
+    description: |
+      MEASURED (IMEX PR 1966): softmax 4096x4096 with chunk = 4096 does not compile:
+        [xegpu-propagate-layout]: Failed to resolve vector consumer: scf.yield %15 : vector<1xf32>
+        error: No consumer layout found for vector operand
+      Any chunk giving two or more iterations compiles and runs. chunk = N is the
+      natural special case an optimizer derives first, and it is the one that breaks.
+    rationale: |
+      A single-trip loop is the whole-row form with a loop wrapped round it, so
+      the rule costs nothing; it is here because the failure is a compiler error.
+    fix: |
+      // require N / chunk >= 2; size chunk so that chunk / threads = 2..8 f32 per lane
+      %cC = arith.constant 1024 : index   // N = 4096 -> 4 iterations
+
+
 patterns:
   - id: xegpu_streaming_128bit_lane_load
     name: "Shape a streaming load_nd so each lane reads one contiguous 128-bit chunk; scale with sg_layout"
@@ -965,10 +1035,14 @@ patterns:
       (see xegpu_intra_subgroup_max_should_be_maxnumf for why). That cost is small:
       2 `sync.bar` in the final ISA.
 
-      When the row is too long for registers even at 1024 threads, split it into
-      panels sized to the register budget and keep only the LAST panel live; the
-      earlier panels still re-read, so an R-panel split costs (1 + (R-1)/R) reads
-      instead of 2.
+      WHEN THE ROW IS LONG, OR N IS NOT KNOWN: do not fight for the whole row.
+      Walk it in chunks with a chunk-wide element-wise accumulator and reduce once
+      after the loop — see xegpu_walk_long_row_in_chunks_with_chunk_accumulator.
+      MEASURED 2026-09-29: at 4096x4096 that form ties this one (+0.15% softmax,
+      -0.8% layer-norm) while reading the row 3 times, so the "extra read costs
+      (R-1)/R" reasoning that used to sit here was wrong at this shape — a 16 KB
+      row re-read hits in cache. The chunk form is what shipped in IMEX PRs 1965
+      and 1966.
     rationale: |
       A two-loop online softmax moves 3*N*N*4 bytes where the algorithm needs
       2*N*N*4. For a kernel whose only limit is DRAM, that extra pass IS the
@@ -1046,3 +1120,122 @@ patterns:
       into a loss. Measured clean here: 0 GRF spill/fill instructions at 128 GRF,
       instCount 687, `slm_size: 128`, `barrier_count: 1`.
       Related: xegpu_online_softmax_still_reads_twice_unless_the_row_is_register_resident.
+
+  - id: xegpu_walk_long_row_in_chunks_with_chunk_accumulator
+    name: "Walk a long row with an scf.for over CHUNKS and a chunk-wide element-wise accumulator; reduce once after the loop. Ties the whole-row form at 4K; live state does not grow with N"
+    stage: algorithmic
+    precondition: |
+      APPLIES to a row-wise normalization (softmax, layernorm, rmsnorm, logsumexp)
+      that is ALREADY one row per workgroup (sg_layout = [1, S]) and loads the
+      whole row as one vector<1xNxf32>. Apply when ANY of:
+        * row_len / threads_per_wg > 8 f32 per lane
+        * N is a parameter, or one kernel must serve several N
+        * large GRF is in use (threads_per_wg <= 512, so "more threads" is closed)
+      Do NOT apply when the row is already chunked, or to move rows INTO one
+      subgroup (sg_layout = [S, 1]) — that is 1.5x-2x slower on these kernels
+      (see xegpu_row_per_subgroup_single_read_softmax).
+    description: |
+      Keep ONE ROW PER WORKGROUP (that is the 2.3x). Replace the vector<1xNxf32>
+      load with an scf.for over the row in chunks of C columns. Each pass carries
+      a vector<1xCxf32> ELEMENT-WISE accumulator in iter_args (maximumf / addf)
+      and performs exactly one vector.multi_reduction AFTER its loop. The
+      normalize pass re-loads each chunk, recomputes exp(x - max), scales, stores.
+      Live state per lane is C / threads, independent of N.
+
+      THE REDUCTION MUST STAY OUTSIDE THE LOOP — inside it is silently wrong
+      (xegpu_cross_subgroup_reduction_must_stay_outside_scf_for). The loop must
+      run >= 2 times (xegpu_reduction_chunk_loop_must_run_at_least_twice).
+
+      MEASURED, IMEX PRs 1966/1965, BMG B580, f32, default GRF, flush ON, 11
+      interleaved reps (full tables in `evidence`):
+        * 4096x4096 softmax: whole row 0.348296 ms, chunk 1024 @ 512 threads
+          0.348816 (+0.15%, SHIPPED). Sweep over 8 chunk/thread combos spans 2.2%;
+          512 threads wins at every chunk. Copy floor 0.351676.
+        * 4096x4096 layer-norm: whole row 0.293384, chunk 512 @ 256 threads
+          0.290992 (-0.8%, SHIPPED).
+        * PASS COUNT IS FREE: the chunk form reads the row 3x and ties the 1x
+          whole-row form — a 16 KB row re-read hits in cache. Online 2-pass
+          fusion measured +0.15%..+0.27% (a tie), +10.9% with a per-iteration
+          reduction at chunk 1024.
+        * 256x65536 softmax: at a FIXED 512 threads the loop is 13% faster than
+          the whole row (0.417248 vs 0.480584, 128 f32/lane live). Whole row at
+          1024 threads is still fastest (0.359320) — but 1024 threads cannot
+          launch under large GRF, so the loop is the form that always works.
+        * 1024x16384: flat across all forms within 0.7%.
+
+      SIZING: C / threads_per_wg = 2..8 f32 per lane, threads from the whole-row
+      rule (min(N/8, 512)). Best measured: 2 f32/lane — C = 1024 @ 512 threads
+      (softmax), C = 512 @ 256 threads (layer-norm).
+    rationale: |
+      The whole-row form bakes N into the vector type; live registers grow with N
+      and the only escape is more work-items, which caps at 1024 (512 under large
+      GRF). The chunk form bounds live state by construction and costs nothing at
+      4K because the re-reads are cache hits. Emit it whenever N is not known small.
+    pattern_before: |
+      // whole row in one value; live state = N / threads f32 per lane, grows with N
+      %row_v = xegpu.load_nd %in[%row, %c0] : ... -> vector<1x4096xf32>
+      %mx = vector.multi_reduction <maximumf>, %row_v, %ninf [1] : vector<1x4096xf32> to vector<1xf32>
+      %e  = math.exp (%row_v - %mx) ...
+      %sm = vector.multi_reduction <add>, %e, %zero [1] : vector<1x4096xf32> to vector<1xf32>
+      xegpu.store_nd (%e * (1/%sm)), %out[%row, %c0] ...
+    pattern_after: |
+      // SHIPPED IMEX PR 1966 (WG/softmax_4096x4096.mlir): 1 row/WG, 512 work-items,
+      // chunk 1024, 3 passes, reduce AFTER each loop.
+      %cN = arith.constant 4096 : index
+      %cC = arith.constant 1024 : index
+      %in  = xegpu.create_nd_tdesc %arg0 : memref<4096x4096xf32> -> !xegpu.tensor_desc<1x1024xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+      %pmax = scf.for %k1 = %c0 to %cN step %cC iter_args(%accm = %neg_inf_tile) -> vector<1x1024xf32> {
+        %tile = xegpu.load_nd %in[%row, %k1] <{layout = #xegpu.layout<sg_layout = [1, 32], sg_data = [1, 32]>}> : ... -> vector<1x1024xf32>
+        %next = arith.maximumf %accm, %tile : vector<1x1024xf32>
+        scf.yield %next : vector<1x1024xf32>
+      }
+      %row_max = vector.multi_reduction <maximumf>, %pmax, %neg_inf [1] : vector<1x1024xf32> to vector<1xf32>
+      %max_bc  = vector.broadcast %row_max : vector<1xf32> to vector<1x1024xf32>
+      %psum = scf.for %k2 = %c0 to %cN step %cC iter_args(%accs = %zero_tile) -> vector<1x1024xf32> {
+        %tile = xegpu.load_nd %in[%row, %k2] <{layout = ...}> : ... -> vector<1x1024xf32>
+        %e    = math.exp (arith.subf %tile, %max_bc) : vector<1x1024xf32>
+        %next = arith.addf %accs, %e : vector<1x1024xf32>
+        scf.yield %next : vector<1x1024xf32>
+      }
+      %row_sum = vector.multi_reduction <add>, %psum, %zero [1] : vector<1x1024xf32> to vector<1xf32>
+      %inv_bc  = vector.broadcast (arith.divf %one, %row_sum) : vector<1xf32> to vector<1x1024xf32>
+      scf.for %k3 = %c0 to %cN step %cC {                       // normalize: recompute exp, do not keep it live
+        %tile = xegpu.load_nd %in[%row, %k3] <{layout = ...}> : ... -> vector<1x1024xf32>
+        %o = arith.mulf (math.exp (arith.subf %tile, %max_bc)), %inv_bc : vector<1x1024xf32>
+        xegpu.store_nd %o, %out[%row, %k3] <{layout = #xegpu.layout<sg_layout = [1, 32], sg_data = [1, 32]>}> : vector<1x1024xf32>, ...
+      }
+    expected_speedup: "1.00x vs whole-row at 4096x4096 (+0.15% softmax, -0.8% layer-norm, MEASURED); 1.13x vs whole-row at 256x65536 with threads fixed at 512; 2.27x vs the column-tiled 3-pass baseline (0.791648 -> 0.348816 ms)"
+    applies_to: ["softmax", "layernorm", "rmsnorm", "logsumexp", "row_normalization", "long_reduction_dim"]
+    notes: |
+      PROVENANCE: IMEX PRs 1966 (softmax) / 1965 (layer-norm), review by charithaintc,
+      2026-09-29..10-02. Harness ~/test/pr_perf_reports (gen_loop_variants.py,
+      gen_scaling.py, measure.py); results/{sm,ln}_loop_sweep_final.json,
+      loop_scaling_*.json. Reports: Performance_report_{softmax,layer_norm}_4096x4096.md
+      on branches xeforge_optimized_softmax / xeforge_optimized_layer_norm.
+      Large GRF loses here too: shipped softmax loop 0.376168 (+7.9%), layer-norm
+      chunk form 0.308880 (+6.1%). Cross-kernel medians are NOT comparable
+      (different fills; BMG memory compression makes GB/s fill-dependent).
+    evidence: |
+      NOT RENDERED INTO THE PROMPT. Softmax 4096x4096 chunk/thread sweep, 11 reps:
+        chunk      iters  work-items  sg_layout/sg_data  f32/lane  median ms  vs whole row
+        whole row    1      512       [1,32]/[1,128]       8      0.348296   -
+        1024         4      512       [1,32]/[1,32]        2      0.348816   +0.15% SHIPPED
+        2048         2      512       [1,32]/[1,64]        4      0.349128   +0.24%
+        512          8      512       [1,32]/[1,16]        1      0.350584   +0.66%
+        512          8      256       [1,16]/[1,32]        2      0.351104   +0.81%
+        2048         2      256       [1,16]/[1,128]       8      0.351728   +0.99%
+        1024         4      256       [1,16]/[1,64]        4      0.352248   +1.14%
+        1024         4      128       [1,8]/[1,128]        8      0.355888   +2.18%
+        pure copy of the same buffers                             0.351676
+      Layer-norm 4096x4096, 11 reps:
+        whole row @256 0.293384 | c512@256 0.290992 SHIPPED | c1024@256 0.291720 | c2048@256 0.292136
+        c256@256 0.293384 | c1024@512 0.296920 | c2048@512 0.297336 | c1024@128 0.297752
+        whole row @512 threads 0.288600 (fastest single row; the test shipped 256 threads)
+      Softmax 256x65536, 7 reps:
+        whole row @1024 0.359320 | loop c8192@1024 0.363168 | loop c4096@1024 0.368108
+        loop c1024@512 0.417248 | whole row @512 0.480584
+      Softmax 1024x16384, 7 reps: whole row 0.352872, whole row@1024 0.351312,
+        c1024 0.352144, c2048 0.353392, c4096 0.353912.
+      Online 2-pass fusion vs shipped 3-pass (4096x4096): element-wise state +0.15%,
+        per-iteration reduction c2048 +0.27%, c1024 +10.9%; single-subgroup rows
+        [S,1] +51%..+98%.
