@@ -373,18 +373,24 @@ constraints:
       /data/gta/upstream/triton-layernorm-study/REPORT.md.
 
   - id: xegpu_online_softmax_still_reads_twice_unless_the_row_is_register_resident
-    name: "Two-loop online softmax reads the input twice; only a register-resident row cuts it to one"
+    name: "ANY row normalization (softmax, layer-norm, RMSNorm, logsumexp) that loads the same input in two loops reads it twice; one row per workgroup, held in registers, reads it once"
     severity: critical
     stages: [analysis, algorithmic, memory_access]
     description: |
-      ANALYSIS TRIGGER: two xegpu.load_nd reading the SAME base memref in
-      different scf.for loops = a 3-pass softmax/layernorm (2 reads + 1 write)
-      where 2 suffice. FIX: give ONE ROW to the whole workgroup, hold it in
-      registers. Report issue_type: redundant_computation, stage: algorithmic.
-      Measured 1.982x at 4096x4096, and it is NOT a register-pressure risk: 16
-      f32 per lane at N=4096 with 256 threads, zero spills at 128 GRF. Do not
-      decline this fix on spilling grounds. No cache hint, prefetch or faster
-      math removes the extra pass.
+      ANALYSIS TRIGGER (softmax, layer-norm, RMSNorm, logsumexp, ANY row
+      reduction + per-row rescale): 2+ xegpu.load_nd of the SAME input memref in
+      different scf.for loops = a redundant pass. Report issue_type:
+      redundant_computation, severity 5, stage: algorithmic. NOT missing_tma,
+      NOT a cache-hint issue: no prefetch or hint removes a whole pass.
+      FIX: ONE ROW per workgroup, held in registers (or the chunk-accumulator
+      loop). Measured 1.982x softmax, 2.44x layer-norm at 4096x4096; 16 f32/lane
+      at N=4096 with 256 threads, zero spills at 128 GRF. Do not decline on
+      spilling grounds. No cache hint, prefetch or faster math removes the pass.
+
+      MISSED ONCE, 2026-10-08: on an RMSNorm with two 64x16-tile loops over x
+      the analyzer filed the two loops under missing_tma and skipped
+      algorithmic entirely. The old text said "softmax/layernorm". Hence the
+      explicit op list above.
 
       Writing softmax/layernorm as an online (single-statistics-pass) algorithm
       does NOT by itself get you to minimum traffic. The usual XeGPU shape is two
@@ -665,6 +671,46 @@ constraints:
       // require N / chunk >= 2; size chunk so that chunk / threads = 2..8 f32 per lane
       %cC = arith.constant 1024 : index   // N = 4096 -> 4 iterations
 
+
+  - id: xegpu_cache_flush_modes_are_not_comparable_across_harnesses
+    name: "Compare kernel times across harnesses with cache flushing OFF on both; the IMEX flush and the torch-profiler flush move the number in OPPOSITE directions"
+    severity: warning
+    stages: [analysis, autotuning]
+    # Lives in mlir/xpu, not common/: the IMEX flush is an MLIR-harness fact and
+    # common/ entries change the Triton/SYCL/Gluon prompt views byte for byte.
+    description: |
+      MEASURED 2026-10-08, softmax 4096x4096 f32, BMG B580, same day, same GPU,
+      same uniform [-0.5, 0.5] fill (randn gives the same numbers), device
+      kernel time, medians of 500 runs x 11 reps (ours) / 500 runs (Triton, torch):
+
+        condition                 ours (1 row/WG)  copy floor  Triton    torch
+        back-to-back, no flush    0.335088         0.337376    0.353437  0.337708
+        each side's "flush on"    0.349544         0.353184    0.339062  0.315520
+
+      With flushing OFF on both sides our kernel is 5.4% faster than Triton,
+      0.8% faster than torch, and 0.7% faster than a pure copy. With each
+      side's flush ON we read 3% SLOWER than Triton. The kernel did not change;
+      the flushes did:
+        * IMEX (IMEX_ENABLE_CACHE_FLUSHING=1) appends an 18 MiB memset to the
+          command list right before the kernel with NO sync between them
+          (LevelZeroRuntimeWrappers.cpp, profiling loop). The kernel starts
+          while 18 MiB of dirty lines drain: costs 4.0-4.5%.
+        * torch's bench zeroes a buffer, then torch.xpu.synchronize(), then runs
+          the kernel. The kernel starts on an idle GPU with a clean L2: GAINS
+          4.0% (Triton) to 6.5% (torch). 18 MiB and 1 GiB give the same gain.
+      So "flush on" is a different experiment on each side. Never quote a
+      flush-on IMEX number against a flush-on Triton/torch number.
+    rationale: |
+      A 3% "gap to Triton" that is really a harness difference sends the
+      optimizer chasing a kernel change that cannot exist: the kernel is already
+      at the copy floor. The no-flush, back-to-back condition is the only one
+      both harnesses implement the same way.
+    fix: |
+      # Cross-harness comparison: flushing OFF on both sides, same fill, same day.
+      #   ours:   measure.py --no-flush ...      (or unset IMEX_ENABLE_CACHE_FLUSHING)
+      #   triton: profile a back-to-back loop, no cache.zero_() between iterations
+      # Keep IMEX_ENABLE_CACHE_FLUSHING=1 only for perf_config.yaml CI tracking,
+      # where every number is IMEX-vs-IMEX.
 
 patterns:
   - id: xegpu_streaming_128bit_lane_load

@@ -96,7 +96,7 @@ def test_softmax_single_read_fix_reaches_the_optimizer():
     context = agent._get_stage_patterns(OptimizationStage.ALGORITHMIC)
     for needle in (
         "Give ONE ROW to the whole WORKGROUP",  # the fix pattern
-        "Two-loop online softmax reads the input twice",  # the trigger constraint
+        "reads it twice; one row per workgroup, held in registers, reads it once",  # the trigger constraint
         "1.982x",  # what the fix is worth
         "no spills at 128 GRF",  # why it is not the register-pressure risk it looks like
     ):
@@ -143,7 +143,7 @@ def test_both_halves_of_the_one_pass_rewrite_fit_together():
     context = agent._get_stage_patterns(OptimizationStage.ALGORITHMIC)
     _, total_constraints, kept_patterns, total_patterns = agent._last_kb_counts
     assert "THE GRF MODE SETS THE CEILING" in context
-    assert "Two-loop online softmax reads the input twice" in context
+    assert "reads it twice; one row per workgroup, held in registers, reads it once" in context
     assert kept_patterns == total_patterns, (
         f"algorithmic dropped {total_patterns - kept_patterns} of {total_patterns} "
         "patterns; the stage that owns the launch-geometry rewrite should see all of them"
