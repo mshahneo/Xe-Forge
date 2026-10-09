@@ -691,32 +691,33 @@ constraints:
       0.8% faster than torch, and 0.7% faster than a pure copy. With each
       side's flush ON we read 3% SLOWER than Triton. The kernel did not change;
       the flushes did:
-        * IMEX before 2026-10-09 (IMEX_ENABLE_CACHE_FLUSHING=1, build-with-imex
-          stash version): an 18 MiB memset on the COPY engine with NO ordering
-          against the kernel on the compute engine. The kernel overlapped the
-          fill: +4.3% on a 4K row kernel, +22.7% on a 33 MB RMSNorm. Ordered,
-          the memset still leaves DIRTY lines in the write-back L2 (-2.3% /
-          +6.5%).
-        * torch's bench zeroes a buffer with a torch fill kernel, which leaves
-          L2 CLEAN and evicts the previous iteration's output: GAINS 3% (Triton)
-          to 6% (torch). 18 MiB and 1 GiB give the same gain.
-        * IMEX FIXED (branch clean-cache-flush, 5cd0dbd1; patch for
-          build-with-imex in ~/test/l0rt_flush): the flush is a READ of a 2x-L3
-          buffer into host memory, ordered before the kernel. Clean start:
-          -7.4% vs no flush on softmax (0.3097 ms = 434 GB/s), -3.2% on the
-          small kernel. This matches the torch/Triton clean-start state, so
-          flush-on numbers become comparable ONCE BOTH SIDES USE A CLEAN FLUSH.
-      MEASURED 2026-10-09, what the pre-kernel op leaves in L2 is the whole story
-      (Triton / torch, 4096x4096, ms):
-        nothing (back-to-back)        0.3539 / 0.3392   <- previous output's dirty tail
-        read-only 18 MiB (sum)        0.3414 / 0.3175   <- clean L2: fastest
-        write-only 18 MiB (zero_)     0.3429 / 0.3206   <- same as read-only
-        read-modify-write (add_)      0.3509 / 0.3365   <- dirty L2: gain gone
-        host sync alone               0.3533 / 0.3382   <- does nothing
-      So: a flush must (1) be ORDERED before the kernel and (2) leave CLEAN
-      lines. Until the IMEX fix is in the build you measure with, treat
-      flush-on IMEX numbers as harness-specific and compare flush-off only.
-      Perf-CI baselines taken with the old flush drop ~11% (4K rows) to ~20%
+        * IMEX before 2026-10-09 (build-with-imex stash version): an 18 MiB
+          memset on the COPY engine with NO ordering against the kernel on the
+          compute engine. The kernel overlapped the fill: +4.3% on a 4K row
+          kernel, +22.7% on a 33 MB RMSNorm, +13% on an 8 MB copy.
+        * IMEX after (llvm-project working tree, on top of the stash): the same
+          memset, now of the full 2x-L3 scratch, with a host wait before the
+          timed launch. Softmax 4K: 0.3486 -> 0.3268 ms.
+        * torch's bench zeroes a buffer (a write) and waits; equivalent in kind.
+      MEASURED 2026-10-09 with an 8 MB copy that fits the 18 MiB L3 (hot 9.5 us):
+      WRITES EVICT, READS DO NOT. 36 MB of cached reads (compute kernel,
+      default cache policy) left it hot (+3%); 72 MB of reads +15%; a 36 MB
+      device-to-host copy +34%; an 18 MiB memset +79%; a 36 MiB memset +91%.
+      A read-based "flush" therefore leaves part of the timed kernel's own
+      input resident and makes it look FASTER than a cold run: softmax after a
+      d2h read 0.3096, after a read kernel 0.3210, after an ordered memset
+      0.3266 (the honest cold number), back-to-back 0.3344. The same applies
+      to a read-only torch flush (cache.sum()): its gain is incomplete
+      eviction, not a cleaner cache. An earlier version of this entry called
+      the read flush "clean"; that was wrong.
+      Still open: the memset leaves its own lines dirty inside the measurement;
+      a host-scope barrier signal after it changed nothing, so the cost could
+      not be separated without cache counters.
+      RULES: (1) a flush must be ORDERED before the kernel; (2) it must be a
+      WRITE of >= 2x L3; (3) never compare a flush-on number from one harness
+      with a flush-on number from another unless both flushes are verified to
+      evict a hot working set; compare flush-off otherwise.
+      Perf-CI baselines taken with the old flush move ~6% (4K rows) to ~20%
       (short kernels) when re-measured.
     rationale: |
       A 3% "gap to Triton" that is really a harness difference sends the
