@@ -691,13 +691,23 @@ constraints:
       0.8% faster than torch, and 0.7% faster than a pure copy. With each
       side's flush ON we read 3% SLOWER than Triton. The kernel did not change;
       the flushes did:
-        * IMEX (IMEX_ENABLE_CACHE_FLUSHING=1) appends an 18 MiB memset to the
-          command list right before the kernel with NO sync between them
-          (LevelZeroRuntimeWrappers.cpp, profiling loop). The kernel starts
-          while 18 MiB of dirty lines drain: costs 4.0-4.5%.
-        * torch's bench zeroes a buffer, then torch.xpu.synchronize(), then runs
-          the kernel. The kernel starts on an idle GPU with a clean L2: GAINS
-          4.0% (Triton) to 6.5% (torch). 18 MiB and 1 GiB give the same gain.
+        * IMEX (IMEX_ENABLE_CACHE_FLUSHING=1) runs zeCommandListAppendMemoryFill
+          over 18 MiB right before each timed kernel (LevelZeroRuntimeWrappers.cpp
+          profiling loop). It leaves DIRTY lines in the write-back L2, which the
+          timed kernel then has to write back: costs 4.0-4.5%.
+        * torch's bench zeroes a buffer with a torch fill kernel. That kernel's
+          stores leave L2 CLEAN, and the fill evicts the previous iteration's
+          dirty output. The timed kernel starts with 0 dirty bytes: GAINS 3%
+          (Triton) to 6% (torch). 18 MiB and 1 GiB give the same gain.
+      MEASURED 2026-10-09, what the pre-kernel op leaves in L2 is the whole story
+      (Triton / torch, 4096x4096, ms):
+        nothing (back-to-back)        0.3539 / 0.3392   <- previous output's dirty tail
+        read-only 18 MiB (sum)        0.3414 / 0.3175   <- clean L2: fastest
+        write-only 18 MiB (zero_)     0.3429 / 0.3206   <- same as read-only
+        read-modify-write (add_)      0.3509 / 0.3365   <- dirty L2: gain gone
+        host sync alone               0.3533 / 0.3382   <- does nothing
+      A host synchronize() between flush and kernel changes nothing (an earlier
+      note here blamed a missing sync; that was wrong).
       So "flush on" is a different experiment on each side. Never quote a
       flush-on IMEX number against a flush-on Triton/torch number.
     rationale: |
