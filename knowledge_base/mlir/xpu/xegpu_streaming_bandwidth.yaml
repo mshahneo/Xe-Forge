@@ -714,7 +714,9 @@ constraints:
       a host-scope barrier signal after it changed nothing, so the cost could
       not be separated without cache counters.
       RULES: (1) a flush must be ORDERED before the kernel; (2) it must be a
-      WRITE of >= 2x L3; (3) never compare a flush-on number from one harness
+      WRITE of >= 1x L3 (fill-size sweep: the knee is at the L3 size; 2x is
+      NOT proven better — past 1x only small-working-set probes move, for an
+      unidentified reason); (3) never compare a flush-on number from one harness
       with a flush-on number from another unless both flushes are verified to
       evict a hot working set; compare flush-off otherwise.
       Perf-CI baselines taken with the old flush move ~6% (4K rows) to ~20%
