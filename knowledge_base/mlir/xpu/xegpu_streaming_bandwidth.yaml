@@ -718,6 +718,14 @@ constraints:
       IMEX fill) 0.3354, random data 0.3398. Lines of zeros are almost free to
       write back (memory compression), so torch's zero_() flush reads ~5-6%
       faster than the IMEX fill. Match the pattern when comparing.
+      HOW THE INPUT WAS WRITTEN MATTERS TOO (measured 2026-10-12, layer-norm
+      input [24.5, 25.5] + per-row offset, 4096x4096 f32, torch copy): written
+      on the GPU by compute kernels 0.3392 ms; the SAME values written by a
+      host->device copy 0.2818 ms (17% faster); the IMEX harness, which always
+      builds inputs on the host and uses gpu.memcpy, 0.2729 ms. Memory
+      compression depends on the write path, not only on the values. A torch/
+      Triton bench that builds inputs with torch.rand on the device is NOT the
+      same input as an IMEX test. Build on the host and copy to the device.
       RULES: (1) a flush must be ORDERED before the kernel; (2) it must be a
       WRITE of >= 1x L3 (fill-size sweep: the knee is at the L3 size; 2x is
       NOT proven better — past 1x only small-working-set probes move, for an
