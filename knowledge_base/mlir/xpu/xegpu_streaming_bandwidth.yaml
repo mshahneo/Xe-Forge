@@ -713,6 +713,11 @@ constraints:
       Still open: the memset leaves its own lines dirty inside the measurement;
       a host-scope barrier signal after it changed nothing, so the cost could
       not be separated without cache counters.
+      THE FLUSH'S WRITE VALUE MATTERS TOO (measured 2026-10-12, Liger RMSNorm
+      4096x4096 after a 36 MiB flush write): zeros 0.3173 ms, byte 0x05 (the
+      IMEX fill) 0.3354, random data 0.3398. Lines of zeros are almost free to
+      write back (memory compression), so torch's zero_() flush reads ~5-6%
+      faster than the IMEX fill. Match the pattern when comparing.
       RULES: (1) a flush must be ORDERED before the kernel; (2) it must be a
       WRITE of >= 1x L3 (fill-size sweep: the knee is at the L3 size; 2x is
       NOT proven better — past 1x only small-working-set probes move, for an
