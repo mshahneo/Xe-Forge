@@ -172,6 +172,11 @@ constraints:
       (XeGPUPropagateLayout asserts the DPAS B operand needs an anchor layout carrying
       inst_data).
 
+      FOURTH MEMBER — the prefetch block. On a GEMM K loop the prefetch_nd of the
+      same operands is part of the pair: [32,32] loads with [8,16] prefetches lose
+      8.9%, [8,32] prefetches with DPAS-sized loads lose 19.6%, and the two together
+      win. Numbers in xegpu_dpas_feed_load_uses_dpas_inst_data.
+
       MEASURED INSTANCE — BMG B580, 4k flash attention (median-of-100, large-GRF, all
       ALLCLOSE TRUE), starting from an f16 kernel at 1.4119 ms:
         * K/V inst_data [16,16] -> [32,32] ALONE      -> 1.5888 ms (0.888x, WORSE)
@@ -183,6 +188,57 @@ constraints:
       transplant (a hand-tuned reference using sg_layout=[1,1] sg_data=[64,64] in the
       tensor_desc type, moved onto an attribute-layout kernel) measured 1.6488 ms
       (0.856x).
+
+  - id: xegpu_dpas_feed_load_uses_dpas_inst_data
+    name: "A load_nd feeding xegpu.dpas with the DPAS inst_data ([8,16]/[16,16]) is cut into many small block loads — widen the load AND its prefetch together"
+    severity: warning
+    stages: [memory_access]
+    applies_to: [any_dpas_k_loop, gemm, matmul, mlp, swiglu, attention]
+    description: |
+      ANALYSIS TRIGGER: in a K loop, a load_nd whose value feeds xegpu.dpas carries
+      the dpas operand's own inst_data ([8, 16] for A, [16, 16] for B) instead of a
+      wider load layout. Report issue_type: uncoalesced_access, stage: memory_access.
+
+      inst_data is the hardware message shape of the load. At the DPAS size each
+      subgroup cuts its operand slice into DPAS-sized 2D-block messages, and every
+      message needs its own scalar address setup. Counted in the Xe2 ISA of one such
+      GEMM (per K step of 32, A slice [32,32], B slice [32,64]): 20 block loads,
+      54 movs, 13 syncs, 124 instructions. Intel's Triton GEMM on the same tile: 5
+      loads, 17 movs, 64 instructions.
+
+      THE FIX — one layout per role (xegpu_distinct_layout_per_access_role):
+        * DPAS: keep #a / #b (inst_data [8, 16] / [16, 16]).
+        * LOAD: a separate layout with the same sg_layout / sg_data and
+          inst_data [32, 32] for f16 (32 rows x 64 B, one message at the B580 cap,
+          xegpu_bmg_b580_2d_block_message_limits). Put it on the tensor_desc type and
+          on the load_nd. The load result can feed the dpas directly (TESTED), or go
+          through an explicit xegpu.convert_layout to the dpas layout (the form
+          IMEX's gemm_4kx4kx4k_f16_f16_f32_bias_large_GRF.mlir uses).
+        * PREFETCH: inst_data [8, 32]. 8 rows is the prefetch cap, and 32 f16 is the
+          same 64 B width as the load.
+      WIDEN THE LOAD AND THE PREFETCH TOGETHER. Each one alone is WORSE than neither
+      (table below). It is the pairing rule of xegpu_widen_load_inst_data_in_pairs,
+      with the prefetch block as one more member. The mechanism is not measured.
+
+      MEASURED INSTANCE — BMG B580, C = A @ B, f16 in / f32 out, 256x256x32 tile,
+      sg_layout [8, 4] sg_data [32, 64], large GRF, grouped launch order G 4
+      (xegpu_tile_rows_walked_in_groups), cached depth-1 prefetch, 4x-L3 zero flush,
+      median of 5 interleaved runs of 500, 2026-10-14:
+        | load inst_data | prefetch inst_data | 4096^3   | 4096x8192x4096 |
+        | [32, 32]       | [8, 32]            | 1.614 ms | 3.282 ms       |
+        | DPAS size      | [8, 16]            | 1.684    | 3.428          |
+        | [32, 32]       | [8, 16]            | 1.758    | 3.555          |
+        | DPAS size      | [8, 32]            | 1.930    | 3.913          |
+      The rest of the kernel matters too. With the 2-D M-fastest launch and a depth-3
+      uncached prefetch, the pair alone was worth 1.915 -> 1.835 ms (4096^3); with the
+      grouped order but still depth-3 uncached it was a no-op (1.711 -> 1.709). It
+      pays in full only together with the grouped order and a cached depth-1
+      prefetch.
+      IMEX's gemm_4kx4kx4k_f16_f16_f32_bias_large_GRF.mlir uses [32, 16] loads and
+      [8, 16] prefetches. Moving it to [32, 32] / [8, 32] is worth 1.616 -> 1.562 ms
+      (-3.3%) with the grouped order, and only 1.945 -> 1.923 ms (-1.2%) without.
+      VERIFY offline: dump the ISA (IGC_ShaderDumpEnable=1 on imex-opt) and count
+      load_block2d in the K loop. 5 per K step for this tile.
 
   - id: xegpu_prefetch_depth_is_tunable
     name: Prefetch depth is a tunable, not a free win — suppress it on compute-bound loops
@@ -278,6 +334,18 @@ constraints:
       loads per iteration, or transposed loads, is where prefetch pays.
       A lead is still MANDATORY whenever a prefetch is written at all — a zero-lead
       prefetch cannot even reach the 1% (see xegpu_prefetch_must_lead_the_load).
+
+
+      MEASURED INSTANCE — a GEMM K loop is compute-bound, and depth 1 wins. BMG B580,
+      f16 in / f32 out, 256x256x32 tile, large GRF, grouped launch order G 4, [32,32]
+      loads + [8,32] prefetch, median of 5 interleaved runs, 2026-10-14
+      (4096^3 / 4096x8192x4096):
+        uncached prefetch: depth 3 (k + 96) 1.710 / 3.508 ms, depth 2 1.690 / 3.464,
+                           depth 1 1.628 / 3.322
+        cached prefetch:   depth 3 1.645 / 3.357, depth 1 1.614 / 3.282
+      Depth 1 wins by 1.9-5.6%. Intel's Triton GEMM uses num_stages 2 = depth 1 on
+      this tile. Depth 0 was not measured. IMEX's plain WG GEMM tests prefetch at
+      depth 3; its bias GEMM test already uses depth 1.
 
   - id: xegpu_prefetch_must_lead_the_load
     name: A prefetch_nd at the SAME offset as the load_nd it shadows has zero lead and can never help
@@ -432,6 +500,8 @@ constraints:
         * LOAD (xegpu.load_nd that feeds a DPAS): wants the WIDEST contiguous 2D-block
           message that still lands in the DPAS register shape (e.g. inst_data=[16,32]
           or [32,32]) — fewer, wider load messages, then a cheap in-register reshape.
+          A load_nd that reuses the dpas layout is the trigger of
+          xegpu_dpas_feed_load_uses_dpas_inst_data (GEMM: 20 loads per K step -> 5).
         * PREFETCH (xegpu.prefetch_nd): its ONLY job is to pull the tile into
           L1/L2/L3 once; it never feeds a register. The right layout is a DEDICATED,
           WIDE, COOPERATIVE-DISJOINT spread where the subgroups TOGETHER cover the
@@ -532,6 +602,14 @@ patterns:
       }
     expected_speedup: "1.3-2x on a DRAM-latency-bound GEMM / attention stream. 1.0x (or slightly worse) if the streamed operand is already L2-resident — classify with xegpu_prefetch_depth_is_tunable first."
     applies_to: ["gemm", "matmul", "flash_attention"]
+    notes: |
+      MEASURED INSTANCE — keep the cache hints. On a GEMM K loop (BMG B580, f16 in /
+      f32 out, 256x256x32 tile, large GRF, grouped launch order, median of 5), a
+      prefetch_nd with no hints lowers to a default load_block2d (desc 0x2000203);
+      with l1/l2/l3 = cached it lowers to `.ca.ca` (desc 0x2080203), the same as
+      Intel's Triton GEMM. Removing the hints costs, at 4096^3 / 4096x8192x4096:
+      depth 3: 1.645 -> 1.710 / 3.357 -> 3.508 ms; depth 1: 1.614 -> 1.628 /
+      3.282 -> 3.322 ms.
 
   - id: xegpu_dedicated_prefetch_layout
     name: Give prefetch_nd its own cooperative-disjoint wide layout, not the DPAS/load layout
@@ -799,7 +877,9 @@ patterns:
       }
     notes: |
       Lead distance is a tunable: 3 is the validated value on BMG for a 64-wide tile;
-      deeper pipes cost more register/cache residency for marginal latency gain. When
+      deeper pipes cost more register/cache residency for marginal latency gain.
+      It is NOT the value for a DPAS GEMM K loop: on a 256x256x32 GEMM tile depth 3
+      measured 1.9-5.6% slower than depth 1 (xegpu_prefetch_depth_is_tunable). When
       two operands advance together over the same offset (attention's K and V), issue
       both prefetches at the same running offset rather than pipelining them
       separately. See xegpu_add_prefetch_nd for the base "add a prefetch at all"

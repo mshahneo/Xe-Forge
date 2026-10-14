@@ -72,8 +72,9 @@ _SYCL_SKIP_ISSUES: set[IssueType] = {
 _MLIR_DESCRIPTIONS: dict[IssueType, str] = {
     IssueType.SUBOPTIMAL_TILE_SIZE: (
         "sg_data / inst_data in #xegpu.layout suboptimal for the Xe-core — match "
-        "inst_data to the DPAS shape ([8,16]/[16,16]) and size sg_data so each "
-        "subgroup tile feeds the systolic array efficiently"
+        "the dpas operand inst_data to the DPAS shape ([8,16]/[16,16]) and size "
+        "sg_data so each subgroup tile feeds the systolic array efficiently (a "
+        "load_nd feeding it wants its own wider inst_data, see uncoalesced_access)"
     ),
     IssueType.SUBOPTIMAL_WARPS: (
         "sg_layout (subgroup grid) mismatched with gpu.launch_func threads — the "
@@ -81,7 +82,14 @@ _MLIR_DESCRIPTIONS: dict[IssueType, str] = {
     ),
     IssueType.UNCOALESCED_ACCESS: (
         "load_nd tile shape does not map to a contiguous 2D block load — pick "
-        "sg_data/order that yields coalesced access"
+        "sg_data/order that yields coalesced access; or a load_nd feeding dpas "
+        "reuses the dpas inst_data ([8,16]/[16,16]), so it is cut into many small "
+        "messages — give it its own wider load layout"
+    ),
+    IssueType.NO_SWIZZLING: (
+        "C-tile row/column taken straight from gpu.block_id x/y, so the grid is "
+        "walked M-fastest — use a 1-D grid with G tile rows per group so the "
+        "work-groups that run together share A/B panels in the cache"
     ),
     IssueType.MISSING_TMA: (
         "no xegpu.prefetch_nd ahead of load_nd — add prefetch with cached "
@@ -115,7 +123,6 @@ _MLIR_SKIP_ISSUES: set[IssueType] = {
     IssueType.AUTOTUNE_KEY_MISSING,
     IssueType.AUTOTUNE_DUPLICATE_PARAMS,
     IssueType.MISSING_GRF_MODE,
-    IssueType.NO_SWIZZLING,
     IssueType.SIGMOID_SLOW_EXP,
     IssueType.REPACK_IN_FORWARD,
     IssueType.MISSING_PACKED_TRANSPOSE,

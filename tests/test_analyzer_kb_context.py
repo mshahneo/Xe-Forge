@@ -196,6 +196,40 @@ def test_a_constraint_never_names_an_issue_type_that_does_not_exist():
     assert not bad, f"constraint names a non-existent IssueType: {bad}"
 
 
+# The two GEMM triggers added 2026-10-14. Each must reach the analyzer, fit the
+# 300-char window, name a real issue type that is offered for MLIR, and route to the
+# stage that owns its pattern. `no_swizzling` was on the MLIR skip list before, so
+# the analyzer was never offered it and the launch-order pattern was unreachable.
+GEMM_TRIGGERS = {
+    "xegpu_tile_rows_walked_in_groups": ("no_swizzling", OptimizationStage.DEVICE_SPECIFIC),
+    "xegpu_dpas_feed_load_uses_dpas_inst_data": ("uncoalesced_access", OptimizationStage.MEMORY_ACCESS),
+}
+
+
+def test_the_gemm_triggers_reach_the_analyzer_in_the_window():
+    agent = _agent()
+    shown = {c.id: c for bucket in _buckets(agent.knowledge_base) for c in bucket}
+    for cid, (issue, _stage) in GEMM_TRIGGERS.items():
+        assert cid in shown, cid
+        window = shown[cid].description.strip()[:300]
+        assert "TRIGGER" in window, cid
+        assert issue in window, cid
+
+
+def test_the_gemm_triggers_route_to_the_stage_that_owns_the_fix():
+    from xe_forge.agents.analyzer_agent import _MLIR_ISSUE_CATEGORIES_BLOCK, _MLIR_SKIP_ISSUES
+    from xe_forge.knowledge.patterns import get_stage_for_issue
+    from xe_forge.models import IssueType
+
+    kb = _agent().knowledge_base
+    for cid, (issue, stage) in GEMM_TRIGGERS.items():
+        it = IssueType(issue)
+        assert it not in _MLIR_SKIP_ISSUES, issue
+        assert f"- {issue}:" in _MLIR_ISSUE_CATEGORIES_BLOCK, issue
+        assert get_stage_for_issue(it) == stage, issue
+        assert any(c.id == cid for c in kb.constraints_for_stage(stage)), cid
+
+
 def test_attempts_dir_is_per_run():
     # A single per-kernel directory meant the next run overwrote the evidence from
     # the run you were still reading.

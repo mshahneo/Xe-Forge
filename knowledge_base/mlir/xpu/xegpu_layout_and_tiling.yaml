@@ -152,6 +152,56 @@ constraints:
 
       Full writeup: /data/gta/upstream/triton-layernorm-study/REPORT.md.
 
+  - id: xegpu_tile_rows_walked_in_groups
+    name: "A DPAS kernel that takes its C-tile row and column straight from gpu.block_id x/y walks the grid M-fastest — group the tile rows so concurrent work-groups share the cache"
+    severity: warning
+    stages: [device_specific]
+    applies_to: [any_tiled_dpas_kernel_with_a_2d_tile_grid, gemm, matmul, mlp, swiglu]
+    description: |
+      ANALYSIS TRIGGER: the C-tile row comes straight from gpu.block_id x and the
+      tile column from gpu.block_id y (no remap), and the grid has 8 or more tiles in
+      each dimension. Report issue_type: no_swizzling, stage: device_specific.
+
+      Work-groups are dispatched x first. With the tile row on x, the work-groups
+      that run at the same time all read ONE column panel of B, but each reads a
+      DIFFERENT row panel of A. The A panels they need together do not fit in the
+      L3, so they keep coming back from DRAM.
+
+      THE FIX is pattern xegpu_grouped_tile_launch_order: launch a 1-D grid and remap
+      the work-group id the way Triton's GROUP_SIZE_M does. Consecutive work-groups
+      walk G tile rows, then step to the next tile column. G = 4 measured best. Only
+      the tile-to-work-group mapping changes (the gpu.block_id ops, the grid in
+      gpu.launch_func, known_grid_size). The K loop is untouched, so this stacks with
+      every other GEMM rewrite.
+
+      WHY 4 — arithmetic from the hardware, not measured with counters. At large GRF
+      one 512-work-item work-group fills one Xe core (8 vector engines x 4 threads =
+      32 subgroups), so a B580 runs 20 at a time. With 256x256 tiles and K = 4096,
+      each A row panel and each B column panel is 2 MiB. M-fastest, 20 concurrent
+      work-groups touch 16 A panels + 2 B panels = 36 MiB, twice the 18 MiB L3. With
+      G = 4 they touch 4 A + 5 B = 18 MiB. INFERENCE (not tested): that is why 4
+      beats 1, 8 and 16.
+
+      MEASURED INSTANCE — BMG B580, C = A @ B, f16 in / f32 out, 256x256x32
+      work-group tile, sg_layout [8, 4] sg_data [32, 64], large GRF, 4x-L3 zero cache
+      flush, median of 5 interleaved runs of 500 (spread < 0.6%), 2026-10-14:
+        | launch order                     | 4096^3   | 4096x8192x4096 |
+        | 2-D grid, M fastest (= G 16)     | 1.915 ms | 3.911 ms       |
+        | G = 1 (N fastest)                | 1.777    | 3.759          |
+        | G = 4                            | 1.710    | 3.497          |
+        | G = 8                            | 1.739    | 3.542          |
+      Cross-check on the other compiler: Intel's Triton GEMM on the same tile, forced
+      from G 4 to G 16, slows by the same amount: 1.592 -> 1.786, 3.264 -> 3.686 ms.
+      With every other GEMM fix applied (xegpu_dpas_feed_load_uses_dpas_inst_data and
+      a cached depth-1 prefetch), dropping the grouped order costs 11.5% / 12.4%.
+      IMEX's own perf-CI WG GEMM tests at 4096^3 (same conditions, median of 3),
+      grouped order added and nothing else changed:
+        gemm_4kx4kx4k_f16_f16_f16                 1.733 -> 1.642 ms (-5.3%)
+        gemm_4kx4kx4k_f16_f16_f32                 1.955 -> 1.782 ms (-8.8%)
+        gemm_4kx4kx4k_f16_f16_f32_bias_large_GRF  1.945 -> 1.616 ms (-16.9%)
+      The order matters MORE once the prefetch is right: the bias test already has
+      a cached depth-1 prefetch and gains the most.
+
   - id: xegpu_propagate_dpas_layout_epilogue
     name: Keep the DPAS accumulator layout through the elementwise epilogue — no intermediate relayouts
     severity: warning
@@ -242,6 +292,9 @@ patterns:
       should match a DPAS shape; sg_data should be an integer multiple of
       inst_data so each subgroup issues several back-to-back DPAS ops, keeping
       the systolic array busy and amortizing load latency.
+      This is the layout of the DPAS OPERANDS. A load_nd that feeds them wants its
+      own, wider inst_data; giving it the DPAS size cuts each load into many small
+      messages (xegpu_dpas_feed_load_uses_dpas_inst_data).
     rationale: |
       Tiles that match the DPAS shape avoid partial/under-utilized MMA issues;
       larger sg_data increases arithmetic intensity per load but costs GRF.
@@ -380,3 +433,60 @@ patterns:
       resident, K 64x64f16 per step, 128x64f32 accumulator loop-carried): this is the
       spelling the tuned kernel ships, and the 1.1-1.3x range above is measured against
       loading the full 64x64 K tile there.
+
+  - id: xegpu_grouped_tile_launch_order
+    name: "Grouped tile launch order: 1-D grid, G tile rows per group (Triton's GROUP_SIZE_M)"
+    stage: device_specific
+    applies_to: [any_tiled_dpas_kernel_with_a_2d_tile_grid, gemm, matmul, mlp, swiglu]
+    expected_speedup: "1.12x on a 4096-scale GEMM whose 2-D grid walks M fastest (1.915 -> 1.710 ms at 4096^3, 3.911 -> 3.497 ms at 4096x8192x4096). Nothing to gain when the grid is one tile row or one tile column."
+    precondition: |
+      APPLIES when constraint xegpu_tile_rows_walked_in_groups fires: the C-tile row
+      and column come straight from gpu.block_id x and y. The number of tile rows must
+      be a multiple of G. If it is not, clamp the last group's height with
+      `arith.minui (tiles_m - first_row), G`, as Triton does.
+    description: |
+      Three edits, all needed:
+        1. gpu.launch_func: `blocks in (%tiles_m, %tiles_n, %c1)` becomes
+           `blocks in (%num_tiles, %c1, %c1)`, num_tiles = tiles_m * tiles_n.
+        2. gpu.func: if it has known_grid_size, change it to
+           `array<i32: num_tiles, 1, 1>`. A stale known_grid_size is wrong code.
+        3. Replace the two gpu.block_id ops with the remap below. It defines the
+           SAME two values (tile row, tile column), so nothing after it changes.
+      Use G = 4. A group is G * tiles_n work-groups.
+    rationale: |
+      Work-groups are dispatched in id order. Grouping G tile rows keeps the A and B
+      panels that the concurrently running work-groups need inside the L3, instead of
+      spreading them over every A row panel. See xegpu_tile_rows_walked_in_groups.
+    pattern_before: |
+      gpu.launch_func @k::@k blocks in (%c16, %c16, %c1) threads in (%c512, %c1, %c1) args(...)
+      ...
+      gpu.func @k(...) kernel attributes {known_block_size = array<i32: 512, 1, 1>, known_grid_size = array<i32: 16, 16, 1>} {
+        %block_id_x = gpu.block_id x
+        %block_id_y = gpu.block_id y
+        %m = arith.muli %block_id_x, %c256 : index
+        %n = arith.muli %block_id_y, %c256 : index
+    pattern_after: |
+      %num_wg = arith.constant 256 : index      // 16 x 16 tiles
+      gpu.launch_func @k::@k blocks in (%num_wg, %c1, %c1) threads in (%c512, %c1, %c1) args(...)
+      ...
+      gpu.func @k(...) kernel attributes {known_block_size = array<i32: 512, 1, 1>, known_grid_size = array<i32: 256, 1, 1>} {
+        // G = 4 tile rows per group; a group is 4 x 16 = 64 work-groups.
+        %wg_id = gpu.block_id x
+        %grp_rows = arith.constant 4 : index
+        %grp_size = arith.constant 64 : index
+        %grp = arith.divui %wg_id, %grp_size : index
+        %grp_first_row = arith.muli %grp, %grp_rows : index
+        %grp_pos = arith.remui %wg_id, %grp_size : index
+        %grp_row = arith.remui %grp_pos, %grp_rows : index
+        %block_id_x = arith.addi %grp_first_row, %grp_row : index
+        %block_id_y = arith.divui %grp_pos, %grp_rows : index
+        %m = arith.muli %block_id_x, %c256 : index
+        %n = arith.muli %block_id_y, %c256 : index
+    notes: |
+      The remap is pure index math, so [ALLCLOSE] is unchanged; every variant above
+      passed. The numbers are in constraint xegpu_tile_rows_walked_in_groups.
+      TESTED form: the 1-D grid. A 2-D grid with the remap applied to the linear id
+      `block_id_x + block_id_y * grid_x` should be equivalent, but it is NOT TESTED.
+      A kernel with TWO B operands per tile (two GEMMs sharing A, e.g. a fused
+      SwiGLU gate) reads twice the B panel bytes per tile column. INFERENCE (not
+      tested): G may then want re-measuring; start from 4.
