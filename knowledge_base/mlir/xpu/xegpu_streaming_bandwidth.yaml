@@ -734,9 +734,13 @@ constraints:
       Triton bench that builds inputs with torch.rand on the device is NOT the
       same input as an IMEX test. Build on the host and copy to the device.
       RULES: (1) a flush must be ORDERED before the kernel; (2) it must be a
-      WRITE of >= 1x L3 (fill-size sweep: the knee is at the L3 size; 2x is
-      NOT proven better — past 1x only small-working-set probes move, for an
-      unidentified reason); (3) never compare a flush-on number from one harness
+      WRITE of >= 4x L3 (zero-fill size sweep 2026-10-14: an 8 MB kernel that
+      fits the 18 MiB L3 reads 12.8-15.2 us after a 1x or 2x flush and locks
+      at 16.0-16.2 us from 3x on; a 16 MB kernel spreads 25-38 us below 3x and
+      locks at 31.5-31.8 us from 3x. Below 3x the flush leaves part of the hot
+      set resident AND the runs are noisy. Kernels much larger than L3 do not
+      care past 1.5x. oneDNN benchdnn cycles >= 4x the GPU cache; Triton
+      zero_()s a fixed 256 MB); (3) never compare a flush-on number from one harness
       with a flush-on number from another unless both flushes are verified to
       evict a hot working set; compare flush-off otherwise.
       Perf-CI baselines taken with the old flush move ~6% (4K rows) to ~20%
