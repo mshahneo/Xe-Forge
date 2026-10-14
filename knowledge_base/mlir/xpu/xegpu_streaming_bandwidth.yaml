@@ -695,9 +695,16 @@ constraints:
           memset on the COPY engine with NO ordering against the kernel on the
           compute engine. The kernel overlapped the fill: +4.3% on a 4K row
           kernel, +22.7% on a 33 MB RMSNorm, +13% on an 8 MB copy.
-        * IMEX after (llvm-project working tree, on top of the stash): the same
-          memset, now of the full 2x-L3 scratch, with a host wait before the
-          timed launch. Softmax 4K: 0.3486 -> 0.3268 ms.
+        * IMEX after (0013 on mlir-extensions clean-cache-flush 8a73bde0): a
+          ZERO fill of the full 2x-L3 scratch, with a host wait before the timed
+          launch. Softmax 4K: 0.3486 (old) -> 0.3268 (0x05 fill) -> 0.3160 (zero).
+      WHY FLUSHED BEATS BACK-TO-BACK ON LARGE KERNELS (measured 2026-10-12, same
+      on IMEX and on Triton): a 128 MB kernel has no warm cache to lose; back to
+      back it starts with the previous run's output dirty in L3. vs no flush:
+      softmax 4K fill 0x05 -2.3%, zeros -5.8%, random data -0.3%, clean read
+      -5.9%. Random ~= no flush, zeros ~= clean: the cost is dirty-line
+      write-back. An 8 MB kernel that fits L3 goes the expected way: every
+      flush slows it (+51% zeros/read, +115% 0x05, +159% random).
         * torch's bench zeroes a buffer (a write) and waits; equivalent in kind.
       MEASURED 2026-10-09 with an 8 MB copy that fits the 18 MiB L3 (hot 9.5 us):
       WRITES EVICT, READS DO NOT. 36 MB of cached reads (compute kernel,
