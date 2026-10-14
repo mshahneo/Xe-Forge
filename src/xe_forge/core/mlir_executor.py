@@ -95,10 +95,15 @@ def _extract_time_ms(text: str, allow_lone_float: bool = True) -> float | None:
     explicitly labeled "... time (ms): X", then any labeled "time: X" (the WG
     harness convention is milliseconds), then — only when *allow_lone_float* —
     a bare float line from an older raw-seconds rtclock harness.
+
+    The profiler prints one "Median:" block per gpu.launch_func. A module that
+    launches several kernels (an unfused chain) takes their SUM: reading only
+    the first block would time the chain as its first kernel, so fusing the
+    chain into one kernel would be scored against a fraction of its real cost.
     """
-    mi = _IMEX_MEDIAN_RE.search(text)
-    if mi:
-        return float(mi.group(1))
+    medians = _IMEX_MEDIAN_RE.findall(text)
+    if medians:
+        return sum(float(m) for m in medians)
     m = _TIME_MS_RE.search(text)
     if m:
         return float(m.group(1))
