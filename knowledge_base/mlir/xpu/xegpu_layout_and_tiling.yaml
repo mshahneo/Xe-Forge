@@ -269,6 +269,16 @@ constraints:
       tile) plus a resident 128x64xf16 Q tile and running m_i/l_i vectors: fits at
       256 GRF, does NOT fit at the default 128 GRF, where IGC spills ~8.9 KB with ~282
       spill/fill accesses per loop body and the kernel measures 4.1x worse.
+
+      MEASURED INSTANCE — FUSING TWO GEMMs INTO ONE KERNEL DOUBLES THE ACCUMULATORS.
+      One 256x256 f32 accumulator over 32 subgroups (sg_data [32, 64]) is already 128
+      of the 256 large-GRF registers per thread. A fused kernel that keeps TWO of them
+      (z @ w1 and z @ w3 of a SwiGLU gate, 4096x8192x4096, BMG B580, large GRF) spills
+      7680-8192 bytes per thread (IGC `.spill size`) and ran 1.6-1.8x SLOWER than the
+      unfused 5-kernel chain (23.0 / 25.4 ms vs 14.3 ms). Halving each GEMM's N tile
+      to 256x128 keeps the two accumulators at 128 registers together: no spill, one
+      kernel at 7.51 ms. Budget the accumulators of EVERY GEMM a fusion puts in the
+      kernel, not just one. See pattern xegpu_fuse_two_gemms_sharing_a.
     rationale: |
       Register pressure is the one budget in a WG kernel that every optimization spends
       from, which is why individually-good rewrites stop composing: each extra live tile
@@ -490,3 +500,80 @@ patterns:
       A kernel with TWO B operands per tile (two GEMMs sharing A, e.g. a fused
       SwiGLU gate) reads twice the B panel bytes per tile column. INFERENCE (not
       tested): G may then want re-measuring; start from 4.
+
+  - id: xegpu_fuse_two_gemms_sharing_a
+    name: "Two GEMMs that read the same A (a gated FFN: silu(z@w1) * (z@w3)) fuse into ONE kernel: one A load feeds both dpas; halve each N tile so both accumulators fit"
+    stage: fusion
+    applies_to: [two_gemms_same_lhs, gated_ffn, swiglu, geglu, gemm, matmul]
+    expected_speedup: "1.92x over the unfused 5-kernel SwiGLU chain (14.43 -> 7.51 ms) and 1.07x over the 3-kernel form that only fuses the epilogues (8.06 ms). A fusion that keeps two 256x256 accumulators instead SPILLS and is 1.6-1.8x slower than the chain."
+    precondition: |
+      APPLIES when two xegpu.dpas K loops (in one kernel or in two) read the SAME A
+      operand (same memref, same M offset, same K range) and their two results are
+      combined only element-wise afterwards (silu(g) * u, gelu(g) * u, g + u).
+      Then each work-group can compute the same output tile of BOTH products.
+      BEFORE writing it, do the register budget (xegpu_grf_budget_loop_accumulators):
+      two f32 accumulators of one work-group tile, divided by the subgroup count, must
+      fit with the A and B blocks in the GRF. At large GRF and 32 subgroups, two
+      256x128 f32 tiles (64 + 64 registers per thread) fit; two 256x256 tiles do not.
+    description: |
+      One kernel, one work-group per 256 x TN output tile, TN = half the tile width a
+      single GEMM would use (256 -> 128):
+        1. Two loop-carried accumulators, one per GEMM, same layout (#c with
+           sg_layout [8, 4], sg_data [32, TN/4]).
+        2. Per K step: ONE load of the A block (the 256 x 32 slice), then ONE load of
+           each B block (32 x TN of w1 and of w3), then two dpas that both take the A
+           value. The A traffic and A load messages are paid once for both GEMMs.
+        3. Keep everything the single GEMM had: grouped launch order
+           (xegpu_grouped_tile_launch_order, G = 4 measured best here too), [32, 32]
+           loads and 64-byte-wide prefetches (xegpu_dpas_feed_load_uses_dpas_inst_data),
+           a cached prefetch one K step ahead for A and BOTH B operands.
+        4. Epilogue in f32 on the two accumulators (silu(g) * u with fastmath on the
+           exp and the divide), then ONE arith.truncf and ONE store_nd of the output.
+           No intermediate tensor is written.
+      The launch grid doubles along N (tiles_n = N / TN) and gpu.launch_func,
+      known_grid_size and the group size (G * tiles_n) must follow.
+    pattern_before: |
+      // two GEMM kernels + elementwise kernels; g and u round-trip through memory in f32
+      gpu.launch_func @gemm_w1 blocks in (%c16, %c32, %c1) ...   // g = z @ w1  (256x256 tiles)
+      gpu.launch_func @silu    ...                               // g = silu(g)
+      gpu.launch_func @gemm_w3 blocks in (%c16, %c32, %c1) ...   // u = z @ w3
+      gpu.launch_func @mul_cast ...                              // out = f16(g * u)
+    pattern_after: |
+      // ONE kernel: 256x128 output tile, two accumulators, A loaded once per K step
+      #c = #xegpu.layout<sg_layout = [8, 4], sg_data = [32, 32], inst_data = [8, 16]>
+      %acc:2 = scf.for %k = %c0 to %cK step %c32 iter_args(%ag = %zero, %au = %zero)
+          -> (vector<256x128xf32>, vector<256x128xf32>) {
+        // prefetch A, w1, w3 at %k + 32 (cached), then:
+        %av = xegpu.load_nd %a_ld[%m, %k]  <{layout = #a_load}> : ... -> vector<256x32xf16>
+        %gv = xegpu.load_nd %w1_ld[%k, %n] <{layout = #b_load}> : ... -> vector<32x128xf16>
+        %uv = xegpu.load_nd %w3_ld[%k, %n] <{layout = #b_load}> : ... -> vector<32x128xf16>
+        %ac = xegpu.convert_layout %av <{input_layout = #a_load, target_layout = #a}> : vector<256x32xf16>
+        %gc = xegpu.convert_layout %gv <{input_layout = #b_load, target_layout = #b}> : vector<32x128xf16>
+        %uc = xegpu.convert_layout %uv <{input_layout = #b_load, target_layout = #b}> : vector<32x128xf16>
+        %ag2 = xegpu.dpas %ac, %gc, %ag <{layout_a = #a, layout_b = #b, layout_cd = #c}> : ... -> vector<256x128xf32>
+        %au2 = xegpu.dpas %ac, %uc, %au <{layout_a = #a, layout_b = #b, layout_cd = #c}> : ... -> vector<256x128xf32>
+        scf.yield %ag2, %au2 : vector<256x128xf32>, vector<256x128xf32>
+      }
+      %ng   = arith.negf %acc#0 : vector<256x128xf32>
+      %e    = math.exp %ng fastmath<fast> : vector<256x128xf32>
+      %den  = arith.addf %e, %one : vector<256x128xf32>
+      %silu = arith.divf %acc#0, %den fastmath<fast> : vector<256x128xf32>
+      %y    = arith.mulf %silu, %acc#1 : vector<256x128xf32>
+      %y16  = arith.truncf %y : vector<256x128xf32> to vector<256x128xf16>
+      xegpu.store_nd %y16, %out_td[%m, %n] <{layout = #c}> : vector<256x128xf16>, ...
+    notes: |
+      MEASURED INSTANCE — SwiGLU gate, z 4096x4096 f16, w1/w3 4096x8192 f16, f32
+      accumulate, f16 out, BMG B580, large GRF, 4x-L3 zero flush, median of 5
+      interleaved runs of 500 (steady state), 2026-10-14:
+        | form                                               | kernels | ms    |
+        | Lighthouse llama3 chain (matmul,silu,matmul,mul,cast) | 5     | 14.43 |
+        | epilogues fused only (gemm+silu, gemm, mul+cast)      | 3     |  8.06 |
+        | THIS pattern, 256x128 tile, G 4, fastmath              | 1     |  7.51 |
+        | same, precise exp/divide                               | 1     |  7.66 |
+        | same, G 2 / G 8                                        | 1     | 7.62 / 7.72 |
+      The 3-kernel row is what Xe-Forge reached on its own: its two attempts at this
+      fusion kept 256x256 tiles, spilled 7.5-8 KB per thread and measured 1.6-1.8x
+      slower than the chain. For reference, Triton Inductor (two GEMM kernels + one
+      fused pointwise kernel, f16 intermediates) measured 6.72 ms and Intel's fused
+      Triton kernel (default GRF, 256x64 tile) 8.66 ms.
+      Accuracy is unchanged: max |d| / (1e-4 + 1e-3 |ref|) = 0.46 for every IMEX form.
