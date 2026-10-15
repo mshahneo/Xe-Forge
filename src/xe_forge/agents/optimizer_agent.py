@@ -1276,7 +1276,9 @@ class OptimizerAgent(Optimizer):
         problem_ctx = self._build_problem_context(input_shapes, dtype, init_args, flop)
         perf_ctx = _build_performance_context(perf_context)
 
-        kb_context = self._get_stage_patterns(stage)
+        kb_context = self._get_stage_patterns(
+            stage, issue_types=[i.issue_type.value for i in stage_issues]
+        )
         if kb_context:
             kept_c, all_c, kept_p, all_p = self._last_kb_counts
             logger.info(
@@ -1741,10 +1743,18 @@ class OptimizerAgent(Optimizer):
     # the last _get_stage_patterns call, so the caller can log real counts.
     _last_kb_counts: tuple[int, int, int, int] = (0, 0, 0, 0)
 
-    def _select_kb_entries(self, constraints, patterns, budget):
+    def _select_kb_entries(self, constraints, patterns, budget, issue_types=()):
         """
         Choose whole KB entries that fit in *budget* chars, alternating between
         constraints and patterns.
+
+        Entries tied to the issues this stage is fixing go first. A constraint is
+        tied when it names one of *issue_types*; a pattern when it names such a
+        constraint (patterns point at their trigger by id) or the issue type
+        itself. Without this the order was severity, then file order, and on
+        mlir/xpu the over-budget cut dropped the very trigger the analyzer had
+        routed here (xegpu_dpas_feed_load_uses_dpas_inst_data in memory_access,
+        xegpu_tile_rows_walked_in_groups in device_specific, 2026-10-15).
 
         Alternating is the point. A constraint and a pattern do different jobs:
         the constraint says an issue exists, the pattern shows the edit that
@@ -1755,14 +1765,27 @@ class OptimizerAgent(Optimizer):
         entry must not hide every smaller one behind it.
         """
         kb = self.knowledge_base
+        issues = [t for t in issue_types if t]
+        c_text = {c.id: kb.render_constraint(c) for c in constraints}
+        tied_c = {cid for cid, text in c_text.items() if any(t in text for t in issues)}
+
+        def pattern_tied(text):
+            return any(t in text for t in issues) or any(cid in text for cid in tied_c)
+
         rendered_c = [
-            (c.id, kb.render_constraint(c))
+            (c.id, c_text[c.id])
             for c in sorted(
                 constraints,
-                key=lambda c: self._KB_SEVERITY_ORDER.get(str(c.severity).lower(), 99),
+                key=lambda c: (
+                    c.id not in tied_c,
+                    self._KB_SEVERITY_ORDER.get(str(c.severity).lower(), 99),
+                ),
             )
         ]
-        rendered_p = [(p.id, kb.render_pattern(p)) for p in patterns]
+        rendered_p = sorted(
+            ((p.id, kb.render_pattern(p)) for p in patterns),
+            key=lambda e: not pattern_tied(e[1]),
+        )
 
         keep_c: list[str] = []
         keep_p: list[str] = []
@@ -1792,7 +1815,7 @@ class OptimizerAgent(Optimizer):
 
         return keep_c, keep_p, dropped
 
-    def _get_stage_patterns(self, stage: OptimizationStage) -> str:
+    def _get_stage_patterns(self, stage: OptimizationStage, issue_types=()) -> str:
         """
         Return KB context for *stage*: constraints + patterns + compact examples.
 
@@ -1828,7 +1851,9 @@ class OptimizerAgent(Optimizer):
                 - len(no_patterns_note)
                 - 2  # the "\n\n" between the constraint and pattern sections
             )
-            keep_c, keep_p, dropped = self._select_kb_entries(constraints, patterns, budget)
+            keep_c, keep_p, dropped = self._select_kb_entries(
+                constraints, patterns, budget, issue_types=issue_types
+            )
             self._last_kb_counts = (len(keep_c), len(constraints), len(keep_p), len(patterns))
 
             parts: list[str] = []

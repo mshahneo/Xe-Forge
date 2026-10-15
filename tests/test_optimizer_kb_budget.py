@@ -170,3 +170,43 @@ def test_no_knowledge_base_returns_empty():
     agent = OptimizerAgent.__new__(OptimizerAgent)
     agent.knowledge_base = None
     assert agent._get_stage_patterns(OptimizationStage.ALGORITHMIC) == ""
+
+
+# Over budget, the entries tied to the routed issue go first. The cut used to keep
+# severity and file order only, and dropped the very trigger the analyzer had routed
+# to the stage: xegpu_dpas_feed_load_uses_dpas_inst_data (memory_access) and
+# xegpu_tile_rows_walked_in_groups (device_specific) on the 2026-10-15 SwiGLU runs.
+def _names(agent, stage, ids):
+    kb = agent.knowledge_base
+    entries = list(kb.constraints_for_stage(stage)) + list(kb.get_by_stage(stage))
+    return {e.id: e.name for e in entries if e.id in ids}
+
+
+def test_the_routed_trigger_survives_the_memory_access_cut():
+    agent = _agent()
+    stage = OptimizationStage.MEMORY_ACCESS
+    name = _names(agent, stage, {"xegpu_dpas_feed_load_uses_dpas_inst_data"})[
+        "xegpu_dpas_feed_load_uses_dpas_inst_data"
+    ]
+    assert name not in agent._get_stage_patterns(stage), "test needs the entry to be cut without a hint"
+    assert name in agent._get_stage_patterns(stage, issue_types=["uncoalesced_access"])
+
+
+def test_a_pattern_tied_to_the_trigger_is_kept_under_a_tight_budget():
+    # The pattern names its trigger constraint by id; that tie is what keeps it.
+    agent = _agent()
+    agent.KB_CONTEXT_BUDGET = 9000
+    stage = OptimizationStage.DEVICE_SPECIFIC
+    names = _names(agent, stage, {"xegpu_tile_rows_walked_in_groups", "xegpu_grouped_tile_launch_order"})
+    plain = agent._get_stage_patterns(stage)
+    tied = agent._get_stage_patterns(stage, issue_types=["no_swizzling"])
+    assert not all(n in plain for n in names.values()), "budget too loose for the test to mean anything"
+    for n in names.values():
+        assert n in tied, n
+    assert len(tied) <= agent.KB_CONTEXT_BUDGET
+
+
+def test_no_issue_types_keeps_the_old_order():
+    agent = _agent()
+    for stage in _PATTERN_STAGES:
+        assert agent._get_stage_patterns(stage) == agent._get_stage_patterns(stage, issue_types=[])
