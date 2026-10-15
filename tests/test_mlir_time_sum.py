@@ -22,3 +22,24 @@ def test_the_sum_is_taken_from_stderr_too():
     # The runtime prints the profiler block on stderr; the parser reads it there.
     text = "noise line\n" + BLOCK.format(m="2.0") + BLOCK.format(m="3.0")
     assert _extract_time_ms(text, allow_lone_float=False) == 5.0
+
+
+def test_profiling_counts_default_to_steady_state(monkeypatch):
+    # 10 + 10 read boost clocks (11.5% fast on an 8 ms module); 100 + 100 is within
+    # 0.3% of 500 + 500.
+    from xe_forge.core.mlir_executor import MlirExecutor
+
+    monkeypatch.delenv("MLIR_PROFILING_WARMUPS", raising=False)
+    monkeypatch.delenv("MLIR_PROFILING_RUNS", raising=False)
+    ex = MlirExecutor()
+    assert (ex.imex_warmups, ex.imex_runs) == (100, 100)
+
+
+def test_profiling_counts_follow_the_environment(monkeypatch):
+    from xe_forge.core.mlir_executor import MlirExecutor
+
+    monkeypatch.setenv("MLIR_PROFILING_WARMUPS", "500")
+    monkeypatch.setenv("MLIR_PROFILING_RUNS", "300")
+    ex = MlirExecutor()
+    assert (ex.imex_warmups, ex.imex_runs) == (500, 300)
+    assert (MlirExecutor(imex_warmups=7, imex_runs=8).imex_warmups) == 7

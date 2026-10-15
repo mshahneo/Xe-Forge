@@ -88,6 +88,13 @@ _TIME_LABELED_RE = re.compile(r"\btime\b[^:\n]*:\s*" + _FLOAT, re.IGNORECASE)
 _FLOAT_LINE_RE = re.compile(r"^\s*" + _FLOAT + r"\s*$")
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
 def _extract_time_ms(text: str, allow_lone_float: bool = True) -> float | None:
     """Kernel time in ms from one output stream, or None if it holds no timing.
 
@@ -166,8 +173,8 @@ class MlirExecutor:
         require_correctness: bool = True,
         speedup_tol: float = 0.03,
         use_imex_profiling: bool = True,
-        imex_warmups: int = 10,
-        imex_runs: int = 10,
+        imex_warmups: int | None = None,
+        imex_runs: int | None = None,
         large_grf: bool | None = None,
         compare_repeats: int | None = None,
         min_reliable_ms: float | None = None,
@@ -195,6 +202,15 @@ class MlirExecutor:
         # it without re-zeroing C — our lowering guarantees this. When off, timing
         # falls back to any rtclock/"Average time (ms)" the harness prints.
         self.use_imex_profiling = use_imex_profiling
+        # Launch counts per kernel. 10 + 10 read BOOST clocks: a compute-bound
+        # kernel measured 11.5% (one kernel 21%) faster than at steady state, so
+        # speedups were overstated and candidates could be mis-ranked. Measured
+        # 2026-10-15 on a 3-kernel ~8 ms module: 100 warmups + 100 runs land within
+        # 0.3% of 500 + 500. Env MLIR_PROFILING_WARMUPS / MLIR_PROFILING_RUNS override.
+        if imex_warmups is None:
+            imex_warmups = _env_int("MLIR_PROFILING_WARMUPS", 100)
+        if imex_runs is None:
+            imex_runs = _env_int("MLIR_PROFILING_RUNS", 100)
         self.imex_warmups = imex_warmups
         self.imex_runs = imex_runs
         # Cross-process timing robustness. IMEX profiling already medians over
