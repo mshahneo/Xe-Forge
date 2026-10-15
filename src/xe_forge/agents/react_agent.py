@@ -368,6 +368,16 @@ class MlirOptimizationReActSignature(dspy.Signature):
       yours: leave the allocations, the fill calls, the CPU reference function,
       the input fill values, and the `[ALLCLOSE]` check alone. Those are the
       correctness oracle.
+    - MULTI-KERNEL MODULES: when `@main` calls a separate host function that
+      launches the kernels (for example `@payload` with several
+      `gpu.launch_func`, and `gpu.alloc` buffers that carry results from one
+      kernel to the next), THAT function's launch sequence is yours too. You may
+      merge kernels into fewer launches, delete the intermediate `gpu.alloc` /
+      `gpu.dealloc` that a fusion makes unused, and change the launch argument
+      lists. Keep its signature (the arguments `@main` passes) and keep writing
+      the same final output into its output argument. `@main` itself stays the
+      fixed oracle. Fusing kernels is not possible without this, and the fusion
+      stage exists to do it.
     - If you change `threads in (...)` or `blocks in (...)`, update
       `known_block_size` and `known_grid_size` on the `gpu.func` to match. They
       must agree with the launch or the workgroup pass distributes wrongly.
