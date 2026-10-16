@@ -505,7 +505,7 @@ patterns:
     name: "Two GEMMs that read the same A (a gated FFN: silu(z@w1) * (z@w3)) fuse into ONE kernel: one A load feeds both dpas; halve each N tile so both accumulators fit"
     stage: fusion
     applies_to: [two_gemms_same_lhs, gated_ffn, swiglu, geglu, gemm, matmul]
-    expected_speedup: "1.92x over the unfused 5-kernel SwiGLU chain (14.43 -> 7.51 ms) and 1.07x over the 3-kernel form that only fuses the epilogues (8.06 ms). A fusion that keeps two 256x256 accumulators instead SPILLS and is 1.6-1.8x slower than the chain."
+    expected_speedup: "2.14x over the unfused 5-kernel SwiGLU chain (14.43 -> 6.74 ms with the peeled last K step; 7.51 ms without it) and 1.20x over the 3-kernel form that only fuses the epilogues (8.06 ms). A fusion that keeps two 256x256 accumulators instead SPILLS and is 1.6-1.8x slower than the chain."
     precondition: |
       APPLIES when two xegpu.dpas K loops (in one kernel or in two) read the SAME A
       operand (same memref, same M offset, same K range) and their two results are
@@ -530,6 +530,10 @@ patterns:
         4. Epilogue in f32 on the two accumulators (silu(g) * u with fastmath on the
            exp and the divide), then ONE arith.truncf and ONE store_nd of the output.
            No intermediate tensor is written.
+        5. Peel the last K step: run the loop to K - TK, then load and multiply the
+           last tile once after the loop, with no prefetch. With two accumulators
+           IGC unrolls a 128-trip loop 2-3x and that costs ~12%; it does not unroll
+           the 127-trip loop. See the notes; do NOT peel a one-accumulator GEMM.
       The launch grid doubles along N (tiles_n = N / TN) and gpu.launch_func,
       known_grid_size and the group size (G * tiles_n) must follow.
     pattern_before: |
@@ -577,3 +581,20 @@ patterns:
       fused pointwise kernel, f16 intermediates) measured 6.72 ms and Intel's fused
       Triton kernel (default GRF, 256x64 tile) 8.66 ms.
       Accuracy is unchanged: max |d| / (1e-4 + 1e-3 |ref|) = 0.46 for every IMEX form.
+
+      MEASURED INSTANCE — WHY STEP 5 (peel) IS IN THE RECIPE, 2026-10-16, same shape and
+      conditions, median of 5 interleaved runs of 500:
+        | fused kernel, 128-trip K loop (IGC unrolls it: 64 + 32 dpas blocks)  | 7.50 ms |
+        | prefetch clamped to the last tile, loop whole                       | 7.31 ms |
+        | last K step peeled, 127-trip loop (IGC leaves it at 1 K step/pass)   | 6.74 ms |
+        | loop whole, IGC_DisableLoopUnroll=1 (1 K step/pass, no spill)        | 6.57 ms |
+      So the gain is IGC's unroll decision, not the out-of-bounds prefetch (the clamp
+      removes that and gives only 2.6%). The peel is a workaround: it is the only
+      MLIR-level way found to stop the unroll. Passing `-igc_opts 'DisableLoopUnroll=1'`
+      through the pipeline's igc-cmd-options does NOT work today: the space-split form
+      is rejected ("Missing single quotes for -igc_opts") and the escaped form drops
+      -ze-opt-large-register-file (5.6 KB spill). The same peel on a ONE-accumulator
+      256x256 GEMM (IMEX's gemm_4kx4kx4k_f16_f16_f32_bias_large_GRF.mlir) changes
+      nothing (1.562 -> 1.561 ms), and turning unrolling off there costs 2.2%
+      (1.596 ms): unrolling helps a one-accumulator GEMM. Xe-Forge's run 4 found this
+      peel by itself (memory_access stage, as a fix for the out-of-bounds prefetch).
