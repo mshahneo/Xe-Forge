@@ -161,3 +161,35 @@ def confirm_marginal(comparison, code, original_code, executor, flop=None):
         executor.compare_repeats = reps
     logger.info("Re-timed: %.3fx -> %.3fx", comparison.speedup, confirmed.speedup)
     return confirmed
+
+
+# A precision fix is accepted at speed parity only if it cuts the error ratio to at
+# most this fraction of what it replaces. 0.8 keeps run-to-run error noise (the input
+# is random each run) from counting as a gain.
+ACCURACY_GAIN = 0.8
+
+
+def accuracy_gain_at_parity(comparison, spd, executor, best_spd=None, best_ratio=None) -> bool:
+    """True when a correct candidate is no slower than noise and clearly more accurate.
+
+    A dtype_fix whose purpose is precision (f32 accumulation instead of bf16, say)
+    usually leaves a memory-bound kernel's speed unchanged, so the speed-only rule
+    rejected it every time: on KernelBench #36 two verified f32 rewrites measured
+    1.004x and 1.005x and were both thrown away. This accepts such a candidate when
+    the harness reports an error ratio (MAX_TOL_RATIO) for both kernels.
+
+    `spd` is the candidate's confirmed speedup over the stage input. `best_spd` and
+    `best_ratio` describe the stage's current best, if one was already accepted; the
+    candidate must then hold that speed and beat that accuracy instead.
+    """
+    if comparison is None or spd is None:
+        return False
+    orig = getattr(comparison, "original_error_ratio", None)
+    opt = getattr(comparison, "optimized_error_ratio", None)
+    ref = best_ratio if best_ratio is not None else orig
+    if ref is None or opt is None or opt != opt or ref != ref:  # missing or NaN
+        return False
+    floor = undecided_floor(executor)
+    if spd < floor * (best_spd if best_spd is not None else 1.0):
+        return False
+    return opt <= ACCURACY_GAIN * ref

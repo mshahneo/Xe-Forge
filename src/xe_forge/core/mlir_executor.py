@@ -65,6 +65,9 @@ _RUNTIME_LIBS = [
 
 # Markers emitted by the in-file harness.
 _ALLCLOSE_ANY_RE = re.compile(r"\[ALLCLOSE:\s*(TRUE|FALSE)\]", re.IGNORECASE)
+# Worst |error| / bound printed by a self-checking harness. vector.print puts the
+# label and the value on separate lines, so allow any whitespace between them.
+_MAX_TOL_RATIO_RE = re.compile(r"MAX_TOL_RATIO:\s*([-+]?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|nan|inf))", re.IGNORECASE)
 _FLOAT = r"([-+]?\d+\.\d+(?:[eE][-+]?\d+)?)"
 # IMEX level-zero profiling (mgpuLaunchKernel when IMEX_ENABLE_PROFILING is set)
 # prints "Median: <ms>" among Min/Max/Avg/Median/Std Dev. This is pure kernel
@@ -138,6 +141,9 @@ class MlirComparisonResult:
     optimized_tflops: float | None = None
     original_correct: bool = True
     optimized_correct: bool = True
+    # Worst |error| / bound of each kernel, when its harness prints MAX_TOL_RATIO.
+    original_error_ratio: float | None = None
+    optimized_error_ratio: float | None = None
     is_slower: bool = False
     # True when the optimized source lowers to IR byte-identical to the original's
     # (e.g. the edit only added dead ops that the compiler eliminates). Such an
@@ -456,9 +462,13 @@ class MlirExecutor:
         if flop and time_ms and time_ms > 0:
             tflops = (flop / 1e12) / (time_ms / 1e3)
 
+        ratio_match = _MAX_TOL_RATIO_RE.search(stdout)
+        error_ratio = float(ratio_match.group(1)) if ratio_match else None
+
         return ExecutionResult(
             success=True,
             output_correct=correct,
+            error_ratio=error_ratio,
             execution_time_ms=time_ms,
             tflops=tflops,
         )
@@ -651,6 +661,8 @@ class MlirExecutor:
             optimized_tflops=opt.tflops,
             original_correct=bool(orig.output_correct),
             optimized_correct=opt_correct,
+            original_error_ratio=getattr(orig, "error_ratio", None),
+            optimized_error_ratio=getattr(opt, "error_ratio", None),
             is_slower=is_slower,
             lowered_identical=lowered_identical,
             low_confidence=low_confidence,

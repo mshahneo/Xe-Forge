@@ -15,7 +15,7 @@ import dspy
 
 from xe_forge.agents.base import Optimizer
 from xe_forge.agents.cover import CoVeR
-from xe_forge.core.timing_confidence import confirm_marginal, min_gain
+from xe_forge.core.timing_confidence import accuracy_gain_at_parity, confirm_marginal, min_gain
 from xe_forge.knowledge.loader import KnowledgeBase
 from xe_forge.models import (
     DSL,
@@ -1417,6 +1417,7 @@ class OptimizerAgent(Optimizer):
         best_code = None
         best_spd = None
         best_mb = best_ma = best_traj = None
+        best_err = None  # error ratio (MAX_TOL_RATIO) of best_code, when the harness prints one
         iters_used = 0
         attempt_history: list[str] = []  # what each run tried and achieved
 
@@ -1544,6 +1545,25 @@ class OptimizerAgent(Optimizer):
                     if best_spd is None
                     else spd is not None and spd > best_spd * _min_improvement
                 )
+                # A precision fix rarely changes speed, so the speed rule alone threw
+                # every one away (KernelBench #36: f32 rewrites at 1.004x and 1.005x).
+                # In dtype_fix, a correct candidate that is no slower than noise and
+                # clearly more accurate also counts.
+                _last_cmp = getattr(self, "_last_comparison", None) if ok else None
+                _accuracy_gain = (
+                    not _is_improvement
+                    and stage == OptimizationStage.DTYPE_FIX
+                    and accuracy_gain_at_parity(
+                        _last_cmp, spd, self.executor, best_spd=best_spd, best_ratio=best_err
+                    )
+                )
+                if _accuracy_gain:
+                    _ref = best_err if best_err is not None else _last_cmp.original_error_ratio
+                    logger.info(
+                        f"Stage {stage.value}: accepted on accuracy at {spd:.3f}x "
+                        f"(error ratio {_ref:.3g} -> {_last_cmp.optimized_error_ratio:.3g})"
+                    )
+                    _is_improvement = True
                 # Also stop if code is identical to previous best (LLM stuck)
                 _code_identical = best_code is not None and candidate == best_code
                 if _code_identical:
@@ -1561,6 +1581,7 @@ class OptimizerAgent(Optimizer):
                         ma,
                         traj,
                     )
+                    best_err = getattr(_last_cmp, "optimized_error_ratio", None)
                     current_code_for_run = candidate
                     # Rebuild performance_context with updated speedup
                     # so the next CoVeR iteration knows where it stands
@@ -2061,6 +2082,9 @@ class OptimizerAgent(Optimizer):
         baseline_ms: float | None = None,
         spec_dims=None,
     ):
+        # The comparison behind the verdict, for rules that need more than the
+        # speedup (accuracy_gain_at_parity). Reset so a failed verify leaves none.
+        self._last_comparison = None
         if self.dsl == DSL.SYCL:
             if "#include" not in opt:
                 return False, None, None, None, "Not valid SYCL C++"
@@ -2127,6 +2151,7 @@ class OptimizerAgent(Optimizer):
                     spd = (baseline_ms * 1000) / c.optimized_time_us
                 else:
                     spd = c.speedup
+                self._last_comparison = c
                 return True, spd, mb, ma, None
             except Exception as e:
                 return False, None, None, None, f"Verify failed: {e}"

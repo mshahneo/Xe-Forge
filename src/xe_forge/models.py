@@ -191,6 +191,9 @@ class ExecutionResult(BaseModel):
     tflops: float | None = None
     memory_bandwidth_gb: float | None = None
     output_correct: bool | None = None
+    # Worst |error| / bound, when the harness prints it (MAX_TOL_RATIO). Lets a
+    # precision fix that does not change speed still count as an improvement.
+    error_ratio: float | None = None
     error_message: str | None = None
     error_traceback: str | None = None
 
