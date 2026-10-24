@@ -241,3 +241,33 @@ def test_attempts_dir_is_per_run():
     idx = src.index("attempts_dir")
     window = src[idx : idx + 400]
     assert "strftime" in window, "attempts_dir must carry a per-run timestamp"
+
+
+# A reduction over a strided axis (an NCHW channel norm) read with 2-D block loads gets
+# 32 B of each memory row per message; the gather pattern that fixes it is only
+# reachable through this trigger. Measured 0.4689 -> 0.3151 ms on KernelBench #36.
+STRIDED_TRIGGERS = {
+    "xegpu_strided_axis_reduction_needs_long_row_runs": ("uncoalesced_access", OptimizationStage.MEMORY_ACCESS),
+}
+
+
+def test_the_strided_reduction_trigger_reaches_the_analyzer_in_the_window():
+    agent = _agent()
+    shown = {c.id: c for bucket in _buckets(agent.knowledge_base) for c in bucket}
+    for cid, (issue, _stage) in STRIDED_TRIGGERS.items():
+        assert cid in shown, cid
+        window = shown[cid].description.strip()[:300]
+        assert "TRIGGER" in window, cid
+        assert issue in window, cid
+
+
+def test_the_strided_reduction_trigger_routes_to_the_stage_with_the_gather_pattern():
+    from xe_forge.knowledge.patterns import get_stage_for_issue
+    from xe_forge.models import IssueType
+
+    kb = _agent().knowledge_base
+    for cid, (issue, stage) in STRIDED_TRIGGERS.items():
+        assert get_stage_for_issue(IssueType(issue)) == stage, issue
+        assert any(c.id == cid for c in kb.constraints_for_stage(stage)), cid
+    ids = [getattr(e, "id", None) for e in kb.get_by_stage(OptimizationStage.MEMORY_ACCESS)]
+    assert "xegpu_strided_axis_reduction_gather_rows" in ids

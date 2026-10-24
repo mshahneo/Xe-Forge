@@ -293,8 +293,40 @@ constraints:
 
       SOURCE: `test/lightouse_softmax_tuning/triton-vs-xe-forge/REPORT.md`,
       2026-09-16, 500 runs x 4-6 interleaved reps, `[ALLCLOSE: TRUE]` every run.
-      NOT CHECKED: other dtypes, gather/scatter (as opposed to 2D block) access,
-      and kernels with data reuse — this is a streaming rule only.
+      NOT CHECKED: other dtypes and kernels with data reuse — this is a streaming
+      rule only. It also assumes one long contiguous row: when the tile's rows are
+      far apart (a reduction over a strided axis), the run per message DOES matter;
+      see xegpu_strided_axis_reduction_needs_long_row_runs.
+
+  - id: xegpu_strided_axis_reduction_needs_long_row_runs
+    name: "A reduction over a STRIDED axis (e.g. the channels of NCHW) must read >= 128 B of each memory row per message; 2-D block loads read 32-64 B and run ~1.5x slower"
+    severity: warning
+    stages: [analysis, memory_access]
+    description: |
+      ANALYSIS TRIGGER: report issue_type: uncoalesced_access, stage: memory_access,
+      when a kernel reduces over an axis that is NOT the innermost one (its stride is
+      many cache lines, e.g. the channel axis of an NCHW tensor, stride H*W) and reads
+      the tile with xegpu.load_nd. A 2-D block message reads at most 64 B of each memory
+      row; with rows that far apart, that is the whole contiguous run of the message.
+
+      MEASURED on BMG B580: KernelBench #36 RMSNorm, out = x / sqrt(mean_c x^2 + eps),
+      2x64x512x512 bf16, channel rows 512 KB apart, 500 warm-ups + 500 runs, 4x-L3 zero
+      flush, 3 interleaved reps each:
+
+        | kernel | bytes of a row per message | median |
+        |---|---|---|
+        | load_nd, 64x16 per subgroup, inst_data [8,16] / [16,16] / [32,16] | 32 B | 0.4688-0.4705 ms |
+        | 3-D load_nd, 64x1x16 per subgroup, one row per message | 32 B | 0.4775 ms |
+        | xegpu.load gather, lane_data [1, 4] | 128 B | 0.3207 ms |
+        | xegpu.load gather, lane_data [1, 8] | 256 B | 0.3151 ms |
+        | Inductor's Triton kernel (load.ugm.d32x4, 16 B per lane) | 256 B | 0.3168 ms |
+
+      The same Triton kernel slowed to 0.500 ms when its block shrank to 32 B of each
+      row (XBLOCK 16 instead of 128), so the per-row run sets the speed, not the
+      compiler. What did NOT help (measured): the load_nd inst_data height (8/16/32
+      rows: within 0.3%), smaller work-group tiles (64x128 per WG: 0.709 ms, 64x64:
+      0.780 ms), the large GRF on the gather kernel (0.3151 vs 0.3167 ms).
+      The fix is pattern xegpu_strided_axis_reduction_gather_rows.
 
   - id: xegpu_cross_subgroup_reduction_slm_should_be_tiny
     name: "Cross-subgroup reduction SLM should be one element per subgroup, not one per row element"
@@ -807,6 +839,74 @@ patterns:
       The kernel carrying that layout ran at 396-402 GB/s = 87-88% of the 456 GB/s
       peak at 4096x4096 and 8192x8192, so 16 B/lane is demonstrably SUFFICIENT to
       saturate BMG DRAM; the speedup range above is the cost of NOT doing it.
+
+  - id: xegpu_strided_axis_reduction_gather_rows
+    name: "Read a strided-axis reduction with xegpu.load gathers: 16 B per lane, 256 B of each memory row per message; split the reduced axis across subgroups"
+    stage: memory_access
+    precondition: |
+      APPLIES to a reduction over a non-innermost axis with a large stride, such as a
+      channel norm over dim 1 of NCHW (RMSNorm / LayerNorm / BatchNorm style), when the
+      whole reduced extent (e.g. 64 channels) is reduced inside one work-group. Do NOT
+      apply to a reduction along the contiguous row (softmax, row layer-norm): there a
+      2-D block load already reads one long contiguous run.
+    description: |
+      View the tensor as a flat 1-D memref (memref.collapse_shape [[0, 1, 2, 3]], done
+      in the host launch function). Give each work-group one batch, all R reduced rows
+      and P positions, and build offsets[r, j] = base + r * stride + j with vector.step,
+      vector.shape_cast and vector.broadcast. Load with xegpu.load (a gather) and an
+      all-true mask, with the layout
+        sg_layout = [8, P/128], sg_data = [R/8, 128], inst_data = [1, 128],
+        lane_layout = [1, 16], lane_data = [1, 8]          (16-bit data)
+      so each lane reads 8 contiguous elements (16 B) of a row and one message covers
+      256 B of it. The vector.multi_reduction over dim 0 then crosses 8 subgroups;
+      XeGPU does that through a small SLM buffer (4 KB at R = 64, P = 128). Store with
+      xegpu.store at the same offsets and layout. Do the math in f32 (arith.extf): it is
+      free here (bf16 math 0.3154 ms, f32 0.3151 ms) and halves the error.
+    rationale: |
+      The rows of the tile are a whole plane apart (512 KB here). A 2-D block message
+      reads at most 64 B of each row, so every message fetches short runs from many
+      DRAM pages. A gather whose lanes own adjacent 16 B chunks reads one long run per
+      message, which is what Inductor's Triton kernel does.
+    pattern_before: |
+      // 3-D block load: 32 B of each channel row per message
+      %d = xegpu.create_nd_tdesc %in : memref<64x512x512xbf16, strided<[262144, 512, 1], offset: ?>>
+          -> !xegpu.tensor_desc<64x1x512xbf16, #xegpu.block_tdesc_attr<boundary_check = false>>
+      %x = xegpu.load_nd %d[%c0, %h, %c0] <{layout = #xegpu.layout<sg_layout = [1, 1, 32], sg_data = [64, 1, 16]>}>
+          : !xegpu.tensor_desc<64x1x512xbf16, ...> -> vector<64x1x512xbf16>
+    pattern_after: |
+      // host: %x1 = memref.collapse_shape %x [[0, 1, 2, 3]] : memref<2x64x512x512xbf16> into memref<33554432xbf16>
+      %j = vector.step : vector<128xindex>
+      %jb = vector.broadcast %j : vector<128xindex> to vector<64x128xindex>
+      %c = vector.step : vector<64xindex>
+      %chw = arith.muli %c, %hw : vector<64xindex>                // hw = dense<262144>
+      %chw2 = vector.shape_cast %chw : vector<64xindex> to vector<64x1xindex>
+      %chwb = vector.broadcast %chw2 : vector<64x1xindex> to vector<64x128xindex>
+      %o0 = arith.addi %jb, %chwb : vector<64x128xindex>
+      %bs = vector.broadcast %base : index to vector<64x128xindex>  // base = b*C*HW + tile*128
+      %off = arith.addi %o0, %bs : vector<64x128xindex>
+      %v = xegpu.load %x[%off], %mask <{layout = #xegpu.layout<sg_layout = [8, 1], sg_data = [8, 128],
+              inst_data = [1, 128], lane_layout = [1, 16], lane_data = [1, 8]>}>
+          : memref<33554432xbf16>, vector<64x128xindex>, vector<64x128xi1> -> vector<64x128xbf16>
+      %vf = arith.extf %v : vector<64x128xbf16> to vector<64x128xf32>
+      %sq = arith.mulf %vf, %vf : vector<64x128xf32>
+      %ss = vector.multi_reduction <add>, %sq, %zero [0] : vector<64x128xf32> to vector<128xf32>
+      // ... mean, rsqrt, broadcast, multiply, truncf ...
+      xegpu.store %y16, %out[%off], %mask <{layout = <same layout>}>
+          : vector<64x128xbf16>, memref<33554432xbf16>, vector<64x128xindex>, vector<64x128xi1>
+    expected_speedup: "1.45-1.5x over 2-D block loads at 32 B per row (measured 0.4689 -> 0.3151 ms)"
+    applies_to: ["rmsnorm", "layernorm", "batchnorm", "channel_norm", "reduction", "strided_reduction"]
+    notes: |
+      COMPILER REQUIREMENT (tested 2026-10-24): this form compiles only with the XeGPU
+      contiguity stack (llvm PRs #233995, #233997, #233998, #234283; not merged as of
+      2026-10-24). On IMEX main's LLVM pin 34e28ef4 the lowering stops with
+      "failed to legalize operation 'xegpu.lane_shuffle' ... lane_shuffle_mode<unpack>":
+      the cross-subgroup reduction's SLM store_matrix / load_matrix are fixed at
+      lane_data [1, 1]. If you see that error, the compiler lacks the stack and this
+      pattern cannot be used with it.
+      TRAP: 64 B rows through load_nd (32 columns per subgroup) do not compile: the
+      SPIR-V backend cannot legalize fpext / fptrunc on vectors over 16 elements; with
+      load inst_data [8, 32] it compiles but spills 131072 B per thread and cannot launch.
+      SOURCE: /data/gta/test/kb_rmsnorm (make_gather.py, results/gather_*.json).
 
   - id: xegpu_streaming_cache_hints_read_once_write_once
     name: "Bypass L1 on the streamed input ONLY; leave every re-read operand L1-cached"
