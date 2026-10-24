@@ -862,6 +862,14 @@ patterns:
       XeGPU does that through a small SLM buffer (4 KB at R = 64, P = 128). Store with
       xegpu.store at the same offsets and layout. Do the math in f32 (arith.extf): it is
       free here (bf16 math 0.3154 ms, f32 0.3151 ms) and halves the error.
+
+      TWO DETAILS THAT DECIDE IT (both seen in an Xe-Forge run, 2026-10-24):
+      1. The stride multiply needs a VECTOR constant: `arith.muli %c, %hw` with
+         `%hw = arith.constant dense<H*W> : vector<Rxindex>`. An `index` scalar there does
+         not verify ("use of value ... expects different type"); that one error threw
+         away an otherwise correct gather kernel, which measured 0.3421 ms once fixed.
+      2. Multiply by math.rsqrt; do not divide by math.sqrt. Measured on the gather
+         kernel: x * rsqrt(m) 0.3151 ms, x / sqrt(m) 0.3318 ms (5.3% slower), same error.
     rationale: |
       The rows of the tile are a whole plane apart (512 KB here). A 2-D block message
       reads at most 64 B of each row, so every message fetches short runs from many
@@ -878,7 +886,8 @@ patterns:
       %j = vector.step : vector<128xindex>
       %jb = vector.broadcast %j : vector<128xindex> to vector<64x128xindex>
       %c = vector.step : vector<64xindex>
-      %chw = arith.muli %c, %hw : vector<64xindex>                // hw = dense<262144>
+      %hw = arith.constant dense<262144> : vector<64xindex>       // a VECTOR constant, not an index
+      %chw = arith.muli %c, %hw : vector<64xindex>
       %chw2 = vector.shape_cast %chw : vector<64xindex> to vector<64x1xindex>
       %chwb = vector.broadcast %chw2 : vector<64x1xindex> to vector<64x128xindex>
       %o0 = arith.addi %jb, %chwb : vector<64x128xindex>
@@ -890,7 +899,12 @@ patterns:
       %vf = arith.extf %v : vector<64x128xbf16> to vector<64x128xf32>
       %sq = arith.mulf %vf, %vf : vector<64x128xf32>
       %ss = vector.multi_reduction <add>, %sq, %zero [0] : vector<64x128xf32> to vector<128xf32>
-      // ... mean, rsqrt, broadcast, multiply, truncf ...
+      %mean = arith.mulf %ss, %inv_c : vector<128xf32>              // inv_c = dense<1/64>
+      %me = arith.addf %mean, %eps : vector<128xf32>
+      %inv = math.rsqrt %me : vector<128xf32>                        // multiply by rsqrt, no divf
+      %ib = vector.broadcast %inv : vector<128xf32> to vector<64x128xf32>
+      %y = arith.mulf %vf, %ib : vector<64x128xf32>
+      %y16 = arith.truncf %y : vector<64x128xf32> to vector<64x128xbf16>
       xegpu.store %y16, %out[%off], %mask <{layout = <same layout>}>
           : vector<64x128xbf16>, memref<33554432xbf16>, vector<64x128xindex>, vector<64x128xi1>
     expected_speedup: "1.45-1.5x over 2-D block loads at 32 B per row (measured 0.4689 -> 0.3151 ms)"
